@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+taxonomy.sqlite
+evidence/
+.env
+.env.*
+!.env.example

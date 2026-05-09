@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wireless-taxonomy"
+version = "0.1.0"
+description = "Accuracy-first CLI for building wireless paper and dataset taxonomy records."
+requires-python = ">=3.11"
+dependencies = [
+  "typer>=0.12",
+  "openpyxl>=3.1",
+]
+
+[project.scripts]
+wireless-taxonomy = "wireless_taxonomy.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
+
+from wireless_taxonomy.config import LlmSettings, ProviderConfig
+
+
+@dataclass(frozen=True)
+class LlmRequest:
+    task: str
+    prompt: str
+    schema_name: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class LlmResponse:
+    provider: str
+    model: str
+    content: str
+    parsed: dict[str, Any] | list[Any] | None
+    confidence: float | None = None
+
+
+class LlmRouter:
+    """Small provider router using raw HTTPS APIs to avoid SDK lock-in."""
+
+    def __init__(self, settings: LlmSettings):
+        self.settings = settings
+
+    def configured_providers(self) -> tuple[ProviderConfig, ...]:
+        return tuple(provider for provider in self.settings.ordered_providers() if provider.api_key_configured)
+
+    def select_provider(self) -> ProviderConfig:
+        configured = self.configured_providers()
+        if not configured:
+            raise RuntimeError(
+                "No LLM provider API key configured. Set one of OPENAI_API_KEY, "
+                "ANTHROPIC_API_KEY, or GOOGLE_API_KEY."
+            )
+        return configured[0]
+
+    def complete(self, request: LlmRequest) -> LlmResponse:
+        errors: list[str] = []
+        for provider in self.configured_providers():
+            try:
+                content = self._complete_with_provider(provider, request)
+                return LlmResponse(
+                    provider=provider.provider,
+                    model=provider.model,
+                    content=content,
+                    parsed=_parse_json_content(content),
+                )
+            except Exception as exc:  # Providers are fallbacks; preserve concise failure context.
+                errors.append(f"{provider.provider}: {exc}")
+        if not errors:
+            self.select_provider()
+        raise RuntimeError("All configured LLM providers failed: " + " | ".join(errors))
+
+    def _complete_with_provider(self, provider: ProviderConfig, request: LlmRequest) -> str:
+        if provider.provider == "openai":
+            return _openai_complete(provider, request)
+        if provider.provider == "anthropic":
+            return _anthropic_complete(provider, request)
+        if provider.provider == "google":
+            return _google_complete(provider, request)
+        raise ValueError(f"Unsupported provider: {provider.provider}")
+
+
+def _openai_complete(provider: ProviderConfig, request: LlmRequest) -> str:
+    body = {
+        "model": provider.model,
+        "input": request.prompt,
+        "temperature": 0,
+    }
+    data = _post_json(
+        "https://api.openai.com/v1/responses",
+        body,
+        {
+            "Authorization": f"Bearer {os.environ[provider.api_key_env]}",
+            "Content-Type": "application/json",
+        },
+    )
+    if isinstance(data.get("output_text"), str):
+        return data["output_text"]
+    chunks: list[str] = []
+    for item in data.get("output", []):
+        for content in item.get("content", []):
+            text = content.get("text")
+            if isinstance(text, str):
+                chunks.append(text)
+    return "\n".join(chunks).strip()
+
+
+def _anthropic_complete(provider: ProviderConfig, request: LlmRequest) -> str:
+    body = {
+        "model": provider.model,
+        "max_tokens": int(os.getenv("WIRELESS_TAXONOMY_LLM_MAX_TOKENS", "16000")),
+        "temperature": 0,
+        "messages": [{"role": "user", "content": request.prompt}],
+    }
+    data = _post_json(
+        "https://api.anthropic.com/v1/messages",
+        body,
+        {
+            "x-api-key": os.environ[provider.api_key_env],
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        },
+    )
+    return "\n".join(part.get("text", "") for part in data.get("content", []) if part.get("type") == "text").strip()
+
+
+def _google_complete(provider: ProviderConfig, request: LlmRequest) -> str:
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY")
+    body = {
+        "contents": [{"role": "user", "parts": [{"text": request.prompt}]}],
+        "generationConfig": {
+            "temperature": 0,
+            "responseMimeType": "application/json",
+        },
+    }
+    data = _post_json(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{quote(provider.model)}:generateContent?key={api_key}",
+        body,
+        {"Content-Type": "application/json"},
+    )
+    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    return "\n".join(part.get("text", "") for part in parts).strip()
+
+
+def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+    request = Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=int(os.getenv("WIRELESS_TAXONOMY_LLM_TIMEOUT_SECONDS", "120"))) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:1000]
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
+def _parse_json_content(content: str) -> dict[str, Any] | list[Any] | None:
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text.removeprefix("json").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = min((idx for idx in [text.find("{"), text.find("[")] if idx >= 0), default=-1)
+        end = max(text.rfind("}"), text.rfind("]"))
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+        return None
