@@ -32,8 +32,6 @@ class LlmSettings:
     primary_provider: LlmProvider
     fallback_providers: tuple[LlmProvider, ...]
     providers: dict[LlmProvider, ProviderConfig]
-    embedding_provider: LlmProvider
-    embedding_model: str
 
     def ordered_providers(self) -> tuple[ProviderConfig, ...]:
         ordered = (self.primary_provider, *self.fallback_providers)
@@ -53,7 +51,6 @@ class Settings:
     evidence_dir: Path
     llm: LlmSettings
     enable_web_search: bool
-    enable_metadata_check: bool
     thresholds: Thresholds
 
 
@@ -67,7 +64,6 @@ def load_settings(db_path: str | Path = "taxonomy.sqlite") -> Settings:
         evidence_dir=Path(evidence_dir) if evidence_dir else default_evidence_dir,
         llm=load_llm_settings(),
         enable_web_search=os.getenv("WIRELESS_TAXONOMY_ENABLE_WEB_SEARCH", "0") == "1",
-        enable_metadata_check=os.getenv("WIRELESS_TAXONOMY_ENABLE_METADATA_CHECK", "0") == "1",
         thresholds=Thresholds(),
     )
 
@@ -99,13 +95,10 @@ def load_llm_settings() -> LlmSettings:
             api_key_configured=bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
         ),
     }
-    embedding_provider = _provider(os.getenv("WIRELESS_TAXONOMY_EMBEDDING_PROVIDER", "openai"))
     return LlmSettings(
         primary_provider=primary,
         fallback_providers=fallbacks,
         providers=providers,
-        embedding_provider=embedding_provider,
-        embedding_model=os.getenv("WIRELESS_TAXONOMY_EMBEDDING_MODEL", "text-embedding-3-small"),
     )
 
 

@@ -31,6 +31,7 @@ def test_json_export_contains_nested_paper_records(tmp_path: Path) -> None:
     pipeline = Pipeline(load_settings(db))
     try:
         run_id = pipeline.ingest("SIGCOMM", 2025, "url", str(FIXTURES / "sigcomm_2025_papers_info.html"))
+        pipeline.enrich_paper_text(run_id)
         pipeline.export(run_id, str(out), "json")
     finally:
         pipeline.close()
@@ -41,5 +42,8 @@ def test_json_export_contains_nested_paper_records(tmp_path: Path) -> None:
     assert payload["run_id"] == run_id
     assert len(payload["papers"]) == 2
     assert "paper_sources" in payload["papers"][0]
+    assert "text_artifacts" in payload["papers"][0]
+    assert "paper_text_artifacts" in payload
+    assert payload["paper_text_artifacts"]
     assert "paper_list_verification_reports" in payload
     assert payload["papers"][0]["title"] == "Example Wireless Dataset Paper"

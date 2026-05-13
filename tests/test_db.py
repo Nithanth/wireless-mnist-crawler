@@ -15,3 +15,12 @@ def test_init_creates_expected_tables(tmp_path: Path) -> None:
     assert "papers" in tables
     assert "review_items" in tables
     assert "evidence_claims" in tables
+    assert "paper_text_artifacts" in tables
+    assert "paper_text_links" in tables
+    assert "paper_text_snippets" in tables
+    assert "scope_assessments" in tables
+    assert "paper_agentic_analyses" in tables
+    assert "paper_analysis_dataset_claims" in tables
+    assert "paper_analysis_reflections" in tables
+    assert "paper_input_readiness" in tables
+    assert "resolver_cache" in tables

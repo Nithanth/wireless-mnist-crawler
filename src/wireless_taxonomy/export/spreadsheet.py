@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 import sqlite3
 from pathlib import Path
@@ -81,15 +82,30 @@ class SpreadsheetExporter:
         rows = self.conn.execute(
             """
             SELECT d.canonical_name, p.bibtex_key, d.availability_status,
+                   GROUP_CONCAT(padc.modalities_json, '||') AS modalities_json,
+                   GROUP_CONCAT(padc.osi_layers_json, '||') AS osi_layers_json,
                    COUNT(DISTINCT pdl.paper_id) AS use_count
             FROM datasets d
             LEFT JOIN papers p ON p.id = d.source_paper_id
             LEFT JOIN paper_dataset_links pdl ON pdl.dataset_id = d.id
+            LEFT JOIN paper_analysis_dataset_claims padc ON padc.dataset_id = d.id
             GROUP BY d.id
             ORDER BY d.canonical_name
             """
         )
-        return [[r["canonical_name"], r["bibtex_key"] or "", "", "", _open_yes_no(r["availability_status"]), r["availability_status"] or "", "", r["use_count"]] for r in rows]
+        return [
+            [
+                r["canonical_name"],
+                r["bibtex_key"] or "",
+                ", ".join(_json_list_union(r["osi_layers_json"])),
+                ", ".join(_json_list_union(r["modalities_json"])),
+                _open_yes_no(r["availability_status"]),
+                r["availability_status"] or "",
+                "",
+                r["use_count"],
+            ]
+            for r in rows
+        ]
 
     def _bibtex(self) -> list[list[object]]:
         rows = self.conn.execute("SELECT citation_key, doi, bibtex FROM bibtex_entries ORDER BY citation_key")
@@ -156,3 +172,17 @@ def _open_yes_no(status: str | None) -> str:
     if status in {"not_available", "broken_link", "request_access", "metadata_only", "code_only"}:
         return "No"
     return "Unclear"
+
+
+def _json_list_union(value: str | None) -> list[str]:
+    if not value:
+        return []
+    items: set[str] = set()
+    for raw in value.split("||"):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, list):
+            items.update(str(item) for item in parsed if str(item).strip())
+    return sorted(items)

@@ -13,6 +13,10 @@ from wireless_taxonomy.ingest.clean_page import fetch_clean_page
 from wireless_taxonomy.llm import LlmRequest, LlmRouter
 
 
+TITLE_PROSE_START = re.compile(r"(?i)^(this paper|in this paper|we present|we propose|we introduce|our work)\b")
+AUTHOR_PROSE_PHRASES = re.compile(r"(?i)\b(this paper|we present|we propose|we introduce|we evaluate|evaluations? show)\b")
+
+
 @dataclass(frozen=True)
 class VerificationIssue:
     field: str
@@ -190,6 +194,7 @@ def _deterministic_issues(papers: list[dict[str, Any]]) -> list[VerificationIssu
                 issues.append(
                     VerificationIssue(label, paper.get("id"), paper.get("title"), "review", f"Missing {label}", None, 0.0)
                 )
+        issues.extend(_structural_issues(paper))
         if float(paper.get("source_confidence") or 0) < 0.90:
             issues.append(
                 VerificationIssue(
@@ -209,6 +214,32 @@ def _deterministic_issues(papers: list[dict[str, Any]]) -> list[VerificationIssu
                     VerificationIssue("Paper Title", paper.get("id"), paper.get("title"), "review", "Duplicate title", paper.get("title"), 0.50)
                 )
     return issues
+
+
+def _structural_issues(paper: dict[str, Any]) -> list[VerificationIssue]:
+    title = str(paper.get("title") or "").strip()
+    authors = str(paper.get("authors") or "").strip()
+    reasons: list[str] = []
+    if len(title) > 240:
+        reasons.append("Paper title is unusually long")
+    if len(title) > 140 and TITLE_PROSE_START.search(title):
+        reasons.append("Paper title looks like abstract prose")
+    if len(authors) > 500 and AUTHOR_PROSE_PHRASES.search(authors):
+        reasons.append("Authors field appears to contain abstract or neighboring paper text")
+    if not reasons:
+        return []
+    return [
+        VerificationIssue(
+            "Paper Structure",
+            paper.get("id"),
+            paper.get("title"),
+            "review",
+            "; ".join(reasons),
+            None,
+            0.80,
+            evidence=f"title={title[:300]} authors={authors[:300]}",
+        )
+    ]
 
 
 def _counts(
