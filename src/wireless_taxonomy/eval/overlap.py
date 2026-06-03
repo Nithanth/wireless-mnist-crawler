@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from difflib import SequenceMatcher
+from typing import Any
+
+from wireless_taxonomy.textnorm import normalize_doi, normalize_title
+
+
+@dataclass(frozen=True)
+class PaperRef:
+    """A paper identity used for set matching."""
+
+    key: str
+    title: str
+    normalized_title: str
+    normalized_doi: str
+
+    @classmethod
+    def build(cls, key: str, title: str | None, doi: str | None = None) -> "PaperRef":
+        return cls(
+            key=key,
+            title=title or "",
+            normalized_title=normalize_title(title),
+            normalized_doi=normalize_doi(doi),
+        )
+
+
+@dataclass
+class MatchResult:
+    matched: list[tuple[PaperRef, PaperRef]] = field(default_factory=list)
+    unmatched_a: list[PaperRef] = field(default_factory=list)
+    unmatched_b: list[PaperRef] = field(default_factory=list)
+
+
+def match(a_refs: list[PaperRef], b_refs: list[PaperRef], fuzzy_threshold: float = 0.92) -> MatchResult:
+    """Match two sets of papers: DOI -> normalized title -> fuzzy title.
+
+    Each B item is consumed at most once. ``fuzzy_threshold`` of 1.0 disables
+    fuzzy matching and requires an exact normalized-title (or DOI) match.
+    """
+    result = MatchResult()
+    remaining = list(b_refs)
+    doi_index: dict[str, PaperRef] = {ref.normalized_doi: ref for ref in remaining if ref.normalized_doi}
+    title_index: dict[str, PaperRef] = {}
+    for ref in remaining:
+        if ref.normalized_title and ref.normalized_title not in title_index:
+            title_index[ref.normalized_title] = ref
+    consumed: set[int] = set()
+
+    for a in a_refs:
+        chosen: PaperRef | None = None
+        if a.normalized_doi and a.normalized_doi in doi_index:
+            candidate = doi_index[a.normalized_doi]
+            if id(candidate) not in consumed:
+                chosen = candidate
+        if chosen is None and a.normalized_title and a.normalized_title in title_index:
+            candidate = title_index[a.normalized_title]
+            if id(candidate) not in consumed:
+                chosen = candidate
+        if chosen is None and fuzzy_threshold < 1.0 and a.normalized_title:
+            chosen = _best_fuzzy(a, remaining, consumed, fuzzy_threshold)
+        if chosen is None:
+            result.unmatched_a.append(a)
+        else:
+            consumed.add(id(chosen))
+            result.matched.append((a, chosen))
+
+    result.unmatched_b = [ref for ref in remaining if id(ref) not in consumed]
+    return result
+
+
+def _best_fuzzy(a: PaperRef, candidates: list[PaperRef], consumed: set[int], threshold: float) -> PaperRef | None:
+    best: PaperRef | None = None
+    best_score = threshold
+    for b in candidates:
+        if id(b) in consumed or not b.normalized_title:
+            continue
+        score = SequenceMatcher(None, a.normalized_title, b.normalized_title).ratio()
+        if score >= best_score:
+            best_score = score
+            best = b
+    return best
+
+
+@dataclass(frozen=True)
+class Metrics:
+    tp: int
+    fp: int
+    fn: int
+
+    @property
+    def jaccard(self) -> float:
+        denom = self.tp + self.fp + self.fn
+        return self.tp / denom if denom else 0.0
+
+    @property
+    def precision(self) -> float:
+        denom = self.tp + self.fp
+        return self.tp / denom if denom else 0.0
+
+    @property
+    def recall(self) -> float:
+        denom = self.tp + self.fn
+        return self.tp / denom if denom else 0.0
+
+    @property
+    def f1(self) -> float:
+        denom = self.precision + self.recall
+        return 2 * self.precision * self.recall / denom if denom else 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tp": self.tp,
+            "fp": self.fp,
+            "fn": self.fn,
+            "jaccard": round(self.jaccard, 4),
+            "precision": round(self.precision, 4),
+            "recall": round(self.recall, 4),
+            "f1": round(self.f1, 4),
+        }
+
+
+def jaccard(pred_keys: set[str], gold_keys: set[str]) -> float:
+    union = pred_keys | gold_keys
+    return len(pred_keys & gold_keys) / len(union) if union else 0.0
+
+
+def aggregate(instance_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-(venue, year) count rows into per-venue and overall metrics.
+
+    ``instance_rows`` each carry: venue, year, tp, fp, fn, fn_missed,
+    fn_missing_from_universe. Uses pandas for the grouping the user asked for.
+    """
+    import pandas as pd
+
+    if not instance_rows:
+        return {"per_conference_year": [], "per_conference": [], "overall": Metrics(0, 0, 0).to_dict()}
+
+    df = pd.DataFrame(instance_rows)
+    count_cols = ["tp", "fp", "fn", "fn_missed", "fn_missing_from_universe"]
+
+    per_year = [_row_with_metrics(row) for row in instance_rows]
+
+    per_conf_df = df.groupby("venue", as_index=False)[count_cols].sum()
+    per_conf = [_row_with_metrics(row) for row in per_conf_df.to_dict("records")]
+
+    totals = df[count_cols].sum().to_dict()
+    overall = _row_with_metrics(totals)
+
+    return {
+        "per_conference_year": per_year,
+        "per_conference": per_conf,
+        "overall": overall,
+    }
+
+
+def _row_with_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    metrics = Metrics(int(row["tp"]), int(row["fp"]), int(row["fn"]))
+    out: dict[str, Any] = {}
+    for key in ("venue", "year"):
+        if key in row and row[key] is not None:
+            out[key] = row[key]
+    out.update(metrics.to_dict())
+    out["fn_missed"] = int(row.get("fn_missed", 0))
+    out["fn_missing_from_universe"] = int(row.get("fn_missing_from_universe", 0))
+    return out
