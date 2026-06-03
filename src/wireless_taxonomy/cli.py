@@ -157,6 +157,20 @@ def classify_wireless(run_id: int = typer.Option(..., "--run-id"), db: str = typ
         pipeline.close()
 
 
+@app.command("enrich-abstracts")
+def enrich_abstracts(
+    run_id: int = typer.Option(..., "--run-id"),
+    overwrite: bool = typer.Option(False, "--overwrite/--missing-only", help="Refetch even papers that already have an abstract."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    pipeline = _pipeline(db)
+    try:
+        stage_run = pipeline.enrich_abstracts(run_id, overwrite=overwrite)
+        typer.echo(f"Abstract enrichment completed. run_id={stage_run}")
+    finally:
+        pipeline.close()
+
+
 @app.command("classify-candidates")
 def classify_candidates(
     run_id: int = typer.Option(..., "--run-id"),

@@ -142,6 +142,56 @@ class Pipeline:
         logger.event("classify_wireless_completed", {"paper_count": len(rows), "review_count": review_count})
         return stage_run_id
 
+    def enrich_abstracts(self, run_id: int, overwrite: bool = False, enricher=None) -> int:
+        """Backfill missing paper abstracts from open metadata APIs.
+
+        Pulls abstracts from OpenAlex/Crossref/Semantic Scholar (metadata, not
+        the paywalled PDF), so it sidesteps the ACM full-text block.
+        """
+        from wireless_taxonomy.analyze.abstracts import AbstractEnricher
+
+        source_run = self._require_run(run_id)
+        conference_instance_id = source_run["conference_instance_id"]
+        stage_run_id = self._create_run(conference_instance_id, "enrich-abstracts", "run", str(run_id))
+        logger = EvidenceLogger(self.settings.evidence_dir, stage_run_id)
+        enricher = enricher or AbstractEnricher()
+        rows = self.conn.execute(
+            "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
+        ).fetchall()
+        filled = 0
+        attempted = 0
+        with transaction(self.conn):
+            for paper in rows:
+                existing = (paper["abstract"] or "").strip()
+                if existing and not overwrite:
+                    continue
+                attempted += 1
+                result = enricher.fetch(paper["title"], paper["doi"])
+                if result is None:
+                    continue
+                self.conn.execute("UPDATE papers SET abstract = ? WHERE id = ?", (result.abstract, paper["id"]))
+                self._insert_evidence(
+                    stage_run_id,
+                    paper["id"],
+                    None,
+                    "abstract_enrichment",
+                    result.provider,
+                    result.abstract[:1000],
+                    result.source_url,
+                    0.85,
+                    {"provider": result.provider},
+                )
+                filled += 1
+            self._complete_run(
+                stage_run_id,
+                f"Filled {filled}/{attempted} missing abstracts ({len(rows)} papers total).",
+            )
+        logger.event(
+            "enrich_abstracts_completed",
+            {"papers": len(rows), "attempted": attempted, "filled": filled, "overwrite": overwrite},
+        )
+        return stage_run_id
+
     def classify_candidates(self, run_id: int, use_llm: bool = False) -> int:
         """Wireless-candidate screening from title + abstract only.
 
