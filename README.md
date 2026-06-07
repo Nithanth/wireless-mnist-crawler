@@ -421,6 +421,48 @@ Supported formats:
 
 The intended end state is a clean CSV/XLSX workbook that matches the manual taxonomy structure and sends uncertain rows to `Review Needed`.
 
+## Paper-List Coverage (Jaccard)
+
+When automated full-text fetching is blocked (e.g. ACM), the pipeline can still extract titles and abstracts. To measure how well automated ingestion recovers a conference's paper list against a manually curated set, the CLI can emit a flat paper set and compute a Jaccard (intersection-over-union) score keyed on normalized titles.
+
+### Export the fetched paper set
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
+  --run-id 1 \
+  --out sigcomm-2025-papers.csv \
+  --format csv \
+  --db taxonomy.sqlite
+```
+
+This emits one conference-scoped row per fetched paper with these columns:
+
+```text
+match_key, title, abstract, authors, doi, year, venue
+```
+
+`match_key` is the normalized title (lowercased, alphanumeric-only). `--format json` is also supported. Unlike the full workbook export, this output is scoped to the run's conference instance so it can be compared cleanly against a single conference's manual list.
+
+### Compute Jaccard against a manual list
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard \
+  --run-id 1 \
+  --manual manual-sigcomm-2025.csv \
+  --out coverage-report.json \
+  --db taxonomy.sqlite
+```
+
+The manual CSV's title column is auto-detected (`title`, `paper title`, `paper_title`, case-insensitive); override with `--title-col "Paper Title"`. Both sides are normalized with the same `normalize_title` used in matching, so keys line up deterministically.
+
+The command prints the index and counts, and `--out` writes a diff report:
+
+```text
+Paper-list coverage (Jaccard/IoU). index=0.8421 intersection=80 union=95 automated=82 manual=93 missed_by_cli=11 extra_from_cli=2 title_column='Paper Title'
+```
+
+The JSON report lists `matched`, `missed_by_cli` (in the manual list but not fetched), and `extra_from_cli` (fetched but absent from the manual list) so coverage gaps are diagnosable, not just a single number.
+
 ## One-Command Run
 
 The CLI has a convenience `run` command:

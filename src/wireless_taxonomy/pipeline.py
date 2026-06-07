@@ -21,6 +21,8 @@ from wireless_taxonomy.db import connect, migrate, transaction
 from wireless_taxonomy.evidence import EvidenceLogger
 from wireless_taxonomy.export.spreadsheet import SpreadsheetExporter
 from wireless_taxonomy.export.json_export import JsonExporter
+from wireless_taxonomy.export.paper_set import PaperSetExporter
+from wireless_taxonomy.evaluate.jaccard import JaccardReport, compute_paper_list_jaccard, write_jaccard_report
 from wireless_taxonomy.ingest.base import validate_paper_seeds
 from wireless_taxonomy.ingest.bibtex import BibtexIngestAdapter
 from wireless_taxonomy.ingest.csv import CsvIngestAdapter
@@ -1030,6 +1032,15 @@ class Pipeline:
         if fmt == "json":
             return JsonExporter(self.conn).export(run_id, out, scope)
         return SpreadsheetExporter(self.conn).export(run_id, out, fmt)
+
+    def export_paper_set(self, run_id: int, out: str, fmt: str = "csv") -> Path:
+        return PaperSetExporter(self.conn).export(run_id, out, fmt)
+
+    def jaccard(self, run_id: int, manual_csv: str, title_col: str | None = None, out: str | None = None) -> JaccardReport:
+        report = compute_paper_list_jaccard(self.conn, run_id, manual_csv, title_col=title_col)
+        if out:
+            write_jaccard_report(report, out)
+        return report
 
     def status(self, run_id: int | None = None) -> list[sqlite3.Row]:
         if run_id is None:

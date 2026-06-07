@@ -371,6 +371,50 @@ def export(
         pipeline.close()
 
 
+@app.command("paper-set")
+def paper_set(
+    run_id: int = typer.Option(..., "--run-id"),
+    out: str = typer.Option(..., "--out"),
+    fmt: str = typer.Option("csv", "--format", help="csv or json."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    """Export the conference-scoped set of fetched papers (match_key, title, abstract, ...)."""
+    pipeline = _pipeline(db)
+    try:
+        path = pipeline.export_paper_set(run_id, out, fmt)
+        typer.echo(f"Exported paper set ({fmt}): {path}")
+    finally:
+        pipeline.close()
+
+
+@app.command()
+def jaccard(
+    run_id: int = typer.Option(..., "--run-id"),
+    manual: str = typer.Option(..., "--manual", help="CSV of the manually curated paper list."),
+    title_col: Optional[str] = typer.Option(
+        None, "--title-col", help="Column in the manual CSV holding paper titles. Auto-detected when omitted."
+    ),
+    out: Optional[str] = typer.Option(None, "--out", help="Write the full diff report JSON to this path."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    """Jaccard (IoU) of fetched papers vs a manually curated list, by normalized title."""
+    pipeline = _pipeline(db)
+    try:
+        report = pipeline.jaccard(run_id, manual, title_col=title_col, out=out)
+        typer.echo(
+            "Paper-list coverage (Jaccard/IoU). "
+            f"index={report.jaccard_index:.4f} "
+            f"intersection={report.intersection_count} union={report.union_count} "
+            f"automated={report.automated_count} manual={report.manual_count} "
+            f"missed_by_cli={len(report.missed_by_cli)} extra_from_cli={len(report.extra_from_cli)} "
+            f"title_column={report.title_column!r}"
+        )
+        if out:
+            typer.echo(f"Wrote diff report: {out}")
+    finally:
+        pipeline.close()
+
+
 @app.command()
 def status(run_id: Optional[int] = typer.Option(None, "--run-id"), db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
     pipeline = _pipeline(db)

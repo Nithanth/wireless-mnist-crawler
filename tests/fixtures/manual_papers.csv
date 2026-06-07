@@ -1,0 +1,4 @@
+Paper Title,Notes
+Example Wireless Dataset Paper,matches the fetched set
+example   wireless   dataset  paper,duplicate after normalization
+A Manually Curated Paper Not Fetched,missed by the cli
