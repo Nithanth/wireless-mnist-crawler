@@ -11,6 +11,13 @@ from typer.core import TyperArgument, TyperOption
 
 from wireless_taxonomy.config import load_settings
 from wireless_taxonomy.evaluate.jaccard import format_aggregate_summary, format_report_summary
+from wireless_taxonomy.evaluate.run_diff import (
+    diff_paper_sets,
+    format_diff_summary,
+    load_paper_set,
+    write_diff_csv,
+    write_diff_report,
+)
 from wireless_taxonomy.pipeline import Pipeline
 from wireless_taxonomy.review.interactive import review_summary
 
@@ -478,6 +485,40 @@ def paper_set(
         typer.echo(f"Exported paper set ({fmt}): {path}")
     finally:
         pipeline.close()
+
+
+@app.command("diff-sets")
+def diff_sets(
+    a: str = typer.Option(..., "--a", help="First paper-set export (csv or json) — e.g. the URL+LLM run."),
+    b: str = typer.Option(..., "--b", help="Second paper-set export (csv or json) — e.g. the DBLP+OpenAlex run."),
+    label_a: str = typer.Option("A", "--label-a", help="Display label for the first set."),
+    label_b: str = typer.Option("B", "--label-b", help="Display label for the second set."),
+    fuzzy: bool = typer.Option(
+        True,
+        "--fuzzy/--exact",
+        help="Match near-duplicate titles (difflib + author overlap) vs exact normalized title only.",
+    ),
+    out: Optional[str] = typer.Option(None, "--out", help="Write the full diff report JSON to this path."),
+    csv_out: Optional[str] = typer.Option(
+        None, "--csv", help="Write a per-paper diff CSV (status / match type / abstract flags) to this path."
+    ),
+) -> None:
+    """Diff two `paper-set` exports to measure how reliably two automated sources agree.
+
+    Compares two automated paper sets (e.g. a URL+LLM ingest vs a DBLP+OpenAlex
+    ingest) and reports their Jaccard overlap, the papers unique to each side, and
+    abstract coverage per side. No database needed — it operates on the exported files.
+    """
+    rows_a = load_paper_set(a)
+    rows_b = load_paper_set(b)
+    summary, diff_rows = diff_paper_sets(rows_a, rows_b, fuzzy=fuzzy, label_a=label_a, label_b=label_b)
+    typer.echo(format_diff_summary(summary))
+    if out:
+        path = write_diff_report(summary, diff_rows, out)
+        typer.echo(f"Wrote diff report: {path}")
+    if csv_out:
+        path = write_diff_csv(diff_rows, csv_out)
+        typer.echo(f"Wrote per-paper diff CSV: {path}")
 
 
 @app.command()
