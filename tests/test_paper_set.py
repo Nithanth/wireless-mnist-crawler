@@ -5,7 +5,15 @@ from pathlib import Path
 import pytest
 
 from wireless_taxonomy.config import load_settings
-from wireless_taxonomy.evaluate.jaccard import detect_title_column
+from wireless_taxonomy.evaluate.jaccard import (
+    COMPARISON_COLUMNS,
+    comparison_rows,
+    comparison_rows_all,
+    detect_title_column,
+    evaluate_run,
+    format_aggregate_summary,
+    format_report_summary,
+)
 from wireless_taxonomy.export.paper_set import PAPER_SET_COLUMNS
 from wireless_taxonomy.pipeline import Pipeline
 
@@ -242,6 +250,101 @@ def test_jaccard_all_auto_classifies_unclassified_conferences(tmp_path: Path) ->
 
     assert aggregate.skipped == []
     assert {r.venue for r in aggregate.reports} == {"NSDI", "SIGCOMM"}
+
+
+def test_paper_set_surfaces_wireless_confidence(tmp_path: Path) -> None:
+    pipeline, run_id = _ingest(tmp_path)
+    try:
+        pipeline.classify_wireless(run_id)
+        path = pipeline.export_paper_set(run_id, str(tmp_path / "ps.csv"), "csv", wireless_only=True)
+    finally:
+        pipeline.close()
+    with path.open(encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert "wireless_label" in rows[0] and "wireless_confidence" in rows[0]
+    wireless = rows[0]
+    assert wireless["wireless_label"] == "yes"
+    assert float(wireless["wireless_confidence"]) > 0
+
+
+def test_comparison_rows_status_and_confidence(tmp_path: Path) -> None:
+    pipeline, run_id = _ingest(tmp_path)
+    try:
+        pipeline.classify_wireless(run_id)
+        evaluation = evaluate_run(pipeline.conn, run_id, str(MANUAL))
+        rows = comparison_rows(evaluation)
+    finally:
+        pipeline.close()
+
+    by_status: dict[str, list[dict]] = {}
+    for row in rows:
+        assert list(row.keys()) == COMPARISON_COLUMNS
+        by_status.setdefault(row["status"], []).append(row)
+
+    assert set(by_status) == {"matched", "missed_by_cli"}
+    matched = by_status["matched"][0]
+    assert matched["manual_title"] == "Example Wireless Dataset Paper"
+    assert matched["automated_title"] == "Example Wireless Dataset Paper"
+    assert matched["wireless_label"] == "yes"
+    assert float(matched["wireless_confidence"]) > 0
+    # The curated-but-not-fetched paper has no automated counterpart / confidence.
+    missed = by_status["missed_by_cli"][0]
+    assert missed["manual_title"] == "A Manually Curated Paper Not Fetched"
+    assert missed["automated_title"] == ""
+    assert missed["wireless_confidence"] == ""
+
+
+def test_jaccard_writes_comparison_csv(tmp_path: Path) -> None:
+    pipeline, run_id = _ingest(tmp_path)
+    csv_out = tmp_path / "comparison.csv"
+    try:
+        pipeline.classify_wireless(run_id)
+        pipeline.jaccard(run_id, str(MANUAL), csv_out=str(csv_out))
+    finally:
+        pipeline.close()
+    assert csv_out.exists()
+    with csv_out.open(encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        assert reader.fieldnames == COMPARISON_COLUMNS
+        statuses = {row["status"] for row in reader}
+    assert statuses == {"matched", "missed_by_cli"}
+
+
+def test_comparison_rows_all_spans_conferences(tmp_path: Path) -> None:
+    pipeline, sigcomm, nsdi = _ingest_two_conferences(tmp_path)
+    try:
+        pipeline.classify_wireless(sigcomm)
+        pipeline.classify_wireless(nsdi)
+        rows = comparison_rows_all(pipeline.conn, str(MANUAL), wireless_only=False)
+    finally:
+        pipeline.close()
+    venues = {row["venue"] for row in rows}
+    assert venues == {"SIGCOMM", "NSDI"}
+    assert all(list(row.keys()) == COMPARISON_COLUMNS for row in rows)
+
+
+def test_format_report_summary_is_readable(tmp_path: Path) -> None:
+    pipeline, run_id = _ingest(tmp_path)
+    try:
+        pipeline.classify_wireless(run_id)
+        report = pipeline.jaccard(run_id, str(MANUAL))
+    finally:
+        pipeline.close()
+    text = format_report_summary(report)
+    assert "SIGCOMM 2025" in text
+    assert "Jaccard (IoU) = 0.5000" in text
+    assert "mean wireless confidence" in text
+
+
+def test_format_aggregate_summary_lists_conferences(tmp_path: Path) -> None:
+    pipeline, _, _ = _ingest_two_conferences(tmp_path)
+    try:
+        aggregate = pipeline.jaccard_all(str(MANUAL), wireless_only=False)
+    finally:
+        pipeline.close()
+    text = format_aggregate_summary(aggregate)
+    assert "micro" in text and "macro" in text
+    assert "NSDI 2024" in text and "SIGCOMM 2025" in text
 
 
 def test_detect_title_column_errors_when_missing() -> None:

@@ -10,6 +10,7 @@ import typer
 from typer.core import TyperArgument, TyperOption
 
 from wireless_taxonomy.config import load_settings
+from wireless_taxonomy.evaluate.jaccard import format_aggregate_summary, format_report_summary
 from wireless_taxonomy.pipeline import Pipeline
 from wireless_taxonomy.review.interactive import review_summary
 
@@ -445,6 +446,9 @@ def jaccard(
         help="Match near-duplicate titles (difflib + author overlap) vs exact normalized title only.",
     ),
     out: Optional[str] = typer.Option(None, "--out", help="Write the full diff report JSON to this path."),
+    csv_out: Optional[str] = typer.Option(
+        None, "--csv", help="Write a per-paper comparison CSV (status + classifier confidence) to this path."
+    ),
     db: str = typer.Option("taxonomy.sqlite", "--db"),
 ) -> None:
     """Jaccard (IoU) of the pipeline's papers vs a manually curated list, by normalized title."""
@@ -462,20 +466,13 @@ def jaccard(
             conference_filter=conference_filter,
             fuzzy=fuzzy,
             out=out,
+            csv_out=csv_out,
         )
-        typer.echo(
-            "Paper-list coverage (Jaccard/IoU). "
-            f"venue={report.venue} year={report.year} "
-            f"wireless_only={report.wireless_only} fuzzy={report.fuzzy} conference_filtered={report.conference_filtered} "
-            f"index={report.jaccard_index:.4f} "
-            f"intersection={report.intersection_count} union={report.union_count} "
-            f"automated={report.automated_count} manual={report.manual_count} "
-            f"fuzzy_matches={len(report.fuzzy_matches)} "
-            f"missed_by_cli={len(report.missed_by_cli)} extra_from_cli={len(report.extra_from_cli)} "
-            f"title_column={report.title_column!r}"
-        )
+        typer.echo(format_report_summary(report))
         if out:
-            typer.echo(f"Wrote diff report: {out}")
+            typer.echo(f"Wrote diff report (JSON): {out}")
+        if csv_out:
+            typer.echo(f"Wrote comparison (CSV): {csv_out}")
     finally:
         pipeline.close()
 
@@ -502,6 +499,9 @@ def jaccard_all(
         help="Run keyword classify-wireless for any unclassified conference before comparing (only when --wireless-only and --wireless-source classify).",
     ),
     out: Optional[str] = typer.Option(None, "--out", help="Write the full aggregate report JSON to this path."),
+    csv_out: Optional[str] = typer.Option(
+        None, "--csv", help="Write a combined per-paper comparison CSV across all conferences to this path."
+    ),
     db: str = typer.Option("taxonomy.sqlite", "--db"),
 ) -> None:
     """Jaccard across every conference instance in the DB, with micro/macro roll-ups."""
@@ -518,24 +518,13 @@ def jaccard_all(
             fuzzy=fuzzy,
             auto_classify=auto_classify,
             out=out,
+            csv_out=csv_out,
         )
-        for report in aggregate.reports:
-            typer.echo(
-                f"{report.venue} {report.year}: index={report.jaccard_index:.4f} "
-                f"intersection={report.intersection_count} union={report.union_count} "
-                f"automated={report.automated_count} manual={report.manual_count} "
-                f"fuzzy_matches={len(report.fuzzy_matches)} "
-                f"missed_by_cli={len(report.missed_by_cli)} extra_from_cli={len(report.extra_from_cli)}"
-            )
-        for entry in aggregate.skipped:
-            typer.echo(f"SKIPPED {entry['venue']} {entry['year']}: {entry['reason']}")
-        typer.echo(
-            "Aggregate coverage (Jaccard/IoU). "
-            f"conferences={len(aggregate.reports)} skipped={len(aggregate.skipped)} "
-            f"micro={aggregate.micro_index:.4f} macro={aggregate.macro_index:.4f}"
-        )
+        typer.echo(format_aggregate_summary(aggregate))
         if out:
-            typer.echo(f"Wrote aggregate report: {out}")
+            typer.echo(f"Wrote aggregate report (JSON): {out}")
+        if csv_out:
+            typer.echo(f"Wrote comparison (CSV): {csv_out}")
     finally:
         pipeline.close()
 

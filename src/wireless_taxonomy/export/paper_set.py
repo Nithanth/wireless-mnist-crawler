@@ -9,7 +9,17 @@ from typing import Any
 
 from wireless_taxonomy.analyze.text_match import normalize_title
 
-PAPER_SET_COLUMNS = ["match_key", "title", "abstract", "authors", "doi", "year", "venue"]
+PAPER_SET_COLUMNS = [
+    "match_key",
+    "title",
+    "abstract",
+    "authors",
+    "doi",
+    "year",
+    "venue",
+    "wireless_label",
+    "wireless_confidence",
+]
 
 # Where the per-paper wireless decision comes from when restricting the set.
 WIRELESS_SOURCES = ("classify", "agentic")
@@ -66,18 +76,25 @@ class PaperSetExporter:
         if wireless_only:
             allowed = self._wireless_paper_ids(ref.conference_instance_id, wireless_source)
             papers = [paper for paper in papers if paper["id"] in allowed]
-        return [
-            {
-                "match_key": normalize_title(paper["title"]),
-                "title": paper["title"],
-                "abstract": paper["abstract"] or "",
-                "authors": paper["authors"] or "",
-                "doi": paper["doi"] or "",
-                "year": paper["year"],
-                "venue": paper["venue"],
-            }
-            for paper in papers
-        ]
+        classifications = self._classifications(ref.conference_instance_id)
+        rows: list[dict[str, Any]] = []
+        for paper in papers:
+            cls = classifications.get(paper["id"], {})
+            confidence = cls.get("confidence")
+            rows.append(
+                {
+                    "match_key": normalize_title(paper["title"]),
+                    "title": paper["title"],
+                    "abstract": paper["abstract"] or "",
+                    "authors": paper["authors"] or "",
+                    "doi": paper["doi"] or "",
+                    "year": paper["year"],
+                    "venue": paper["venue"],
+                    "wireless_label": cls.get("label") or "",
+                    "wireless_confidence": "" if confidence is None else round(float(confidence), 4),
+                }
+            )
+        return rows
 
     def export(
         self,
@@ -105,6 +122,29 @@ class PaperSetExporter:
             writer.writeheader()
             writer.writerows(rows)
         return output
+
+    def _classifications(self, conference_instance_id: int) -> dict[int, dict[str, Any]]:
+        """Per-paper wireless label + confidence from the latest classify-wireless run.
+
+        Empty when the conference has not been classified yet. Used to surface the
+        classifier's confidence alongside each exported paper.
+        """
+
+        stage_run_id = self._latest_stage_run_id(conference_instance_id, "classify-wireless")
+        if stage_run_id is None:
+            return {}
+        rows = self.conn.execute(
+            "SELECT paper_id, label, confidence, is_wireless FROM paper_classifications WHERE run_id = ?",
+            (stage_run_id,),
+        ).fetchall()
+        return {
+            int(row["paper_id"]): {
+                "label": row["label"],
+                "confidence": row["confidence"],
+                "is_wireless": row["is_wireless"],
+            }
+            for row in rows
+        }
 
     def _wireless_paper_ids(self, conference_instance_id: int, wireless_source: str) -> set[int]:
         if wireless_source not in WIRELESS_SOURCES:

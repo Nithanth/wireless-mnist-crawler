@@ -26,9 +26,13 @@ from wireless_taxonomy.export.paper_set import PaperSetExporter
 from wireless_taxonomy.evaluate.jaccard import (
     JaccardAggregate,
     JaccardReport,
-    compute_paper_list_jaccard,
+    comparison_rows,
+    comparison_rows_all,
     compute_paper_list_jaccard_all,
+    evaluate_run,
     list_conference_runs,
+    report_from_evaluation,
+    write_comparison_csv,
     write_jaccard_aggregate,
     write_jaccard_report,
 )
@@ -1107,8 +1111,9 @@ class Pipeline:
         conference_filter: bool = True,
         fuzzy: bool = True,
         out: str | None = None,
+        csv_out: str | None = None,
     ) -> JaccardReport:
-        report = compute_paper_list_jaccard(
+        evaluation = evaluate_run(
             self.conn,
             run_id,
             manual_csv,
@@ -1121,8 +1126,11 @@ class Pipeline:
             conference_filter=conference_filter,
             fuzzy=fuzzy,
         )
+        report = report_from_evaluation(evaluation)
         if out:
             write_jaccard_report(report, out)
+        if csv_out:
+            write_comparison_csv(comparison_rows(evaluation), csv_out)
         return report
 
     def jaccard_all(
@@ -1137,6 +1145,7 @@ class Pipeline:
         fuzzy: bool = True,
         auto_classify: bool = True,
         out: str | None = None,
+        csv_out: str | None = None,
     ) -> JaccardAggregate:
         if wireless_only and auto_classify and wireless_source == "classify":
             for run_id, _venue, _year in list_conference_runs(self.conn):
@@ -1156,6 +1165,19 @@ class Pipeline:
         )
         if out:
             write_jaccard_aggregate(aggregate, out)
+        if csv_out:
+            rows = comparison_rows_all(
+                self.conn,
+                manual_csv,
+                title_col=title_col,
+                authors_col=authors_col,
+                conference_col=conference_col,
+                year_col=year_col,
+                wireless_only=wireless_only,
+                wireless_source=wireless_source,
+                fuzzy=fuzzy,
+            )
+            write_comparison_csv(rows, csv_out)
         return aggregate
 
     def status(self, run_id: int | None = None) -> list[sqlite3.Row]:
