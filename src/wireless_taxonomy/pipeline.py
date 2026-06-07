@@ -27,6 +27,7 @@ from wireless_taxonomy.evaluate.jaccard import (
     JaccardReport,
     compute_paper_list_jaccard,
     compute_paper_list_jaccard_all,
+    list_conference_runs,
     write_jaccard_aggregate,
     write_jaccard_report,
 )
@@ -1093,8 +1094,14 @@ class Pipeline:
         wireless_only: bool = True,
         wireless_source: str = "classify",
         fuzzy: bool = True,
+        auto_classify: bool = True,
         out: str | None = None,
     ) -> JaccardAggregate:
+        if wireless_only and auto_classify and wireless_source == "classify":
+            for run_id, _venue, _year in list_conference_runs(self.conn):
+                ci_id = self._require_run(run_id)["conference_instance_id"]
+                if self._latest_stage_run_id(ci_id, "classify-wireless") is None:
+                    self.classify_wireless(run_id)
         aggregate = compute_paper_list_jaccard_all(
             self.conn,
             manual_csv,

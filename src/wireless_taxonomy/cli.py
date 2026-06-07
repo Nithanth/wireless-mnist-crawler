@@ -479,6 +479,11 @@ def jaccard_all(
     fuzzy: bool = typer.Option(
         True, "--fuzzy/--exact", help="Match near-duplicate titles (difflib + author overlap) vs exact only."
     ),
+    auto_classify: bool = typer.Option(
+        True,
+        "--auto-classify/--no-auto-classify",
+        help="Run keyword classify-wireless for any unclassified conference before comparing (only when --wireless-only and --wireless-source classify).",
+    ),
     out: Optional[str] = typer.Option(None, "--out", help="Write the full aggregate report JSON to this path."),
     db: str = typer.Option("taxonomy.sqlite", "--db"),
 ) -> None:
@@ -494,6 +499,7 @@ def jaccard_all(
             wireless_only=wireless_only,
             wireless_source=wireless_source,
             fuzzy=fuzzy,
+            auto_classify=auto_classify,
             out=out,
         )
         for report in aggregate.reports:

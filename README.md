@@ -486,13 +486,15 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard-all \
 ```text
 NSDI 2024: index=0.8000 intersection=16 union=20 automated=18 manual=18 fuzzy_matches=3 missed_by_cli=2 extra_from_cli=2
 SIGCOMM 2025: index=0.7500 intersection=6 union=8 automated=7 manual=7 fuzzy_matches=1 missed_by_cli=1 extra_from_cli=1
-SKIPPED GLOBECOM 2023: No 'classify-wireless' run found for this conference. ...
-Aggregate coverage (Jaccard/IoU). conferences=2 skipped=1 micro=0.7857 macro=0.7750
+GLOBECOM 2023: index=0.6667 intersection=4 union=6 automated=5 manual=5 fuzzy_matches=0 missed_by_cli=1 extra_from_cli=1
+Aggregate coverage (Jaccard/IoU). conferences=3 skipped=0 micro=0.7692 macro=0.7389
 ```
+
+(With `--no-auto-classify`, any conference lacking a `classify-wireless` run is printed as `SKIPPED <venue> <year>: ...` instead and excluded from the roll-up.)
 
 - **micro** pools every paper (Σ intersection / Σ union) — larger conferences weigh more.
 - **macro** averages the per-conference indices — every conference counts equally.
-- Conferences missing a prerequisite (e.g. no `classify-wireless` run when `--wireless-only`) are **skipped**, not fatal, and listed with the reason. All the `jaccard` flags (`--all-papers`, `--exact`, `--wireless-source`, column overrides) apply.
+- **Auto-classify (default on):** under `--wireless-only` with the keyword classifier, any conference without a `classify-wireless` run is classified automatically before comparison (the classifier is deterministic, needs no API key, and is idempotent). Pass `--no-auto-classify` to instead **skip** unclassified conferences (they're listed with the reason, never fatal). All other `jaccard` flags (`--all-papers`, `--exact`, `--wireless-source`, column overrides) apply.
 
 ## One-Command Run
 

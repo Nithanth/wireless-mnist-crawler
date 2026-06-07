@@ -219,17 +219,29 @@ def test_jaccard_all_aggregates_micro_macro(tmp_path: Path) -> None:
     assert payload["micro_jaccard_index"] == pytest.approx(0.5)
 
 
-def test_jaccard_all_skips_unclassified_conferences(tmp_path: Path) -> None:
+def test_jaccard_all_skips_unclassified_when_auto_classify_off(tmp_path: Path) -> None:
     pipeline, sigcomm, _ = _ingest_two_conferences(tmp_path)
     try:
         pipeline.classify_wireless(sigcomm)  # only SIGCOMM gets a wireless classification run
-        aggregate = pipeline.jaccard_all(str(MANUAL), wireless_only=True)
+        aggregate = pipeline.jaccard_all(str(MANUAL), wireless_only=True, auto_classify=False)
     finally:
         pipeline.close()
 
     assert [r.venue for r in aggregate.reports] == ["SIGCOMM"]
     assert [entry["venue"] for entry in aggregate.skipped] == ["NSDI"]
     assert "classify-wireless" in aggregate.skipped[0]["reason"]
+
+
+def test_jaccard_all_auto_classifies_unclassified_conferences(tmp_path: Path) -> None:
+    pipeline, _, _ = _ingest_two_conferences(tmp_path)
+    try:
+        # No conference classified up front; auto_classify (default) should classify both.
+        aggregate = pipeline.jaccard_all(str(MANUAL), wireless_only=True)
+    finally:
+        pipeline.close()
+
+    assert aggregate.skipped == []
+    assert {r.venue for r in aggregate.reports} == {"NSDI", "SIGCOMM"}
 
 
 def test_detect_title_column_errors_when_missing() -> None:
