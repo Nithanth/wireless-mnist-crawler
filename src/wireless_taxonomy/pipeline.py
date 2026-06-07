@@ -11,6 +11,7 @@ from wireless_taxonomy.analyze.availability import AvailabilityChecker
 from wireless_taxonomy.analyze.datasets import DatasetExtractor
 from wireless_taxonomy.analyze.full_text import FullTextDiscoverer
 from wireless_taxonomy.analyze.local_pdfs import LocalPdfImporter
+from wireless_taxonomy.analyze.openalex import FetchJson, abstract_for, default_fetch_json
 from wireless_taxonomy.analyze.paper_text import PaperTextFetcher
 from wireless_taxonomy.analyze.readiness import PaperInputReadinessAssessor
 from wireless_taxonomy.analyze.reflection import DeterministicAnalysisReflector
@@ -147,6 +148,46 @@ class Pipeline:
                     review_count += 1
             self._complete_run(stage_run_id, f"Classified {len(rows)} papers; {review_count} review items.")
         logger.event("classify_wireless_completed", {"paper_count": len(rows), "review_count": review_count})
+        return stage_run_id
+
+    def enrich_abstracts(
+        self,
+        run_id: int,
+        fetch_json: FetchJson | None = None,
+        only_missing: bool = True,
+    ) -> int:
+        """Backfill paper abstracts from OpenAlex (matched by DOI, then title).
+
+        Useful when the ingest source carries titles+authors but no abstracts
+        (e.g. DBLP BibTeX). Network failures degrade gracefully: a paper whose
+        abstract can't be fetched is simply left as-is.
+        """
+
+        source_run = self._require_run(run_id)
+        ci_id = source_run["conference_instance_id"]
+        stage_run_id = self._create_run(ci_id, "enrich-abstracts", "run", str(run_id))
+        logger = EvidenceLogger(self.settings.evidence_dir, stage_run_id)
+        fetch = fetch_json or default_fetch_json
+        rows = self.conn.execute(
+            "SELECT * FROM papers WHERE conference_instance_id = ?", (ci_id,)
+        ).fetchall()
+        attempted = 0
+        updated = 0
+        with transaction(self.conn):
+            for paper in rows:
+                if only_missing and (paper["abstract"] or "").strip():
+                    continue
+                attempted += 1
+                abstract = abstract_for(fetch, paper["doi"], paper["title"])
+                if not abstract:
+                    continue
+                self.conn.execute("UPDATE papers SET abstract = ? WHERE id = ?", (abstract, paper["id"]))
+                self._insert_evidence(
+                    stage_run_id, paper["id"], None, "openalex_abstract", paper["title"], abstract[:500], None, 0.9
+                )
+                updated += 1
+            self._complete_run(stage_run_id, f"Filled {updated}/{attempted} missing abstracts from OpenAlex.")
+        logger.event("enrich_abstracts_completed", {"attempted": attempted, "updated": updated})
         return stage_run_id
 
     def verify_paper_list(self, run_id: int, run_external: bool = False, run_llm: bool = False) -> int:

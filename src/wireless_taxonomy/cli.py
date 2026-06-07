@@ -157,6 +157,23 @@ def classify_wireless(run_id: int = typer.Option(..., "--run-id"), db: str = typ
         pipeline.close()
 
 
+@app.command("enrich-abstracts")
+def enrich_abstracts(
+    run_id: int = typer.Option(..., "--run-id"),
+    only_missing: bool = typer.Option(
+        True, "--only-missing/--all", help="Only fill papers that lack an abstract (default) vs refetch all."
+    ),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    """Backfill paper abstracts from OpenAlex (matched by DOI, then title)."""
+    pipeline = _pipeline(db)
+    try:
+        stage_run = pipeline.enrich_abstracts(run_id, only_missing=only_missing)
+        typer.echo(f"Abstract enrichment completed. run_id={stage_run}")
+    finally:
+        pipeline.close()
+
+
 @app.command("verify-paper-list")
 def verify_paper_list(
     run_id: int = typer.Option(..., "--run-id"),

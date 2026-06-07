@@ -496,6 +496,32 @@ Aggregate coverage (Jaccard/IoU). conferences=3 skipped=0 micro=0.7692 macro=0.7
 - **macro** averages the per-conference indices — every conference counts equally.
 - **Auto-classify (default on):** under `--wireless-only` with the keyword classifier, any conference without a `classify-wireless` run is classified automatically before comparison (the classifier is deterministic, needs no API key, and is idempotent). Pass `--no-auto-classify` to instead **skip** unclassified conferences (they're listed with the reason, never fatal). All other `jaccard` flags (`--all-papers`, `--exact`, `--wireless-source`, column overrides) apply.
 
+### Sourcing every conference: DBLP list + OpenAlex abstracts
+
+You supply one accepted-paper source per `(venue, year)`. The pipeline does not invent a conference's paper list. The robust, unblocked route across all venues (no ACM/IEEE scraping):
+
+1. **List from DBLP** — DBLP has title/authors/DOI for essentially every SIGCOMM/IMC/NSDI/ICC/GLOBECOM + IEEE Transactions, in one uniform format. Download a venue's BibTeX from its table-of-contents API and `ingest --bibtex`. DBLP carries **no abstracts**.
+2. **Abstracts from OpenAlex** — `enrich-abstracts` backfills `papers.abstract` from OpenAlex, matching by **DOI** first (exact) then verified title. OpenAlex is free, needs no key, and is not blocked. Abstract coverage is high but not universal (some publishers don't deposit abstracts); a paper with no abstract anywhere just falls back to title-only classification.
+3. **Classify + score** — `jaccard-all` (auto-classifies, see above).
+
+```bash
+# 1. List (DBLP table-of-contents export → BibTeX)
+curl "https://dblp.org/search/publ/api?q=toc:db/conf/sigcomm/sigcomm2024.bht:&h=1000&format=bib1" -o sigcomm2024.bib
+PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest --venue SIGCOMM --year 2024 --bibtex sigcomm2024.bib --db taxonomy.sqlite
+
+# 2. Abstracts (OpenAlex, by DOI then title)
+PYTHONPATH=src python3 -m wireless_taxonomy.cli enrich-abstracts --run-id 1 --db taxonomy.sqlite
+
+# 3. Repeat 1–2 per conference/year, then aggregate
+PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard-all --manual "List of Papers.csv" --db taxonomy.sqlite
+```
+
+`enrich-abstracts` fills only papers missing an abstract by default (`--all` to refetch every paper). It is offline-safe: a paper whose abstract can't be fetched is left unchanged.
+
+**Two real caveats observed on SIGCOMM 2024 (63 main-track papers, 62/63 abstracts backfilled from OpenAlex in ~15s):**
+- **Per-venue DBLP TOCs are main-track only.** Co-located workshops (e.g. SIGCOMM 2024's NAIC workshop, DOI prefix `10.1145/3672198`) have their own DBLP TOC keys. If your manual sheet files workshop papers under the main venue, ingest those workshop TOCs too, or they show up as `missed_by_cli` even with `--all-papers`.
+- **Abstract-only keyword wireless classification is over-inclusive on networking venues.** On SIGCOMM 2024 it flagged 47/63 papers as wireless vs the 9 in the curated set, so the Jaccard is dominated by false positives (`extra_from_cli`) — which is exactly the precision signal this comparison is meant to quantify.
+
 ## One-Command Run
 
 The CLI has a convenience `run` command:
