@@ -142,6 +142,49 @@ def test_jaccard_explicit_title_column(tmp_path: Path) -> None:
     assert report.intersection_count == 1
 
 
+def _write_manual(path: Path, rows: list[dict[str, str]]) -> None:
+    fieldnames = ["Paper Title", "Authors", "Conference", "Year"]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_jaccard_fuzzy_matches_near_duplicate_with_author_boost(tmp_path: Path) -> None:
+    manual = tmp_path / "manual.csv"
+    # Near-duplicate of the fetched "Example Wireless Dataset Paper" with shared authors.
+    _write_manual(
+        manual,
+        [
+            {
+                "Paper Title": "Example Wireless Dataset Paper (Extended)",
+                "Authors": "A. Lovelace, G. Hopper",
+                "Conference": "SIGCOMM",
+                "Year": "2025",
+            }
+        ],
+    )
+    pipeline, run_id = _ingest(tmp_path)
+    try:
+        pipeline.classify_wireless(run_id)
+        fuzzy = pipeline.jaccard(run_id, str(manual))
+        strict = pipeline.jaccard(run_id, str(manual), fuzzy=False)
+    finally:
+        pipeline.close()
+
+    assert fuzzy.fuzzy is True
+    assert fuzzy.intersection_count == 1
+    assert fuzzy.jaccard_index == pytest.approx(1.0)
+    assert len(fuzzy.fuzzy_matches) == 1
+    pair = fuzzy.fuzzy_matches[0]
+    assert pair.shared_authors == ["hopper", "lovelace"]
+
+    # Exact mode does not collapse the near-duplicate.
+    assert strict.intersection_count == 0
+    assert strict.missed_by_cli == ["Example Wireless Dataset Paper (Extended)"]
+    assert strict.extra_from_cli == ["Example Wireless Dataset Paper"]
+
+
 def test_detect_title_column_errors_when_missing() -> None:
     with pytest.raises(ValueError):
         detect_title_column(["foo", "bar"])

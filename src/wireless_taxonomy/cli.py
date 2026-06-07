@@ -400,6 +400,9 @@ def jaccard(
     title_col: Optional[str] = typer.Option(
         None, "--title-col", help="Column in the manual CSV holding paper titles. Auto-detected when omitted."
     ),
+    authors_col: Optional[str] = typer.Option(
+        None, "--authors-col", help="Manual CSV authors column (used to boost fuzzy matching). Auto-detected when omitted."
+    ),
     conference_col: Optional[str] = typer.Option(
         None, "--conference-col", help="Manual CSV conference/venue column. Auto-detected when omitted."
     ),
@@ -419,6 +422,11 @@ def jaccard(
         "--conference-filter/--no-conference-filter",
         help="Filter the manual CSV to the run's conference+year when those columns exist.",
     ),
+    fuzzy: bool = typer.Option(
+        True,
+        "--fuzzy/--exact",
+        help="Match near-duplicate titles (difflib + author overlap) vs exact normalized title only.",
+    ),
     out: Optional[str] = typer.Option(None, "--out", help="Write the full diff report JSON to this path."),
     db: str = typer.Option("taxonomy.sqlite", "--db"),
 ) -> None:
@@ -429,20 +437,23 @@ def jaccard(
             run_id,
             manual,
             title_col=title_col,
+            authors_col=authors_col,
             conference_col=conference_col,
             year_col=year_col,
             wireless_only=wireless_only,
             wireless_source=wireless_source,
             conference_filter=conference_filter,
+            fuzzy=fuzzy,
             out=out,
         )
         typer.echo(
             "Paper-list coverage (Jaccard/IoU). "
             f"venue={report.venue} year={report.year} "
-            f"wireless_only={report.wireless_only} conference_filtered={report.conference_filtered} "
+            f"wireless_only={report.wireless_only} fuzzy={report.fuzzy} conference_filtered={report.conference_filtered} "
             f"index={report.jaccard_index:.4f} "
             f"intersection={report.intersection_count} union={report.union_count} "
             f"automated={report.automated_count} manual={report.manual_count} "
+            f"fuzzy_matches={len(report.fuzzy_matches)} "
             f"missed_by_cli={len(report.missed_by_cli)} extra_from_cli={len(report.extra_from_cli)} "
             f"title_column={report.title_column!r}"
         )

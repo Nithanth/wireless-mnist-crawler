@@ -1050,11 +1050,13 @@ class Pipeline:
         run_id: int,
         manual_csv: str,
         title_col: str | None = None,
+        authors_col: str | None = None,
         conference_col: str | None = None,
         year_col: str | None = None,
         wireless_only: bool = True,
         wireless_source: str = "classify",
         conference_filter: bool = True,
+        fuzzy: bool = True,
         out: str | None = None,
     ) -> JaccardReport:
         report = compute_paper_list_jaccard(
@@ -1062,11 +1064,13 @@ class Pipeline:
             run_id,
             manual_csv,
             title_col=title_col,
+            authors_col=authors_col,
             conference_col=conference_col,
             year_col=year_col,
             wireless_only=wireless_only,
             wireless_source=wireless_source,
             conference_filter=conference_filter,
+            fuzzy=fuzzy,
         )
         if out:
             write_jaccard_report(report, out)

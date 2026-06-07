@@ -463,14 +463,15 @@ Defaults, all overridable:
 - **Wireless-only** automated set (`--all-papers` compares the full ingested list instead).
 - **Conference + year filtering** of the manual CSV to the run (`--no-conference-filter` to disable). The `Conference`/`Venue` and `Year` columns are auto-detected; override with `--conference-col` / `--year-col`. The manual conference value must match the run's `--venue` (case-insensitive).
 - **Title column** auto-detected (`title` / `paper title` / `paper_title`); override with `--title-col "Paper Title"`.
+- **Fuzzy matching** (`--exact` to disable). Papers are first matched on exact normalized title, then remaining papers are matched by title similarity (`difflib` ratio ≥ 0.92) — or a lower similarity (≥ 0.80) when **author surnames overlap** (≥ half of the smaller author list). This catches subtitle/punctuation/wording drift between the conference page and the manual sheet without false-positiving unrelated papers. The `Authors` column is auto-detected (override `--authors-col`); matching is one-to-one (greedy by descending score).
 
-Both sides are normalized with the same `normalize_title`, so keys line up deterministically. The command prints the index and counts:
+Both title sides are normalized with the same `normalize_title`, so keys line up deterministically. The command prints the index and counts:
 
 ```text
-Paper-list coverage (Jaccard/IoU). venue=SIGCOMM year=2024 wireless_only=True conference_filtered=True index=0.8421 intersection=8 union=10 automated=9 manual=9 missed_by_cli=1 extra_from_cli=1 title_column='Paper Title'
+Paper-list coverage (Jaccard/IoU). venue=SIGCOMM year=2024 wireless_only=True fuzzy=True conference_filtered=True index=0.8421 intersection=8 union=10 automated=9 manual=9 fuzzy_matches=2 missed_by_cli=1 extra_from_cli=1 title_column='Paper Title'
 ```
 
-`--out` writes a diff report listing `matched`, `missed_by_cli` (curated wireless papers the pipeline didn't flag), and `extra_from_cli` (pipeline-flagged papers absent from the manual list) so coverage gaps are diagnosable, not just a single number.
+`--out` writes a diff report listing `matched`, `missed_by_cli` (curated wireless papers the pipeline didn't flag), `extra_from_cli` (pipeline-flagged papers absent from the manual list), and `fuzzy_matches` (each near-match with its `title_similarity`, `author_overlap`, and `shared_authors`) so coverage gaps — and any fuzzy matches you want to eyeball — are diagnosable, not just a single number.
 
 ## One-Command Run
 
