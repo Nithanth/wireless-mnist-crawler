@@ -157,6 +157,92 @@ def classify_wireless(run_id: int = typer.Option(..., "--run-id"), db: str = typ
         pipeline.close()
 
 
+@app.command("enrich-abstracts")
+def enrich_abstracts(
+    run_id: int = typer.Option(..., "--run-id"),
+    overwrite: bool = typer.Option(False, "--overwrite/--missing-only", help="Refetch even papers that already have an abstract."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    pipeline = _pipeline(db)
+    try:
+        stage_run = pipeline.enrich_abstracts(run_id, overwrite=overwrite)
+        typer.echo(f"Abstract enrichment completed. run_id={stage_run}")
+    finally:
+        pipeline.close()
+
+
+@app.command("classify-candidates")
+def classify_candidates(
+    run_id: int = typer.Option(..., "--run-id"),
+    llm: bool = typer.Option(False, "--llm/--no-llm", help="Use the configured LLM instead of the keyword baseline."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    pipeline = _pipeline(db)
+    try:
+        stage_run = pipeline.classify_candidates(run_id, use_llm=llm)
+        typer.echo(f"Candidate classification completed. run_id={stage_run}")
+    finally:
+        pipeline.close()
+
+
+@app.command("import-gold")
+def import_gold(
+    path: str = typer.Option(..., "--path", help="Manual gold sheet (csv or xlsx) of wireless papers."),
+    venue: Optional[str] = typer.Option(None, "--venue", help="Default venue if the sheet has no conference column."),
+    year: Optional[int] = typer.Option(None, "--year", help="Default year if the sheet has no year column."),
+    wireless_only: bool = typer.Option(
+        False, "--wireless-only/--all-rows",
+        help="If the sheet lists ALL papers with a wireless flag column, keep only flagged-wireless rows.",
+    ),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    pipeline = _pipeline(db)
+    try:
+        stage_run = pipeline.import_gold(path, venue=venue, year=year, wireless_only=wireless_only)
+        typer.echo(f"Gold import completed. run_id={stage_run}")
+    finally:
+        pipeline.close()
+
+
+@app.command("eval-overlap")
+def eval_overlap(
+    classifier: str = typer.Option("keyword", "--classifier", help="Which prediction set to score: keyword or llm."),
+    pass_mode: str = typer.Option("high", "--pass", help="high = label yes only; low = label yes or maybe."),
+    fuzzy_threshold: float = typer.Option(0.92, "--fuzzy-threshold", help="Title fuzzy-match ratio; 1.0 disables fuzzy."),
+    out: Optional[str] = typer.Option(None, "--out", help="Optional path to write the full JSON report."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    pipeline = _pipeline(db)
+    try:
+        report = pipeline.evaluate_overlap(classifier=classifier, pass_mode=pass_mode, fuzzy_threshold=fuzzy_threshold)
+        overall = report["overall"]
+        typer.echo(f"Overlap eval: classifier={report['classifier']} pass={report['pass_mode']} fuzzy={report['fuzzy_threshold']}")
+        if not report["instances"]:
+            typer.echo("No gold-backed conference instances found. Run import-gold first.")
+        for row in report["instances"]:
+            typer.echo(
+                f"- {row['venue']} {row['year']}: jaccard={row['jaccard']} "
+                f"precision={row['precision']} recall={row['recall']} f1={row['f1']} "
+                f"(tp={row['tp']} fp={row['fp']} fn={row['fn']}; "
+                f"fn_miss={row['fn_missed']} fn_not_ingested={row['fn_missing_from_universe']})"
+            )
+        for row in report["per_conference"]:
+            typer.echo(
+                f"= {row['venue']} (all years): jaccard={row['jaccard']} "
+                f"precision={row['precision']} recall={row['recall']} f1={row['f1']}"
+            )
+        typer.echo(
+            f"OVERALL: jaccard={overall['jaccard']} precision={overall['precision']} "
+            f"recall={overall['recall']} f1={overall['f1']} "
+            f"(tp={overall['tp']} fp={overall['fp']} fn={overall['fn']})"
+        )
+        if out:
+            Path(out).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            typer.echo(f"Wrote report: {out}")
+    finally:
+        pipeline.close()
+
+
 @app.command("verify-paper-list")
 def verify_paper_list(
     run_id: int = typer.Option(..., "--run-id"),

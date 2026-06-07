@@ -7,6 +7,7 @@ from pathlib import Path
 
 from wireless_taxonomy.analyze.agentic_paper import DeterministicPaperAnalyzer, LlmPaperAnalyzer
 from wireless_taxonomy.analyze.acm_browser import AuthenticatedAcmBrowserFetcher
+from wireless_taxonomy.analyze.candidates import KeywordCandidateClassifier, LlmCandidateClassifier
 from wireless_taxonomy.analyze.availability import AvailabilityChecker
 from wireless_taxonomy.analyze.datasets import DatasetExtractor
 from wireless_taxonomy.analyze.full_text import FullTextDiscoverer
@@ -24,11 +25,13 @@ from wireless_taxonomy.export.json_export import JsonExporter
 from wireless_taxonomy.ingest.base import validate_paper_seeds
 from wireless_taxonomy.ingest.bibtex import BibtexIngestAdapter
 from wireless_taxonomy.ingest.csv import CsvIngestAdapter
+from wireless_taxonomy.ingest.gold import GoldSheetReader
 from wireless_taxonomy.ingest.url import UrlIngestAdapter
 from wireless_taxonomy.ingest.verify import PaperListVerifier
 from wireless_taxonomy.models import EvidenceClaim, PaperSeed, PaperTextArtifact, PaperTextEnrichment, new_id, utc_now
 from wireless_taxonomy.resolve.datasets import DatasetResolver, normalize_dataset_name
 from wireless_taxonomy.resolve.reuse import compute_reuse_counts
+from wireless_taxonomy.eval import overlap
 from wireless_taxonomy.resolve.cache import SqliteResolverCache
 from wireless_taxonomy.review.queue import insert_review_item
 
@@ -138,6 +141,254 @@ class Pipeline:
             self._complete_run(stage_run_id, f"Classified {len(rows)} papers; {review_count} review items.")
         logger.event("classify_wireless_completed", {"paper_count": len(rows), "review_count": review_count})
         return stage_run_id
+
+    def enrich_abstracts(self, run_id: int, overwrite: bool = False, enricher=None) -> int:
+        """Backfill missing paper abstracts from open metadata APIs.
+
+        Pulls abstracts from OpenAlex/Crossref/Semantic Scholar (metadata, not
+        the paywalled PDF), so it sidesteps the ACM full-text block.
+        """
+        from wireless_taxonomy.analyze.abstracts import AbstractEnricher
+
+        source_run = self._require_run(run_id)
+        conference_instance_id = source_run["conference_instance_id"]
+        stage_run_id = self._create_run(conference_instance_id, "enrich-abstracts", "run", str(run_id))
+        logger = EvidenceLogger(self.settings.evidence_dir, stage_run_id)
+        enricher = enricher or AbstractEnricher()
+        rows = self.conn.execute(
+            "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
+        ).fetchall()
+        filled = 0
+        attempted = 0
+        with transaction(self.conn):
+            for paper in rows:
+                existing = (paper["abstract"] or "").strip()
+                if existing and not overwrite:
+                    continue
+                attempted += 1
+                result = enricher.fetch(paper["title"], paper["doi"])
+                if result is None:
+                    continue
+                self.conn.execute("UPDATE papers SET abstract = ? WHERE id = ?", (result.abstract, paper["id"]))
+                self._insert_evidence(
+                    stage_run_id,
+                    paper["id"],
+                    None,
+                    "abstract_enrichment",
+                    result.provider,
+                    result.abstract[:1000],
+                    result.source_url,
+                    0.85,
+                    {"provider": result.provider},
+                )
+                filled += 1
+            self._complete_run(
+                stage_run_id,
+                f"Filled {filled}/{attempted} missing abstracts ({len(rows)} papers total).",
+            )
+        logger.event(
+            "enrich_abstracts_completed",
+            {"papers": len(rows), "attempted": attempted, "filled": filled, "overwrite": overwrite},
+        )
+        return stage_run_id
+
+    def classify_candidates(self, run_id: int, use_llm: bool = False) -> int:
+        """Wireless-candidate screening from title + abstract only.
+
+        Stores per-paper label (yes/no/maybe) plus high-pass (yes) and low-pass
+        (yes|maybe) filter flags for later Jaccard evaluation against a gold set.
+        """
+        source_run = self._require_run(run_id)
+        conference_instance_id = source_run["conference_instance_id"]
+        stage_run_id = self._create_run(conference_instance_id, "classify-candidates", "run", str(run_id))
+        logger = EvidenceLogger(self.settings.evidence_dir, stage_run_id)
+        classifier = LlmCandidateClassifier(self.settings.llm) if use_llm else KeywordCandidateClassifier()
+        rows = self.conn.execute(
+            "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
+        ).fetchall()
+        counts = {"yes": 0, "no": 0, "maybe": 0}
+        with transaction(self.conn):
+            for paper in rows:
+                prediction = classifier.classify(dict(paper))
+                counts[prediction.label] = counts.get(prediction.label, 0) + 1
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO wireless_candidate_predictions
+                    (paper_id, run_id, classifier, model_version, label, confidence,
+                     evidence, high_pass, low_pass, used_abstract)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        prediction.paper_id,
+                        stage_run_id,
+                        prediction.classifier,
+                        prediction.model_version,
+                        prediction.label,
+                        prediction.confidence,
+                        prediction.evidence,
+                        int(prediction.high_pass),
+                        int(prediction.low_pass),
+                        int(prediction.used_abstract),
+                    ),
+                )
+            self._complete_run(
+                stage_run_id,
+                f"Classified {len(rows)} papers via {classifier.classifier}; "
+                f"yes={counts['yes']} maybe={counts['maybe']} no={counts['no']}.",
+            )
+        logger.event(
+            "classify_candidates_completed",
+            {"classifier": classifier.classifier, "paper_count": len(rows), "labels": counts},
+        )
+        return stage_run_id
+
+    def import_gold(
+        self,
+        path: str,
+        venue: str | None = None,
+        year: int | None = None,
+        wireless_only: bool = False,
+    ) -> int:
+        """Load a manually curated gold sheet (csv/xlsx) of wireless papers."""
+        fmt = "xlsx" if Path(path).suffix.lower() in {".xlsx", ".xls"} else "csv"
+        stage_run_id = self._create_run(None, "import-gold", fmt, path)
+        logger = EvidenceLogger(self.settings.evidence_dir, stage_run_id)
+        records = GoldSheetReader(path, venue, year, wireless_only).read()
+        instance_ids = {(record.venue, record.year): self._conference_instance_id(record.venue, record.year) for record in records}
+        imported = 0
+        instances: set[tuple[str, int]] = set()
+        with transaction(self.conn):
+            for record in records:
+                conference_instance_id = instance_ids[(record.venue, record.year)]
+                cur = self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO gold_papers
+                    (conference_instance_id, run_id, title, normalized_title, doi, normalized_doi, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        conference_instance_id,
+                        stage_run_id,
+                        record.title,
+                        record.normalized_title,
+                        record.doi,
+                        record.normalized_doi or None,
+                        json.dumps(record.raw, ensure_ascii=False),
+                    ),
+                )
+                if cur.rowcount:
+                    imported += 1
+                instances.add((record.venue, record.year))
+            self._complete_run(
+                stage_run_id,
+                f"Imported {imported}/{len(records)} gold papers across {len(instances)} conference instance(s).",
+            )
+        logger.event(
+            "import_gold_completed",
+            {"path": path, "rows": len(records), "imported": imported, "instances": sorted(instances)},
+        )
+        return stage_run_id
+
+    def evaluate_overlap(self, classifier: str = "keyword", pass_mode: str = "high", fuzzy_threshold: float = 0.92) -> dict:
+        """Jaccard/IoU of the predicted wireless set vs the gold set, per venue/year.
+
+        Only conference instances that have an imported gold set are scored.
+        """
+        if pass_mode not in {"high", "low"}:
+            raise ValueError("pass_mode must be 'high' or 'low'")
+        flag_column = "high_pass" if pass_mode == "high" else "low_pass"
+        gold_instances = self.conn.execute(
+            """
+            SELECT ci.id AS conference_instance_id, v.name AS venue, ci.year AS year
+            FROM conference_instances ci
+            JOIN venues v ON v.id = ci.venue_id
+            WHERE ci.id IN (SELECT DISTINCT conference_instance_id FROM gold_papers)
+            ORDER BY v.name, ci.year
+            """
+        ).fetchall()
+
+        instance_rows: list[dict] = []
+        mismatches: list[dict] = []
+        for instance in gold_instances:
+            conference_instance_id = instance["conference_instance_id"]
+            gold_refs = [
+                overlap.PaperRef.build(f"gold:{row['id']}", row["title"], row["doi"])
+                for row in self.conn.execute(
+                    "SELECT id, title, doi FROM gold_papers WHERE conference_instance_id = ?",
+                    (conference_instance_id,),
+                )
+            ]
+            latest = self.conn.execute(
+                """
+                SELECT MAX(wcp.run_id) AS run_id
+                FROM wireless_candidate_predictions wcp
+                JOIN papers p ON p.id = wcp.paper_id
+                WHERE p.conference_instance_id = ? AND wcp.classifier = ?
+                """,
+                (conference_instance_id, classifier),
+            ).fetchone()
+            predict_run_id = latest["run_id"] if latest else None
+            predicted_refs = []
+            if predict_run_id is not None:
+                predicted_refs = [
+                    overlap.PaperRef.build(f"paper:{row['id']}", row["title"], row["doi"])
+                    for row in self.conn.execute(
+                        f"""
+                        SELECT p.id, p.title, p.doi
+                        FROM papers p
+                        JOIN wireless_candidate_predictions wcp ON wcp.paper_id = p.id
+                        WHERE p.conference_instance_id = ? AND wcp.classifier = ?
+                          AND wcp.run_id = ? AND wcp.{flag_column} = 1
+                        """,
+                        (conference_instance_id, classifier, predict_run_id),
+                    )
+                ]
+            universe_refs = [
+                overlap.PaperRef.build(f"paper:{row['id']}", row["title"], row["doi"])
+                for row in self.conn.execute(
+                    "SELECT id, title, doi FROM papers WHERE conference_instance_id = ?",
+                    (conference_instance_id,),
+                )
+            ]
+
+            result = overlap.match(predicted_refs, gold_refs, fuzzy_threshold)
+            # Split missed gold papers into classifier misses vs coverage gaps.
+            in_universe = overlap.match(result.unmatched_b, universe_refs, fuzzy_threshold)
+            fn_missed = len(in_universe.matched)
+            fn_missing_from_universe = len(in_universe.unmatched_a)
+
+            instance_rows.append(
+                {
+                    "venue": instance["venue"],
+                    "year": instance["year"],
+                    "tp": len(result.matched),
+                    "fp": len(result.unmatched_a),
+                    "fn": len(result.unmatched_b),
+                    "fn_missed": fn_missed,
+                    "fn_missing_from_universe": fn_missing_from_universe,
+                }
+            )
+            mismatches.append(
+                {
+                    "venue": instance["venue"],
+                    "year": instance["year"],
+                    "predicted_run_id": predict_run_id,
+                    "false_positives": [ref.title for ref in result.unmatched_a],
+                    "false_negatives_classifier_miss": [b.title for _, b in in_universe.matched],
+                    "false_negatives_missing_from_universe": [ref.title for ref in in_universe.unmatched_a],
+                }
+            )
+
+        aggregates = overlap.aggregate(instance_rows)
+        return {
+            "classifier": classifier,
+            "pass_mode": pass_mode,
+            "fuzzy_threshold": fuzzy_threshold,
+            "instances": aggregates["per_conference_year"],
+            "per_conference": aggregates["per_conference"],
+            "overall": aggregates["overall"],
+            "mismatches": mismatches,
+        }
 
     def verify_paper_list(self, run_id: int, run_external: bool = False, run_llm: bool = False) -> int:
         source_run = self._require_run(run_id)
