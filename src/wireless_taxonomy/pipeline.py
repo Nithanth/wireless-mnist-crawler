@@ -22,6 +22,20 @@ from wireless_taxonomy.db import connect, migrate, transaction
 from wireless_taxonomy.evidence import EvidenceLogger
 from wireless_taxonomy.export.spreadsheet import SpreadsheetExporter
 from wireless_taxonomy.export.json_export import JsonExporter
+from wireless_taxonomy.export.paper_set import PaperSetExporter
+from wireless_taxonomy.evaluate.jaccard import (
+    JaccardAggregate,
+    JaccardReport,
+    comparison_rows,
+    comparison_rows_all,
+    compute_paper_list_jaccard_all,
+    evaluate_run,
+    list_conference_runs,
+    report_from_evaluation,
+    write_comparison_csv,
+    write_jaccard_aggregate,
+    write_jaccard_report,
+)
 from wireless_taxonomy.ingest.base import validate_paper_seeds
 from wireless_taxonomy.ingest.bibtex import BibtexIngestAdapter
 from wireless_taxonomy.ingest.csv import CsvIngestAdapter
@@ -1281,6 +1295,100 @@ class Pipeline:
         if fmt == "json":
             return JsonExporter(self.conn).export(run_id, out, scope)
         return SpreadsheetExporter(self.conn).export(run_id, out, fmt)
+
+    def export_paper_set(
+        self,
+        run_id: int,
+        out: str,
+        fmt: str = "csv",
+        wireless_only: bool = False,
+        wireless_source: str = "classify",
+    ) -> Path:
+        return PaperSetExporter(self.conn).export(
+            run_id, out, fmt, wireless_only=wireless_only, wireless_source=wireless_source
+        )
+
+    def jaccard(
+        self,
+        run_id: int,
+        manual_csv: str,
+        title_col: str | None = None,
+        authors_col: str | None = None,
+        conference_col: str | None = None,
+        year_col: str | None = None,
+        wireless_only: bool = True,
+        wireless_source: str = "classify",
+        conference_filter: bool = True,
+        fuzzy: bool = True,
+        out: str | None = None,
+        csv_out: str | None = None,
+    ) -> JaccardReport:
+        evaluation = evaluate_run(
+            self.conn,
+            run_id,
+            manual_csv,
+            title_col=title_col,
+            authors_col=authors_col,
+            conference_col=conference_col,
+            year_col=year_col,
+            wireless_only=wireless_only,
+            wireless_source=wireless_source,
+            conference_filter=conference_filter,
+            fuzzy=fuzzy,
+        )
+        report = report_from_evaluation(evaluation)
+        if out:
+            write_jaccard_report(report, out)
+        if csv_out:
+            write_comparison_csv(comparison_rows(evaluation), csv_out)
+        return report
+
+    def jaccard_all(
+        self,
+        manual_csv: str,
+        title_col: str | None = None,
+        authors_col: str | None = None,
+        conference_col: str | None = None,
+        year_col: str | None = None,
+        wireless_only: bool = True,
+        wireless_source: str = "classify",
+        fuzzy: bool = True,
+        auto_classify: bool = True,
+        out: str | None = None,
+        csv_out: str | None = None,
+    ) -> JaccardAggregate:
+        if wireless_only and auto_classify and wireless_source == "classify":
+            for run_id, _venue, _year in list_conference_runs(self.conn):
+                ci_id = self._require_run(run_id)["conference_instance_id"]
+                if self._latest_stage_run_id(ci_id, "classify-wireless") is None:
+                    self.classify_wireless(run_id)
+        aggregate = compute_paper_list_jaccard_all(
+            self.conn,
+            manual_csv,
+            title_col=title_col,
+            authors_col=authors_col,
+            conference_col=conference_col,
+            year_col=year_col,
+            wireless_only=wireless_only,
+            wireless_source=wireless_source,
+            fuzzy=fuzzy,
+        )
+        if out:
+            write_jaccard_aggregate(aggregate, out)
+        if csv_out:
+            rows = comparison_rows_all(
+                self.conn,
+                manual_csv,
+                title_col=title_col,
+                authors_col=authors_col,
+                conference_col=conference_col,
+                year_col=year_col,
+                wireless_only=wireless_only,
+                wireless_source=wireless_source,
+                fuzzy=fuzzy,
+            )
+            write_comparison_csv(rows, csv_out)
+        return aggregate
 
     def status(self, run_id: int | None = None) -> list[sqlite3.Row]:
         if run_id is None:

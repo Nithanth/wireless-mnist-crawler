@@ -421,6 +421,151 @@ Supported formats:
 
 The intended end state is a clean CSV/XLSX workbook that matches the manual taxonomy structure and sends uncertain rows to `Review Needed`.
 
+## Paper-List Coverage (Jaccard)
+
+When automated full-text fetching is blocked (e.g. ACM), the pipeline can still extract titles and abstracts and classify whether a paper is wireless. To measure how well the automated path reproduces a hand-curated wireless paper list, the CLI can emit a flat paper set and compute a Jaccard (intersection-over-union) score keyed on normalized titles.
+
+Because a manual taxonomy sheet typically holds the *wireless* papers across *many* conferences, the comparison is made like-for-like: the automated side defaults to papers the pipeline classified as wireless, and the manual side is filtered to the run's conference + year.
+
+### Export the fetched paper set
+
+```bash
+# Full ingested list for the run's conference:
+PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
+  --run-id 1 --out sigcomm-2024-papers.csv --format csv --db taxonomy.sqlite
+
+# Only the papers the pipeline classified as wireless (run classify-wireless first):
+PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
+  --run-id 1 --out sigcomm-2024-wireless.csv --wireless-only --db taxonomy.sqlite
+```
+
+Each row has these columns (`match_key` is the normalized title — lowercased, alphanumeric-only):
+
+```text
+match_key, title, abstract, authors, doi, year, venue, wireless_label, wireless_confidence
+```
+
+`wireless_label` / `wireless_confidence` come from the latest `classify-wireless` run for that conference (blank if it hasn't been classified yet), so each exported paper carries the classifier's decision and how confident it was. `--format json` is also supported. Output is scoped to the run's conference instance. `--wireless-source` selects the wireless decision source: `classify` (keyword rules over title+abstract, default) or `agentic` (the LLM analysis stage).
+
+### Compute Jaccard against a manual list
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli classify-wireless --run-id 1 --db taxonomy.sqlite
+PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard \
+  --run-id 1 \
+  --manual "Wireless Taxonomy Record - List of Papers.csv" \
+  --out coverage-report.json \
+  --db taxonomy.sqlite
+```
+
+Defaults, all overridable:
+
+- **Wireless-only** automated set (`--all-papers` compares the full ingested list instead).
+- **Conference + year filtering** of the manual CSV to the run (`--no-conference-filter` to disable). The `Conference`/`Venue` and `Year` columns are auto-detected; override with `--conference-col` / `--year-col`. The manual conference value must match the run's `--venue` (case-insensitive).
+- **Title column** auto-detected (`title` / `paper title` / `paper_title`); override with `--title-col "Paper Title"`.
+- **Fuzzy matching** (`--exact` to disable). Papers are first matched on exact normalized title, then remaining papers are matched by title similarity (`difflib` ratio ≥ 0.92) — or a lower similarity (≥ 0.80) when **author surnames overlap** (≥ half of the smaller author list). This catches subtitle/punctuation/wording drift between the conference page and the manual sheet without false-positiving unrelated papers. The `Authors` column is auto-detected (override `--authors-col`); matching is one-to-one (greedy by descending score).
+
+Both title sides are normalized with the same `normalize_title`, so keys line up deterministically. The command prints a readable summary:
+
+```text
+SIGCOMM 2024  —  Jaccard (IoU) = 0.8421
+  matched (intersection) :    8   (fuzzy: 2)
+  union                  :   10
+  automated / manual     :    9 / 9
+  missed_by_cli          :    1  (curated wireless the CLI didn't flag)
+  extra_from_cli         :    1  (CLI-flagged, not in your sheet)
+  mean wireless confidence (automated): 0.88
+```
+
+`--out` writes a diff report (JSON) listing `matched`, `missed_by_cli` (curated wireless papers the pipeline didn't flag), `extra_from_cli` (pipeline-flagged papers absent from the manual list), and `fuzzy_matches` (each near-match with its `title_similarity`, `author_overlap`, and `shared_authors`) so coverage gaps — and any fuzzy matches you want to eyeball — are diagnosable, not just a single number.
+
+`--csv comparison.csv` writes a **per-paper comparison** — one row per paper with a `status` column so you can review every match/miss in a spreadsheet:
+
+```text
+venue, year, status, manual_title, automated_title, title_similarity, author_overlap, shared_authors, wireless_label, wireless_confidence
+```
+
+`status` is one of `matched`, `fuzzy_matched`, `missed_by_cli`, or `extra_from_cli`. Automated-side rows (`matched` / `fuzzy_matched` / `extra_from_cli`) carry the paper's `wireless_label` and `wireless_confidence` from the classifier; `missed_by_cli` rows (curated papers the CLI didn't fetch) leave those blank.
+
+### Aggregate across every conference (`jaccard-all`)
+
+A single run is one `(venue, year)`. When the DB holds many conference instances (you ran `ingest` for each conference/year in your sheet), `jaccard-all` runs the comparison once per instance against the same master CSV — each instance self-filters the sheet to its own venue+year — and rolls the results up:
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard-all \
+  --manual "Wireless Taxonomy Record - List of Papers.csv" \
+  --out aggregate.json --db taxonomy.sqlite
+```
+
+```text
+Aggregate coverage (Jaccard/IoU) over 3 conference(s), 0 skipped:
+  NSDI 2024: index=0.8000 matched=16 union=20 missed=2 extra=2 (fuzzy=3)
+  SIGCOMM 2025: index=0.7500 matched=6 union=8 missed=1 extra=1 (fuzzy=1)
+  GLOBECOM 2023: index=0.6667 matched=4 union=6 missed=1 extra=1 (fuzzy=0)
+  micro (pooled papers)            = 0.7692
+  macro (mean of per-conference)   = 0.7389
+```
+
+(With `--no-auto-classify`, any conference lacking a `classify-wireless` run is printed as `SKIPPED <venue> <year>: ...` instead and excluded from the roll-up.) `--csv combined.csv` writes one combined per-paper comparison CSV across every conference (same columns as `jaccard --csv`, with `venue`/`year` distinguishing rows).
+
+- **micro** pools every paper (Σ intersection / Σ union) — larger conferences weigh more.
+- **macro** averages the per-conference indices — every conference counts equally.
+- **Auto-classify (default on):** under `--wireless-only` with the keyword classifier, any conference without a `classify-wireless` run is classified automatically before comparison (the classifier is deterministic, needs no API key, and is idempotent). Pass `--no-auto-classify` to instead **skip** unclassified conferences (they're listed with the reason, never fatal). All other `jaccard` flags (`--all-papers`, `--exact`, `--wireless-source`, column overrides) apply.
+
+### Sourcing every conference: DBLP list + OpenAlex abstracts
+
+You supply one accepted-paper source per `(venue, year)`. The pipeline does not invent a conference's paper list. The robust, unblocked route across all venues (no ACM/IEEE scraping):
+
+1. **List from DBLP** — DBLP has title/authors/DOI for essentially every SIGCOMM/IMC/NSDI/ICC/GLOBECOM + IEEE Transactions, in one uniform format. Download a venue's BibTeX from its table-of-contents API and `ingest --bibtex`. DBLP carries **no abstracts**.
+2. **Abstracts from open metadata** — `enrich-abstracts` backfills `papers.abstract` from OpenAlex, Crossref, and Semantic Scholar (metadata APIs, not the paywalled PDF), matched by **DOI** first (exact) then verified title. These are free, need no key, and are not blocked. Abstract coverage is high but not universal (some publishers don't deposit abstracts); a paper with no abstract anywhere just falls back to title-only classification.
+3. **Classify + score** — `jaccard-all` (auto-classifies, see above).
+
+```bash
+# 1. List (DBLP table-of-contents export → BibTeX)
+curl "https://dblp.org/search/publ/api?q=toc:db/conf/sigcomm/sigcomm2024.bht:&h=1000&format=bib1" -o sigcomm2024.bib
+PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest --venue SIGCOMM --year 2024 --bibtex sigcomm2024.bib --db taxonomy.sqlite
+
+# 2. Abstracts (OpenAlex, by DOI then title)
+PYTHONPATH=src python3 -m wireless_taxonomy.cli enrich-abstracts --run-id 1 --db taxonomy.sqlite
+
+# 3. Repeat 1–2 per conference/year, then aggregate
+PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard-all --manual "List of Papers.csv" --db taxonomy.sqlite
+```
+
+`enrich-abstracts` fills only papers missing an abstract by default (`--overwrite` to refetch every paper). It is offline-safe: a paper whose abstract can't be fetched is left unchanged.
+
+#### Co-located workshops
+
+Per-venue DBLP TOCs are **main-track only**. Co-located workshops (e.g. SIGCOMM 2024's NAIC workshop, DOI prefix `10.1145/3672198`) have their own DBLP TOC keys, so if your manual sheet files workshop papers under the parent venue they show up as `missed_by_cli` even with `--all-papers`.
+
+To include them, ingest each workshop TOC into the **same `--venue`/`--year`** — repeated ingests reuse the one conference instance and accumulate papers, so a later `paper-set`/`jaccard` sees main-track + workshop papers together:
+
+```bash
+# Main track
+curl "https://dblp.org/search/publ/api?q=toc:db/conf/sigcomm/sigcomm2024.bht:&h=1000&format=bib1" -o sigcomm2024.bib
+PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest --venue SIGCOMM --year 2024 --bibtex sigcomm2024.bib --db taxonomy.sqlite
+
+# Co-located workshop (same venue+year → same instance)
+curl "https://dblp.org/search/publ/api?q=toc:db/conf/sigcomm/naic2024.bht:&h=1000&format=bib1" -o naic2024.bib
+PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest --venue SIGCOMM --year 2024 --bibtex naic2024.bib --db taxonomy.sqlite
+```
+
+(Find a venue's workshop TOC keys on its DBLP venue page, e.g. `https://dblp.org/db/conf/sigcomm/`.)
+
+#### Per-venue source policy
+
+Hybrid policy: use a conference/program **URL** where it's cleanly fetchable *and* carries abstracts; otherwise use **DBLP list + OpenAlex abstracts**. Either way the coverage layer (`paper-set`/`jaccard`/`jaccard-all`) is identical and venue-agnostic.
+
+| Venue | Recommended source | Abstracts | Notes |
+|---|---|---|---|
+| SIGCOMM | Program URL (`ingest --url`) | from page | Deterministic parser extracts title/authors/abstract; cleanly fetchable. |
+| USENIX / NSDI | Program URL (`ingest --url`) | from page | Same as SIGCOMM; open program pages. |
+| IMC | DBLP `--bibtex` + `enrich-abstracts` | OpenAlex | ACM-hosted; program HTML is anti-bot. |
+| ICC / GLOBECOM | DBLP `--bibtex` + `enrich-abstracts` | OpenAlex | IEEE Xplore is JS-rendered/blocked; DBLP TOCs are reliable. |
+| IEEE Trans. Wireless / Antennas & Propagation | DBLP `--bibtex` + `enrich-abstracts` | OpenAlex | Journals; DBLP per-volume TOC + OpenAlex by DOI. |
+
+**Abstract-only keyword wireless classification is over-inclusive on networking venues.** On SIGCOMM 2024 it flagged 47/63 papers as wireless vs the 9 in the curated set, so the Jaccard is dominated by false positives (`extra_from_cli`) — which is exactly the precision signal this comparison is meant to quantify.
+
 ## One-Command Run
 
 The CLI has a convenience `run` command:
