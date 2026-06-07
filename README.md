@@ -517,7 +517,7 @@ Aggregate coverage (Jaccard/IoU) over 3 conference(s), 0 skipped:
 You supply one accepted-paper source per `(venue, year)`. The pipeline does not invent a conference's paper list. The robust, unblocked route across all venues (no ACM/IEEE scraping):
 
 1. **List from DBLP** — DBLP has title/authors/DOI for essentially every SIGCOMM/IMC/NSDI/ICC/GLOBECOM + IEEE Transactions, in one uniform format. Download a venue's BibTeX from its table-of-contents API and `ingest --bibtex`. DBLP carries **no abstracts**.
-2. **Abstracts from OpenAlex** — `enrich-abstracts` backfills `papers.abstract` from OpenAlex, matching by **DOI** first (exact) then verified title. OpenAlex is free, needs no key, and is not blocked. Abstract coverage is high but not universal (some publishers don't deposit abstracts); a paper with no abstract anywhere just falls back to title-only classification.
+2. **Abstracts from open metadata** — `enrich-abstracts` backfills `papers.abstract` from OpenAlex, Crossref, and Semantic Scholar (metadata APIs, not the paywalled PDF), matched by **DOI** first (exact) then verified title. These are free, need no key, and are not blocked. Abstract coverage is high but not universal (some publishers don't deposit abstracts); a paper with no abstract anywhere just falls back to title-only classification.
 3. **Classify + score** — `jaccard-all` (auto-classifies, see above).
 
 ```bash
@@ -532,7 +532,7 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli enrich-abstracts --run-id 1 --db
 PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard-all --manual "List of Papers.csv" --db taxonomy.sqlite
 ```
 
-`enrich-abstracts` fills only papers missing an abstract by default (`--all` to refetch every paper). It is offline-safe: a paper whose abstract can't be fetched is left unchanged.
+`enrich-abstracts` fills only papers missing an abstract by default (`--overwrite` to refetch every paper). It is offline-safe: a paper whose abstract can't be fetched is left unchanged.
 
 #### Co-located workshops
 
