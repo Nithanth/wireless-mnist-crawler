@@ -125,6 +125,27 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
 ```
 Columns: `match_key, title, abstract, authors, doi, year, venue, wireless_label, wireless_confidence`.
 
+#### Compare two automated sources (`diff-sets`)
+
+To gauge how reliable a source is, export a `paper-set` from each approach and diff
+them — e.g. a URL+LLM ingest vs the DBLP+OpenAlex ingest of the same conference.
+Export each to its own file (papers accumulate per conference in one DB, so use
+separate DBs or runs), then:
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli diff-sets \
+  --a url_llm.csv --b dblp_openalex.csv \
+  --label-a "URL+LLM" --label-b "DBLP+OpenAlex" \
+  --out diff.json --csv diff.csv
+```
+
+It prints the **Jaccard (IoU)** of the two sets, the papers unique to each side,
+and **abstract coverage per side** (how many abstracts each source actually
+supplies). `--csv` writes one row per paper with `status`
+(`shared`/`only_in_a`/`only_in_b`), match type, title similarity, and
+abstract-present flags. Matching is the same exact→fuzzy (author-boosted) logic as
+`jaccard`; `--exact` disables fuzzy. No database needed — it reads the files.
+
 #### Gold-set evaluation (precision / recall / F1)
 
 An alternative scoring track using an imported gold sheet and candidate labels:
@@ -177,6 +198,7 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli llm-config --db taxonomy.sqlite 
 | `classify-wireless` | Keyword wireless classification (title + abstract). |
 | `classify-candidates` | Wireless-candidate labels (yes/no/maybe) for gold eval. |
 | `paper-set` | Export the conference-scoped fetched paper set. |
+| `diff-sets` | Diff two paper-set exports (IoU + abstract coverage) to compare sources. |
 | `jaccard` | IoU of automated vs manual list for one run. |
 | `jaccard-all` | IoU across every conference instance, with micro/macro roll-ups. |
 | `import-gold` | Import a manual gold sheet of wireless papers. |

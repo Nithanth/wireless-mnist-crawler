@@ -19,9 +19,20 @@ from wireless_taxonomy.evaluate.jaccard import (
     write_jaccard_report,
 )
 from wireless_taxonomy.evaluate.matching import MatchPair, MatchResult, PaperRecord, make_record, match_papers
+from wireless_taxonomy.evaluate.run_diff import (
+    DIFF_COLUMNS,
+    DiffSummary,
+    diff_paper_sets,
+    format_diff_summary,
+    load_paper_set,
+    write_diff_csv,
+    write_diff_report,
+)
 
 __all__ = [
     "COMPARISON_COLUMNS",
+    "DIFF_COLUMNS",
+    "DiffSummary",
     "Evaluation",
     "JaccardAggregate",
     "JaccardReport",
@@ -33,15 +44,20 @@ __all__ = [
     "compute_paper_list_jaccard",
     "compute_paper_list_jaccard_all",
     "detect_title_column",
+    "diff_paper_sets",
     "evaluate_run",
     "format_aggregate_summary",
+    "format_diff_summary",
     "format_report_summary",
     "list_conference_runs",
     "load_manual_records",
+    "load_paper_set",
     "make_record",
     "match_papers",
     "report_from_evaluation",
     "write_comparison_csv",
+    "write_diff_csv",
+    "write_diff_report",
     "write_jaccard_aggregate",
     "write_jaccard_report",
 ]
