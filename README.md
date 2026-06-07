@@ -423,45 +423,54 @@ The intended end state is a clean CSV/XLSX workbook that matches the manual taxo
 
 ## Paper-List Coverage (Jaccard)
 
-When automated full-text fetching is blocked (e.g. ACM), the pipeline can still extract titles and abstracts. To measure how well automated ingestion recovers a conference's paper list against a manually curated set, the CLI can emit a flat paper set and compute a Jaccard (intersection-over-union) score keyed on normalized titles.
+When automated full-text fetching is blocked (e.g. ACM), the pipeline can still extract titles and abstracts and classify whether a paper is wireless. To measure how well the automated path reproduces a hand-curated wireless paper list, the CLI can emit a flat paper set and compute a Jaccard (intersection-over-union) score keyed on normalized titles.
+
+Because a manual taxonomy sheet typically holds the *wireless* papers across *many* conferences, the comparison is made like-for-like: the automated side defaults to papers the pipeline classified as wireless, and the manual side is filtered to the run's conference + year.
 
 ### Export the fetched paper set
 
 ```bash
+# Full ingested list for the run's conference:
 PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
-  --run-id 1 \
-  --out sigcomm-2025-papers.csv \
-  --format csv \
-  --db taxonomy.sqlite
+  --run-id 1 --out sigcomm-2024-papers.csv --format csv --db taxonomy.sqlite
+
+# Only the papers the pipeline classified as wireless (run classify-wireless first):
+PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
+  --run-id 1 --out sigcomm-2024-wireless.csv --wireless-only --db taxonomy.sqlite
 ```
 
-This emits one conference-scoped row per fetched paper with these columns:
+Each row has these columns (`match_key` is the normalized title — lowercased, alphanumeric-only):
 
 ```text
 match_key, title, abstract, authors, doi, year, venue
 ```
 
-`match_key` is the normalized title (lowercased, alphanumeric-only). `--format json` is also supported. Unlike the full workbook export, this output is scoped to the run's conference instance so it can be compared cleanly against a single conference's manual list.
+`--format json` is also supported. Output is scoped to the run's conference instance. `--wireless-source` selects the wireless decision source: `classify` (keyword rules over title+abstract, default) or `agentic` (the LLM analysis stage).
 
 ### Compute Jaccard against a manual list
 
 ```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli classify-wireless --run-id 1 --db taxonomy.sqlite
 PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard \
   --run-id 1 \
-  --manual manual-sigcomm-2025.csv \
+  --manual "Wireless Taxonomy Record - List of Papers.csv" \
   --out coverage-report.json \
   --db taxonomy.sqlite
 ```
 
-The manual CSV's title column is auto-detected (`title`, `paper title`, `paper_title`, case-insensitive); override with `--title-col "Paper Title"`. Both sides are normalized with the same `normalize_title` used in matching, so keys line up deterministically.
+Defaults, all overridable:
 
-The command prints the index and counts, and `--out` writes a diff report:
+- **Wireless-only** automated set (`--all-papers` compares the full ingested list instead).
+- **Conference + year filtering** of the manual CSV to the run (`--no-conference-filter` to disable). The `Conference`/`Venue` and `Year` columns are auto-detected; override with `--conference-col` / `--year-col`. The manual conference value must match the run's `--venue` (case-insensitive).
+- **Title column** auto-detected (`title` / `paper title` / `paper_title`); override with `--title-col "Paper Title"`.
+
+Both sides are normalized with the same `normalize_title`, so keys line up deterministically. The command prints the index and counts:
 
 ```text
-Paper-list coverage (Jaccard/IoU). index=0.8421 intersection=80 union=95 automated=82 manual=93 missed_by_cli=11 extra_from_cli=2 title_column='Paper Title'
+Paper-list coverage (Jaccard/IoU). venue=SIGCOMM year=2024 wireless_only=True conference_filtered=True index=0.8421 intersection=8 union=10 automated=9 manual=9 missed_by_cli=1 extra_from_cli=1 title_column='Paper Title'
 ```
 
-The JSON report lists `matched`, `missed_by_cli` (in the manual list but not fetched), and `extra_from_cli` (fetched but absent from the manual list) so coverage gaps are diagnosable, not just a single number.
+`--out` writes a diff report listing `matched`, `missed_by_cli` (curated wireless papers the pipeline didn't flag), and `extra_from_cli` (pipeline-flagged papers absent from the manual list) so coverage gaps are diagnosable, not just a single number.
 
 ## One-Command Run
 

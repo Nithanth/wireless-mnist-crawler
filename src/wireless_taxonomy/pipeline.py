@@ -1033,11 +1033,41 @@ class Pipeline:
             return JsonExporter(self.conn).export(run_id, out, scope)
         return SpreadsheetExporter(self.conn).export(run_id, out, fmt)
 
-    def export_paper_set(self, run_id: int, out: str, fmt: str = "csv") -> Path:
-        return PaperSetExporter(self.conn).export(run_id, out, fmt)
+    def export_paper_set(
+        self,
+        run_id: int,
+        out: str,
+        fmt: str = "csv",
+        wireless_only: bool = False,
+        wireless_source: str = "classify",
+    ) -> Path:
+        return PaperSetExporter(self.conn).export(
+            run_id, out, fmt, wireless_only=wireless_only, wireless_source=wireless_source
+        )
 
-    def jaccard(self, run_id: int, manual_csv: str, title_col: str | None = None, out: str | None = None) -> JaccardReport:
-        report = compute_paper_list_jaccard(self.conn, run_id, manual_csv, title_col=title_col)
+    def jaccard(
+        self,
+        run_id: int,
+        manual_csv: str,
+        title_col: str | None = None,
+        conference_col: str | None = None,
+        year_col: str | None = None,
+        wireless_only: bool = True,
+        wireless_source: str = "classify",
+        conference_filter: bool = True,
+        out: str | None = None,
+    ) -> JaccardReport:
+        report = compute_paper_list_jaccard(
+            self.conn,
+            run_id,
+            manual_csv,
+            title_col=title_col,
+            conference_col=conference_col,
+            year_col=year_col,
+            wireless_only=wireless_only,
+            wireless_source=wireless_source,
+            conference_filter=conference_filter,
+        )
         if out:
             write_jaccard_report(report, out)
         return report

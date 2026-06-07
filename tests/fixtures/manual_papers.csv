@@ -1,4 +1,5 @@
-Paper Title,Notes
-Example Wireless Dataset Paper,matches the fetched set
-example   wireless   dataset  paper,duplicate after normalization
-A Manually Curated Paper Not Fetched,missed by the cli
+Paper Title,Conference,Year,Notes
+Example Wireless Dataset Paper,SIGCOMM,2025,matches the fetched set
+example   wireless   dataset  paper,SIGCOMM,2025,duplicate after normalization
+A Manually Curated Paper Not Fetched,SIGCOMM,2025,missed by the cli
+Some Other Conference Paper,NSDI,2024,different conference - filtered out

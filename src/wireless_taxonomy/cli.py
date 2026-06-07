@@ -376,12 +376,18 @@ def paper_set(
     run_id: int = typer.Option(..., "--run-id"),
     out: str = typer.Option(..., "--out"),
     fmt: str = typer.Option("csv", "--format", help="csv or json."),
+    wireless_only: bool = typer.Option(
+        False, "--wireless-only/--all-papers", help="Restrict to papers the pipeline classified as wireless."
+    ),
+    wireless_source: str = typer.Option(
+        "classify", "--wireless-source", help="Wireless decision source: classify (keyword) or agentic (analysis)."
+    ),
     db: str = typer.Option("taxonomy.sqlite", "--db"),
 ) -> None:
     """Export the conference-scoped set of fetched papers (match_key, title, abstract, ...)."""
     pipeline = _pipeline(db)
     try:
-        path = pipeline.export_paper_set(run_id, out, fmt)
+        path = pipeline.export_paper_set(run_id, out, fmt, wireless_only=wireless_only, wireless_source=wireless_source)
         typer.echo(f"Exported paper set ({fmt}): {path}")
     finally:
         pipeline.close()
@@ -394,15 +400,46 @@ def jaccard(
     title_col: Optional[str] = typer.Option(
         None, "--title-col", help="Column in the manual CSV holding paper titles. Auto-detected when omitted."
     ),
+    conference_col: Optional[str] = typer.Option(
+        None, "--conference-col", help="Manual CSV conference/venue column. Auto-detected when omitted."
+    ),
+    year_col: Optional[str] = typer.Option(
+        None, "--year-col", help="Manual CSV year column. Auto-detected when omitted."
+    ),
+    wireless_only: bool = typer.Option(
+        True,
+        "--wireless-only/--all-papers",
+        help="Compare the pipeline's wireless-classified papers (default) vs the full ingested list.",
+    ),
+    wireless_source: str = typer.Option(
+        "classify", "--wireless-source", help="Wireless decision source: classify (keyword) or agentic (analysis)."
+    ),
+    conference_filter: bool = typer.Option(
+        True,
+        "--conference-filter/--no-conference-filter",
+        help="Filter the manual CSV to the run's conference+year when those columns exist.",
+    ),
     out: Optional[str] = typer.Option(None, "--out", help="Write the full diff report JSON to this path."),
     db: str = typer.Option("taxonomy.sqlite", "--db"),
 ) -> None:
-    """Jaccard (IoU) of fetched papers vs a manually curated list, by normalized title."""
+    """Jaccard (IoU) of the pipeline's papers vs a manually curated list, by normalized title."""
     pipeline = _pipeline(db)
     try:
-        report = pipeline.jaccard(run_id, manual, title_col=title_col, out=out)
+        report = pipeline.jaccard(
+            run_id,
+            manual,
+            title_col=title_col,
+            conference_col=conference_col,
+            year_col=year_col,
+            wireless_only=wireless_only,
+            wireless_source=wireless_source,
+            conference_filter=conference_filter,
+            out=out,
+        )
         typer.echo(
             "Paper-list coverage (Jaccard/IoU). "
+            f"venue={report.venue} year={report.year} "
+            f"wireless_only={report.wireless_only} conference_filtered={report.conference_filtered} "
             f"index={report.jaccard_index:.4f} "
             f"intersection={report.intersection_count} union={report.union_count} "
             f"automated={report.automated_count} manual={report.manual_count} "

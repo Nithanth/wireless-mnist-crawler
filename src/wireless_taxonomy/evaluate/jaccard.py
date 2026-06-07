@@ -11,8 +11,10 @@ from wireless_taxonomy.analyze.text_match import normalize_title
 from wireless_taxonomy.export.paper_set import PaperSetExporter
 
 # Candidate header names (compared case-insensitively after trimming) for the
-# column in a manually curated CSV that holds the paper title.
+# columns in a manually curated CSV.
 _TITLE_COLUMN_CANDIDATES = ("title", "paper title", "paper_title", "papertitle", "paper")
+_CONFERENCE_COLUMN_CANDIDATES = ("conference", "venue")
+_YEAR_COLUMN_CANDIDATES = ("year",)
 
 
 @dataclass(frozen=True)
@@ -20,12 +22,16 @@ class JaccardReport:
     """Jaccard (IoU) comparison between the automated and manual paper sets.
 
     Keys are normalized titles. `missed_by_cli` are papers in the manual set the
-    pipeline did not fetch; `extra_from_cli` are papers the pipeline fetched that
-    are absent from the manual set.
+    pipeline did not capture; `extra_from_cli` are papers the pipeline captured
+    that are absent from the manual set.
     """
 
     run_id: int
+    venue: str
+    year: int
+    wireless_only: bool
     title_column: str
+    conference_filtered: bool
     jaccard_index: float
     intersection_count: int
     union_count: int
@@ -38,7 +44,11 @@ class JaccardReport:
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
+            "venue": self.venue,
+            "year": self.year,
+            "wireless_only": self.wireless_only,
             "title_column": self.title_column,
+            "conference_filtered": self.conference_filtered,
             "jaccard_index": self.jaccard_index,
             "counts": {
                 "automated": self.automated_count,
@@ -54,35 +64,45 @@ class JaccardReport:
         }
 
 
-def detect_title_column(headers: list[str], override: str | None = None) -> str:
-    """Return the actual header to read titles from.
-
-    When `override` is provided it is matched case-insensitively against the
-    headers. Otherwise the first known title-like header wins.
-    """
-
+def _detect_column(headers: list[str], candidates: tuple[str, ...], override: str | None, kind: str, required: bool) -> str | None:
     normalized = {(header or "").strip().lower(): header for header in headers}
     if override:
         actual = normalized.get(override.strip().lower())
         if actual is None:
-            raise ValueError(
-                f"Title column {override!r} not found. Available columns: {', '.join(headers)}"
-            )
+            raise ValueError(f"{kind} column {override!r} not found. Available columns: {', '.join(headers)}")
         return actual
-    for candidate in _TITLE_COLUMN_CANDIDATES:
+    for candidate in candidates:
         if candidate in normalized:
             return normalized[candidate]
-    raise ValueError(
-        "Could not auto-detect a title column. "
-        f"Available columns: {', '.join(headers)}. Pass --title-col to choose one."
-    )
+    if required:
+        raise ValueError(
+            f"Could not auto-detect a {kind} column. "
+            f"Available columns: {', '.join(headers)}. Pass the matching --*-col option."
+        )
+    return None
 
 
-def load_manual_paper_keys(manual_csv: str | Path, title_col: str | None = None) -> tuple[dict[str, str], str]:
+def detect_title_column(headers: list[str], override: str | None = None) -> str:
+    column = _detect_column(headers, _TITLE_COLUMN_CANDIDATES, override, "title", required=True)
+    assert column is not None  # required=True guarantees a value
+    return column
+
+
+def load_manual_paper_keys(
+    manual_csv: str | Path,
+    title_col: str | None = None,
+    conference_col: str | None = None,
+    year_col: str | None = None,
+    venue: str | None = None,
+    year: int | None = None,
+) -> tuple[dict[str, str], str, bool]:
     """Load a manual CSV into a mapping of normalized title -> original title.
 
-    Returns the mapping plus the resolved title column. utf-8-sig handles the BOM
-    that spreadsheet exports (e.g. Google Sheets) commonly prepend.
+    When `venue`/`year` are given and the CSV exposes conference/year columns, rows
+    are filtered to that conference instance so a multi-conference sheet compares
+    like-for-like against a single run. utf-8-sig handles the BOM that spreadsheet
+    exports (e.g. Google Sheets) commonly prepend. Returns the mapping, the resolved
+    title column, and whether conference filtering was applied.
     """
 
     path = Path(manual_csv)
@@ -91,17 +111,25 @@ def load_manual_paper_keys(manual_csv: str | Path, title_col: str | None = None)
         headers = list(reader.fieldnames or [])
         if not headers:
             raise ValueError(f"Manual CSV {path} has no header row")
-        column = detect_title_column(headers, title_col)
+        title_column = detect_title_column(headers, title_col)
+        conference_column = _detect_column(headers, _CONFERENCE_COLUMN_CANDIDATES, conference_col, "conference", required=False)
+        year_column = _detect_column(headers, _YEAR_COLUMN_CANDIDATES, year_col, "year", required=False)
+        apply_filter = venue is not None and year is not None and conference_column is not None and year_column is not None
         keys: dict[str, str] = {}
         for row in reader:
-            title = (row.get(column) or "").strip()
+            if apply_filter:
+                row_venue = (row.get(conference_column) or "").strip().lower()
+                row_year = (row.get(year_column) or "").strip()
+                if row_venue != venue.strip().lower() or row_year != str(year):
+                    continue
+            title = (row.get(title_column) or "").strip()
             if not title:
                 continue
             key = normalize_title(title)
             if not key:
                 continue
             keys.setdefault(key, title)
-    return keys, column
+    return keys, title_column, apply_filter
 
 
 def compute_paper_list_jaccard(
@@ -109,14 +137,31 @@ def compute_paper_list_jaccard(
     run_id: int,
     manual_csv: str | Path,
     title_col: str | None = None,
+    conference_col: str | None = None,
+    year_col: str | None = None,
+    wireless_only: bool = True,
+    wireless_source: str = "classify",
+    conference_filter: bool = True,
 ) -> JaccardReport:
+    exporter = PaperSetExporter(conn)
+    ref = exporter.conference_ref(run_id)
+
     automated: dict[str, str] = {}
-    for row in PaperSetExporter(conn).rows(run_id):
+    for row in exporter.rows(run_id, wireless_only=wireless_only, wireless_source=wireless_source):
         key = row["match_key"]
         if key:
             automated.setdefault(key, row["title"])
 
-    manual, column = load_manual_paper_keys(manual_csv, title_col)
+    filter_venue = ref.venue if conference_filter else None
+    filter_year = ref.year if conference_filter else None
+    manual, title_column, conference_filtered = load_manual_paper_keys(
+        manual_csv,
+        title_col=title_col,
+        conference_col=conference_col,
+        year_col=year_col,
+        venue=filter_venue,
+        year=filter_year,
+    )
 
     automated_keys = set(automated)
     manual_keys = set(manual)
@@ -130,7 +175,11 @@ def compute_paper_list_jaccard(
 
     return JaccardReport(
         run_id=run_id,
-        title_column=column,
+        venue=ref.venue,
+        year=ref.year,
+        wireless_only=wireless_only,
+        title_column=title_column,
+        conference_filtered=conference_filtered,
         jaccard_index=jaccard_index,
         intersection_count=len(intersection),
         union_count=len(union),

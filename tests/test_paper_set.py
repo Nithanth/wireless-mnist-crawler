@@ -10,6 +10,7 @@ from wireless_taxonomy.export.paper_set import PAPER_SET_COLUMNS
 from wireless_taxonomy.pipeline import Pipeline
 
 FIXTURES = Path(__file__).parent / "fixtures"
+MANUAL = FIXTURES / "manual_papers.csv"
 
 
 def _ingest(tmp_path: Path) -> tuple[Pipeline, int]:
@@ -29,8 +30,6 @@ def test_paper_set_csv_has_match_key_and_abstract(tmp_path: Path) -> None:
     with path.open(encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     assert list(rows[0].keys()) == PAPER_SET_COLUMNS
-    titles = {row["title"] for row in rows}
-    assert "Example Wireless Dataset Paper" in titles
     wireless = next(row for row in rows if row["title"] == "Example Wireless Dataset Paper")
     assert wireless["match_key"] == "example wireless dataset paper"
     assert wireless["abstract"]
@@ -51,6 +50,27 @@ def test_paper_set_json_round_trips(tmp_path: Path) -> None:
     }
 
 
+def test_paper_set_wireless_only_filters_to_classified(tmp_path: Path) -> None:
+    pipeline, run_id = _ingest(tmp_path)
+    try:
+        pipeline.classify_wireless(run_id)
+        path = pipeline.export_paper_set(run_id, str(tmp_path / "wireless.csv"), "csv", wireless_only=True)
+    finally:
+        pipeline.close()
+    with path.open(encoding="utf-8") as fh:
+        titles = [row["title"] for row in csv.DictReader(fh)]
+    assert titles == ["Example Wireless Dataset Paper"]
+
+
+def test_paper_set_wireless_only_requires_classification(tmp_path: Path) -> None:
+    pipeline, run_id = _ingest(tmp_path)
+    try:
+        with pytest.raises(ValueError):
+            pipeline.export_paper_set(run_id, str(tmp_path / "w.csv"), "csv", wireless_only=True)
+    finally:
+        pipeline.close()
+
+
 def test_paper_set_rejects_unknown_format(tmp_path: Path) -> None:
     pipeline, run_id = _ingest(tmp_path)
     try:
@@ -60,35 +80,62 @@ def test_paper_set_rejects_unknown_format(tmp_path: Path) -> None:
         pipeline.close()
 
 
-def test_jaccard_index_and_diff(tmp_path: Path) -> None:
+def test_jaccard_wireless_only_with_conference_filter(tmp_path: Path) -> None:
     pipeline, run_id = _ingest(tmp_path)
     out = tmp_path / "report.json"
     try:
-        report = pipeline.jaccard(run_id, str(FIXTURES / "manual_papers.csv"), out=str(out))
+        pipeline.classify_wireless(run_id)
+        report = pipeline.jaccard(run_id, str(MANUAL), out=str(out))
     finally:
         pipeline.close()
 
-    # Manual set has 2 distinct papers after normalization (the duplicate collapses);
-    # one overlaps the fetched set, one is missed. The fetched set has one extra paper.
+    # Manual rows filtered to SIGCOMM/2025 -> 2 distinct papers (dup collapses, NSDI dropped).
+    # Automated wireless set is just the wireless paper; the datacenter paper is excluded.
+    assert report.venue == "SIGCOMM"
+    assert report.year == 2025
+    assert report.wireless_only is True
+    assert report.conference_filtered is True
     assert report.title_column == "Paper Title"
-    assert report.automated_count == 2
+    assert report.automated_count == 1
     assert report.manual_count == 2
     assert report.intersection_count == 1
-    assert report.union_count == 3
-    assert report.jaccard_index == pytest.approx(1 / 3)
-    assert report.missed_by_cli == ["A Manually Curated Paper Not Fetched"]
-    assert report.extra_from_cli == ["Example Datacenter Congestion Paper"]
+    assert report.jaccard_index == pytest.approx(0.5)
     assert report.matched == ["Example Wireless Dataset Paper"]
+    assert report.missed_by_cli == ["A Manually Curated Paper Not Fetched"]
+    assert report.extra_from_cli == []
 
     payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["jaccard_index"] == pytest.approx(0.5)
     assert payload["counts"]["intersection"] == 1
-    assert payload["jaccard_index"] == pytest.approx(1 / 3)
+
+
+def test_jaccard_all_papers(tmp_path: Path) -> None:
+    pipeline, run_id = _ingest(tmp_path)
+    try:
+        report = pipeline.jaccard(run_id, str(MANUAL), wireless_only=False)
+    finally:
+        pipeline.close()
+    # Full ingested list (2) vs SIGCOMM/2025 manual (2): the non-wireless paper is now an extra.
+    assert report.automated_count == 2
+    assert report.manual_count == 2
+    assert report.jaccard_index == pytest.approx(1 / 3)
+    assert report.extra_from_cli == ["Example Datacenter Congestion Paper"]
+
+
+def test_jaccard_no_conference_filter_includes_other_venues(tmp_path: Path) -> None:
+    pipeline, run_id = _ingest(tmp_path)
+    try:
+        report = pipeline.jaccard(run_id, str(MANUAL), wireless_only=False, conference_filter=False)
+    finally:
+        pipeline.close()
+    assert report.conference_filtered is False
+    assert report.manual_count == 3  # NSDI row no longer filtered out
 
 
 def test_jaccard_explicit_title_column(tmp_path: Path) -> None:
     pipeline, run_id = _ingest(tmp_path)
     try:
-        report = pipeline.jaccard(run_id, str(FIXTURES / "manual_papers.csv"), title_col="paper title")
+        report = pipeline.jaccard(run_id, str(MANUAL), title_col="paper title", wireless_only=False)
     finally:
         pipeline.close()
     assert report.title_column == "Paper Title"
