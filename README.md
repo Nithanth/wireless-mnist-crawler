@@ -1,749 +1,195 @@
 # wireless-taxonomy
 
-`wireless-taxonomy` is a Python CLI for building a wireless research taxonomy from a conference or proceedings source. The target workflow is:
+Working repo for the **wireless-mnist** research project (CMU × NIST) on the
+*openness of wireless datasets used to reproduce ML research*.
 
-1. Point the CLI at a page, BibTeX file, or CSV containing accepted papers.
-2. Extract and verify the paper list.
-3. Gather paper text, PDF text, links, and evidence snippets.
-4. Run taxonomy analysis over the papers.
-5. Export a workbook or CSV/JSON artifact shaped like the manual taxonomy spreadsheet.
+The study manually curates, per conference/year, which wireless papers were
+published, which datasets they use, whether those datasets are open, and their
+modalities. This repo is the tooling that supports that effort: a Python CLI
+(`wireless_taxonomy`) that pulls a conference's accepted-paper list, backfills
+titles/abstracts from open metadata APIs, classifies which papers are wireless,
+and **scores that automated set against the hand-curated list** (Jaccard / IoU,
+precision / recall) so we can quantify how well the automated path reproduces
+the manual curation.
 
-The intended final workbook mirrors the manual Google Sheets taxonomy:
+Because ACM/IEEE block automated full-text fetching, the current workflow is
+deliberately metadata-only: it works from **DBLP** (authoritative paper list:
+title/authors/DOI) plus **OpenAlex/Crossref/Semantic Scholar** (abstracts), and
+compares on title + abstract. Data is persisted in SQLite; the package also
+contains a longer LLM-backed taxonomy pipeline (analysis, dataset extraction,
+export) that the evaluation work is layered on top of.
 
-- `List of Papers`
-- `List of Datasets`
-- `Bibtex`
-- `Review Needed`
-- `Evidence`
-- `Paper Dataset Links`
+---
 
-The project is built around a simple principle: use deterministic code for database writes, thresholds, review gating, reuse counts, and exports; use LLM/agentic behavior for messy extraction, paper understanding, dataset synthesis, and evidence gathering.
+## CLI usage
 
-## Current Status
+### Setup
 
-The project currently has a working sequential pipeline with SQLite persistence, JSONL evidence logging, CLI commands, regression tests, and multiple full-text retrieval strategies.
-
-The tested pipeline can currently:
-
-- ingest paper lists from URL, BibTeX, or CSV
-- parse known/simple proceedings pages deterministically
-- use an LLM fallback for heterogeneous URL extraction
-- verify paper-list quality
-- assess whether a source appears relevant to networking/wireless research
-- enrich papers with abstracts, links, landing-page text, and snippets
-- discover full text through open resolvers
-- ingest local PDFs as a fallback
-- optionally use an authenticated ACM browser fallback when the user has legitimate access
-- assess whether each paper has enough input text for taxonomy analysis
-- run deterministic or LLM-backed paper analysis
-- extract dataset claims, modalities, and OSI layers
-- run a deterministic reflection pass over analysis outputs
-- check dataset availability
-- resolve dataset identity/reuse
-- export CSV, XLSX, and JSON
-
-The regression suite is currently green:
+Requires Python ≥ 3.11.
 
 ```bash
-PYTHONPATH=src python3 -m pytest -q
+pip install -e .                      # installs typer, pandas, openpyxl, ...
+# optional: authenticated ACM browser fallback
+pip install -e ".[browser]"
 ```
 
-Current result after the latest cleanup:
+Every command is run through the Typer app. Either use the installed entrypoint:
 
-```text
-43 passed
+```bash
+wireless-taxonomy --help
 ```
 
-## Architecture
-
-The package lives under:
-
-```text
-src/wireless_taxonomy
-```
-
-Main areas:
-
-```text
-wireless_taxonomy/
-  analyze/        Paper text enrichment, full-text discovery, analysis, reflection
-  db.py           SQLite connection, migrations, transactions
-  evidence.py     JSONL evidence/event logging
-  export/         Spreadsheet and JSON export
-  ingest/         URL, BibTeX, CSV ingestion and verification
-  resolve/        Dataset identity, reuse, resolver cache
-  review/         Review queue helpers
-  cli.py          Typer CLI entrypoint
-  pipeline.py     Sequential pipeline orchestration
-```
-
-The main public entrypoint is:
-
-```text
-wireless_taxonomy.cli:app
-```
-
-Run commands locally with:
+or run the module directly (used in the examples below):
 
 ```bash
 PYTHONPATH=src python3 -m wireless_taxonomy.cli --help
 ```
 
-## Data Model
-
-The pipeline writes to SQLite. Migrations live in:
-
-```text
-migrations/
-```
-
-Core persisted records include:
-
-- conference instances
-- pipeline runs
-- papers
-- paper sources
-- paper text artifacts
-- paper text links
-- paper text snippets
-- resolver cache entries
-- paper input readiness reports
-- paper agentic analyses
-- paper analysis dataset claims
-- paper analysis reflections
-- datasets
-- paper-dataset links
-- evidence claims
-- review items
-
-Evidence is persisted in two places:
-
-- canonical structured rows in SQLite
-- JSONL event logs under the configured evidence directory
-
-By default, evidence logs are stored near the selected database unless `WIRELESS_TAXONOMY_EVIDENCE_DIR` is set.
-
-## Pipeline Stages
-
-The current end-to-end pipeline is sequential. Each stage creates a new `pipeline_runs` row and writes its own artifacts/evidence.
-
-### 1. Ingest
-
-Command:
+All commands take `--db` (default `taxonomy.sqlite`). Initialize a database:
 
 ```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli init --db taxonomy.sqlite
+```
+
+### Coverage evaluation (current focus)
+
+Goal: measure how well the automated wireless detection matches your manually
+curated list for a conference. Pull the list from DBLP, backfill abstracts,
+classify, then score.
+
+```bash
+# 1. Paper list from DBLP (title/authors/DOI; no abstracts)
+curl "https://dblp.org/search/publ/api?q=toc:db/conf/sigcomm/sigcomm2024.bht:&h=1000&format=bib1" -o sigcomm2024.bib
 PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest \
-  --venue SIGCOMM \
-  --year 2025 \
-  --url https://conferences.sigcomm.org/sigcomm/2025/program/papers-info/ \
-  --db taxonomy.sqlite
-```
+  --venue SIGCOMM --year 2024 --bibtex sigcomm2024.bib --db taxonomy.sqlite
+# -> Ingest completed. run_id=1
 
-Supported inputs:
+# 2. Backfill abstracts from OpenAlex/Crossref/Semantic Scholar (by DOI, then title)
+PYTHONPATH=src python3 -m wireless_taxonomy.cli enrich-abstracts --run-id 1 --db taxonomy.sqlite
 
-- `--url`
-- `--bibtex`
-- `--csv`
-
-URL ingestion fetches and cleans HTML while preserving links. Known/simple proceedings pages can be parsed deterministically. Heterogeneous pages can use the configured LLM fallback.
-
-### 2. Verify Paper List
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli verify-paper-list \
-  --run-id 1 \
-  --external \
-  --llm \
-  --db taxonomy.sqlite
-```
-
-Verification checks:
-
-- missing title/authors/abstract/DOI
-- duplicate titles
-- malformed records
-- low source confidence
-- optional Crossref checks
-- optional LLM verifier pass
-
-Verification confidence is a source-level quality score for whether the extracted paper list looks complete and coherent enough to continue.
-
-### 3. Assess Scope
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli assess-scope \
-  --run-id 1 \
-  --db taxonomy.sqlite
-```
-
-This stage checks whether the source looks like a networking/wireless-relevant research source. It flags suspicious inputs such as random unrelated conference pages, malformed lists, or sources where most papers do not appear related to networking or wireless.
-
-The `run` command can prompt before continuing when scope looks questionable. Use `--yes` to proceed without prompting.
-
-### 4. Enrich Paper Text
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli enrich-paper-text \
-  --run-id 1 \
-  --db taxonomy.sqlite
-```
-
-This gathers lower-cost paper context:
-
-- abstract text
-- paper landing page links
-- source page text where available
-- snippets around dataset/data/artifact terms
-
-This stage is useful even when full PDFs are not yet available.
-
-### 5. Discover Full Text
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli discover-full-text \
-  --run-id 1 \
-  --db taxonomy.sqlite
-```
-
-For one paper:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli discover-full-text \
-  --run-id 1 \
-  --paper-id 42 \
-  --db taxonomy.sqlite
-```
-
-Full-text discovery tries open and programmatic sources before any manual fallback:
-
-1. paper/proceedings links already found during ingestion
-2. OpenAlex
-3. Crossref
-4. Semantic Scholar
-5. Unpaywall
-6. arXiv title search
-7. OpenReview title search
-8. bounded web search
-9. publisher DOI landing/PDF candidates
-
-Semantic Scholar title/author matching is used because DOI-only matching can miss alternate open versions. DOI is still preferred when it resolves cleanly.
-
-Rate limits are enforced for Semantic Scholar and OpenReview.
-
-### 6. Add Local PDFs
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli add-pdfs \
-  --run-id 1 \
-  --dir ./papers \
-  --db taxonomy.sqlite
-```
-
-This is the fallback when PDFs cannot be retrieved programmatically. The importer matches local PDFs back to the paper list and extracts text/snippets from them.
-
-### 7. Authenticated ACM Browser Fallback
-
-Command for login:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli fetch-acm-browser \
-  --run-id 1 \
-  --login \
-  --profile-dir .browser/acm \
-  --db taxonomy.sqlite
-```
-
-Command for fetching:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli fetch-acm-browser \
-  --run-id 1 \
-  --profile-dir .browser/acm \
-  --limit 10 \
-  --db taxonomy.sqlite
-```
-
-With a manually launched Chrome/CDP session:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli fetch-acm-browser \
-  --run-id 1 \
-  --cdp-url http://127.0.0.1:9222 \
-  --limit 10 \
-  --db taxonomy.sqlite
-```
-
-This fallback is opt-in. It exists for legitimate ACM/institutional access and should not be used as a default bulk scraper. CDP lets the CLI connect to a real logged-in browser session and reuse the user's authenticated access, but it does not hide automation from ACM. Large automated downloads may violate publisher or institutional usage policies.
-
-### 8. Assess Paper Inputs
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli assess-paper-inputs \
-  --run-id 1 \
-  --db taxonomy.sqlite
-```
-
-This stage checks whether each paper has enough input to start taxonomy analysis.
-
-Readiness levels include:
-
-- abstract only
-- abstract plus links
-- full text
-- full text plus links
-
-The goal is to know which papers are ready for the intelligent taxonomy portion and which ones need review or manual PDF upload.
-
-### 9. Agentic Paper Analysis
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli agentic-paper-analysis \
-  --run-id 1 \
-  --llm \
-  --db taxonomy.sqlite
-```
-
-For one paper:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli agentic-paper-analysis \
-  --run-id 1 \
-  --paper-id 42 \
-  --llm \
-  --db taxonomy.sqlite
-```
-
-This stage is the bridge into taxonomy synthesis. It analyzes paper text and snippets to produce:
-
-- wireless/non-wireless label
-- wireless confidence
-- evidence
-- paper summary
-- dataset claims
-- dataset relationship type
-- modality evidence
-- OSI L1-L7 evidence
-- availability hints
-- review-needed flags
-
-The current implementation supports a deterministic analyzer and an LLM-backed analyzer. The deterministic analyzer is useful for tests and regression safety. The LLM analyzer is intended for higher-fidelity synthesis.
-
-### 10. Reflect Paper Analysis
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli reflect-paper-analysis \
-  --run-id 1 \
-  --db taxonomy.sqlite
-```
-
-This stage reviews prior analysis outputs and flags weak or unsupported claims. It is currently deterministic and is meant to reduce hallucination risk by checking whether claims are grounded in available text/evidence.
-
-### 11. Extract Datasets
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli extract-datasets \
-  --run-id 1 \
-  --db taxonomy.sqlite
-```
-
-This is an older deterministic extraction path. It still remains useful as a fallback/regression path while the agentic taxonomy synthesis matures.
-
-### 12. Check Availability
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli check-availability \
-  --run-id 1 \
-  --db taxonomy.sqlite
-```
-
-This checks whether dataset URLs appear open, closed, missing, or uncertain.
-
-### 13. Resolve Reuse
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli resolve-reuse \
-  --run-id 1 \
-  --db taxonomy.sqlite
-```
-
-This computes reuse counts and identity relationships across datasets.
-
-### 14. Export
-
-Command:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli export \
-  --run-id 1 \
-  --format xlsx \
-  --out taxonomy.xlsx \
-  --db taxonomy.sqlite
-```
-
-JSON export:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli export \
-  --run-id 1 \
-  --format json \
-  --scope related \
-  --out taxonomy.json \
-  --db taxonomy.sqlite
-```
-
-Supported formats:
-
-- `csv`
-- `xlsx`
-- `json`
-
-The intended end state is a clean CSV/XLSX workbook that matches the manual taxonomy structure and sends uncertain rows to `Review Needed`.
-
-## Paper-List Coverage (Jaccard)
-
-When automated full-text fetching is blocked (e.g. ACM), the pipeline can still extract titles and abstracts and classify whether a paper is wireless. To measure how well the automated path reproduces a hand-curated wireless paper list, the CLI can emit a flat paper set and compute a Jaccard (intersection-over-union) score keyed on normalized titles.
-
-Because a manual taxonomy sheet typically holds the *wireless* papers across *many* conferences, the comparison is made like-for-like: the automated side defaults to papers the pipeline classified as wireless, and the manual side is filtered to the run's conference + year.
-
-### Export the fetched paper set
-
-```bash
-# Full ingested list for the run's conference:
-PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
-  --run-id 1 --out sigcomm-2024-papers.csv --format csv --db taxonomy.sqlite
-
-# Only the papers the pipeline classified as wireless (run classify-wireless first):
-PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
-  --run-id 1 --out sigcomm-2024-wireless.csv --wireless-only --db taxonomy.sqlite
-```
-
-Each row has these columns (`match_key` is the normalized title — lowercased, alphanumeric-only):
-
-```text
-match_key, title, abstract, authors, doi, year, venue, wireless_label, wireless_confidence
-```
-
-`wireless_label` / `wireless_confidence` come from the latest `classify-wireless` run for that conference (blank if it hasn't been classified yet), so each exported paper carries the classifier's decision and how confident it was. `--format json` is also supported. Output is scoped to the run's conference instance. `--wireless-source` selects the wireless decision source: `classify` (keyword rules over title+abstract, default) or `agentic` (the LLM analysis stage).
-
-### Compute Jaccard against a manual list
-
-```bash
+# 3. Classify which papers are wireless (keyword, title+abstract; no API key)
 PYTHONPATH=src python3 -m wireless_taxonomy.cli classify-wireless --run-id 1 --db taxonomy.sqlite
+
+# 4. Score the automated wireless set vs your curated CSV
 PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard \
-  --run-id 1 \
-  --manual "Wireless Taxonomy Record - List of Papers.csv" \
-  --out coverage-report.json \
-  --db taxonomy.sqlite
+  --run-id 1 --manual "List of Papers.csv" \
+  --csv comparison.csv --out report.json --db taxonomy.sqlite
 ```
 
-Defaults, all overridable:
-
-- **Wireless-only** automated set (`--all-papers` compares the full ingested list instead).
-- **Conference + year filtering** of the manual CSV to the run (`--no-conference-filter` to disable). The `Conference`/`Venue` and `Year` columns are auto-detected; override with `--conference-col` / `--year-col`. The manual conference value must match the run's `--venue` (case-insensitive).
-- **Title column** auto-detected (`title` / `paper title` / `paper_title`); override with `--title-col "Paper Title"`.
-- **Fuzzy matching** (`--exact` to disable). Papers are first matched on exact normalized title, then remaining papers are matched by title similarity (`difflib` ratio ≥ 0.92) — or a lower similarity (≥ 0.80) when **author surnames overlap** (≥ half of the smaller author list). This catches subtitle/punctuation/wording drift between the conference page and the manual sheet without false-positiving unrelated papers. The `Authors` column is auto-detected (override `--authors-col`); matching is one-to-one (greedy by descending score).
-
-Both title sides are normalized with the same `normalize_title`, so keys line up deterministically. The command prints a readable summary:
+`jaccard` prints a readable summary and self-filters the manual CSV to the run's
+conference + year:
 
 ```text
-SIGCOMM 2024  —  Jaccard (IoU) = 0.8421
-  matched (intersection) :    8   (fuzzy: 2)
-  union                  :   10
-  automated / manual     :    9 / 9
-  missed_by_cli          :    1  (curated wireless the CLI didn't flag)
-  extra_from_cli         :    1  (CLI-flagged, not in your sheet)
-  mean wireless confidence (automated): 0.88
+SIGCOMM 2024  —  Jaccard (IoU) = 0.0980
+  matched (intersection) :    5   (fuzzy: 1)
+  union                  :   51
+  automated / manual     :   47 / 9
+  missed_by_cli          :    4  (curated wireless the CLI didn't flag)
+  extra_from_cli         :   42  (CLI-flagged, not in your sheet)
+  mean wireless confidence (automated): 0.91
 ```
 
-`--out` writes a diff report (JSON) listing `matched`, `missed_by_cli` (curated wireless papers the pipeline didn't flag), `extra_from_cli` (pipeline-flagged papers absent from the manual list), and `fuzzy_matches` (each near-match with its `title_similarity`, `author_overlap`, and `shared_authors`) so coverage gaps — and any fuzzy matches you want to eyeball — are diagnosable, not just a single number.
+- `--csv` writes one row per paper with a `status` column
+  (`matched` / `fuzzy_matched` / `missed_by_cli` / `extra_from_cli`), plus
+  `title_similarity`, `author_overlap`, `shared_authors`, and
+  `wireless_label` / `wireless_confidence`.
+- Manual-CSV columns (title / authors / conference / year) are auto-detected;
+  override with `--title-col` / `--authors-col` / `--conference-col` / `--year-col`.
+- Matching is exact-normalized-title, then fuzzy (difflib + author-surname boost);
+  `--exact` disables fuzzy.
+- `--all-papers` compares the full ingested list instead of the wireless subset;
+  `--no-conference-filter` disables the conference/year filter.
 
-`--csv comparison.csv` writes a **per-paper comparison** — one row per paper with a `status` column so you can review every match/miss in a spreadsheet:
-
-```text
-venue, year, status, manual_title, automated_title, title_similarity, author_overlap, shared_authors, wireless_label, wireless_confidence
-```
-
-`status` is one of `matched`, `fuzzy_matched`, `missed_by_cli`, or `extra_from_cli`. Automated-side rows (`matched` / `fuzzy_matched` / `extra_from_cli`) carry the paper's `wireless_label` and `wireless_confidence` from the classifier; `missed_by_cli` rows (curated papers the CLI didn't fetch) leave those blank.
-
-### Aggregate across every conference (`jaccard-all`)
-
-A single run is one `(venue, year)`. When the DB holds many conference instances (you ran `ingest` for each conference/year in your sheet), `jaccard-all` runs the comparison once per instance against the same master CSV — each instance self-filters the sheet to its own venue+year — and rolls the results up:
+**Across every conference in the DB** (repeat steps 1–2 per venue/year first):
 
 ```bash
 PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard-all \
-  --manual "Wireless Taxonomy Record - List of Papers.csv" \
-  --out aggregate.json --db taxonomy.sqlite
+  --manual "List of Papers.csv" --csv comparison_all.csv --db taxonomy.sqlite
 ```
 
 ```text
-Aggregate coverage (Jaccard/IoU) over 3 conference(s), 0 skipped:
-  NSDI 2024: index=0.8000 matched=16 union=20 missed=2 extra=2 (fuzzy=3)
-  SIGCOMM 2025: index=0.7500 matched=6 union=8 missed=1 extra=1 (fuzzy=1)
-  GLOBECOM 2023: index=0.6667 matched=4 union=6 missed=1 extra=1 (fuzzy=0)
-  micro (pooled papers)            = 0.7692
-  macro (mean of per-conference)   = 0.7389
+NSDI 2024:    index=0.8000 intersection=16 union=20 ...
+SIGCOMM 2024: index=0.0980 intersection=5  union=51 ...
+Aggregate coverage. conferences=2 skipped=0 micro=... macro=...
 ```
 
-(With `--no-auto-classify`, any conference lacking a `classify-wireless` run is printed as `SKIPPED <venue> <year>: ...` instead and excluded from the roll-up.) `--csv combined.csv` writes one combined per-paper comparison CSV across every conference (same columns as `jaccard --csv`, with `venue`/`year` distinguishing rows).
+`jaccard-all` rolls up **micro** (pooled papers) and **macro** (mean of
+per-conference indices). With `--wireless-only` it auto-runs `classify-wireless`
+for any unclassified conference (`--no-auto-classify` to opt out).
 
-- **micro** pools every paper (Σ intersection / Σ union) — larger conferences weigh more.
-- **macro** averages the per-conference indices — every conference counts equally.
-- **Auto-classify (default on):** under `--wireless-only` with the keyword classifier, any conference without a `classify-wireless` run is classified automatically before comparison (the classifier is deterministic, needs no API key, and is idempotent). Pass `--no-auto-classify` to instead **skip** unclassified conferences (they're listed with the reason, never fatal). All other `jaccard` flags (`--all-papers`, `--exact`, `--wireless-source`, column overrides) apply.
-
-### Sourcing every conference: DBLP list + OpenAlex abstracts
-
-You supply one accepted-paper source per `(venue, year)`. The pipeline does not invent a conference's paper list. The robust, unblocked route across all venues (no ACM/IEEE scraping):
-
-1. **List from DBLP** — DBLP has title/authors/DOI for essentially every SIGCOMM/IMC/NSDI/ICC/GLOBECOM + IEEE Transactions, in one uniform format. Download a venue's BibTeX from its table-of-contents API and `ingest --bibtex`. DBLP carries **no abstracts**.
-2. **Abstracts from open metadata** — `enrich-abstracts` backfills `papers.abstract` from OpenAlex, Crossref, and Semantic Scholar (metadata APIs, not the paywalled PDF), matched by **DOI** first (exact) then verified title. These are free, need no key, and are not blocked. Abstract coverage is high but not universal (some publishers don't deposit abstracts); a paper with no abstract anywhere just falls back to title-only classification.
-3. **Classify + score** — `jaccard-all` (auto-classifies, see above).
+**Export just the fetched paper set** (e.g. to inspect or diff manually):
 
 ```bash
-# 1. List (DBLP table-of-contents export → BibTeX)
-curl "https://dblp.org/search/publ/api?q=toc:db/conf/sigcomm/sigcomm2024.bht:&h=1000&format=bib1" -o sigcomm2024.bib
-PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest --venue SIGCOMM --year 2024 --bibtex sigcomm2024.bib --db taxonomy.sqlite
-
-# 2. Abstracts (OpenAlex, by DOI then title)
-PYTHONPATH=src python3 -m wireless_taxonomy.cli enrich-abstracts --run-id 1 --db taxonomy.sqlite
-
-# 3. Repeat 1–2 per conference/year, then aggregate
-PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard-all --manual "List of Papers.csv" --db taxonomy.sqlite
+PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
+  --run-id 1 --out papers.csv --format csv --db taxonomy.sqlite
 ```
+Columns: `match_key, title, abstract, authors, doi, year, venue, wireless_label, wireless_confidence`.
 
-`enrich-abstracts` fills only papers missing an abstract by default (`--overwrite` to refetch every paper). It is offline-safe: a paper whose abstract can't be fetched is left unchanged.
+#### Gold-set evaluation (precision / recall / F1)
 
-#### Co-located workshops
-
-Per-venue DBLP TOCs are **main-track only**. Co-located workshops (e.g. SIGCOMM 2024's NAIC workshop, DOI prefix `10.1145/3672198`) have their own DBLP TOC keys, so if your manual sheet files workshop papers under the parent venue they show up as `missed_by_cli` even with `--all-papers`.
-
-To include them, ingest each workshop TOC into the **same `--venue`/`--year`** — repeated ingests reuse the one conference instance and accumulate papers, so a later `paper-set`/`jaccard` sees main-track + workshop papers together:
+An alternative scoring track using an imported gold sheet and candidate labels:
 
 ```bash
-# Main track
-curl "https://dblp.org/search/publ/api?q=toc:db/conf/sigcomm/sigcomm2024.bht:&h=1000&format=bib1" -o sigcomm2024.bib
-PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest --venue SIGCOMM --year 2024 --bibtex sigcomm2024.bib --db taxonomy.sqlite
-
-# Co-located workshop (same venue+year → same instance)
-curl "https://dblp.org/search/publ/api?q=toc:db/conf/sigcomm/naic2024.bht:&h=1000&format=bib1" -o naic2024.bib
-PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest --venue SIGCOMM --year 2024 --bibtex naic2024.bib --db taxonomy.sqlite
+PYTHONPATH=src python3 -m wireless_taxonomy.cli import-gold \
+  --path "List of Papers.csv" --db taxonomy.sqlite
+PYTHONPATH=src python3 -m wireless_taxonomy.cli classify-candidates --run-id 1 --db taxonomy.sqlite
+PYTHONPATH=src python3 -m wireless_taxonomy.cli eval-overlap --classifier keyword --db taxonomy.sqlite
 ```
 
-(Find a venue's workshop TOC keys on its DBLP venue page, e.g. `https://dblp.org/db/conf/sigcomm/`.)
+`eval-overlap` reports per-conference and overall `jaccard / precision / recall /
+f1` (`--pass low` counts `yes|maybe`; `--classifier llm` scores the LLM labels).
 
-#### Per-venue source policy
+### Full taxonomy pipeline
 
-Hybrid policy: use a conference/program **URL** where it's cleanly fetchable *and* carries abstracts; otherwise use **DBLP list + OpenAlex abstracts**. Either way the coverage layer (`paper-set`/`jaccard`/`jaccard-all`) is identical and venue-agnostic.
-
-| Venue | Recommended source | Abstracts | Notes |
-|---|---|---|---|
-| SIGCOMM | Program URL (`ingest --url`) | from page | Deterministic parser extracts title/authors/abstract; cleanly fetchable. |
-| USENIX / NSDI | Program URL (`ingest --url`) | from page | Same as SIGCOMM; open program pages. |
-| IMC | DBLP `--bibtex` + `enrich-abstracts` | OpenAlex | ACM-hosted; program HTML is anti-bot. |
-| ICC / GLOBECOM | DBLP `--bibtex` + `enrich-abstracts` | OpenAlex | IEEE Xplore is JS-rendered/blocked; DBLP TOCs are reliable. |
-| IEEE Trans. Wireless / Antennas & Propagation | DBLP `--bibtex` + `enrich-abstracts` | OpenAlex | Journals; DBLP per-volume TOC + OpenAlex by DOI. |
-
-**Abstract-only keyword wireless classification is over-inclusive on networking venues.** On SIGCOMM 2024 it flagged 47/63 papers as wireless vs the 9 in the curated set, so the Jaccard is dominated by false positives (`extra_from_cli`) — which is exactly the precision signal this comparison is meant to quantify.
-
-## One-Command Run
-
-The CLI has a convenience `run` command:
+The original end-to-end pipeline (text enrichment → analysis → dataset
+extraction → export) is still available. Run it in one shot:
 
 ```bash
 PYTHONPATH=src python3 -m wireless_taxonomy.cli run \
-  --venue SIGCOMM \
-  --year 2025 \
+  --venue SIGCOMM --year 2025 \
   --url https://conferences.sigcomm.org/sigcomm/2025/program/papers-info/ \
-  --out sigcomm-2025.xlsx \
-  --format xlsx \
-  --llm \
-  --db taxonomy.sqlite
+  --out workbook.xlsx --format xlsx --db taxonomy.sqlite
 ```
 
-Use `--yes` to proceed past scope warnings without an interactive prompt:
+Add `--llm` to use the configured LLM for paper analysis (see `llm-config`).
+The same stages can be run individually: `ingest`, `verify-paper-list`,
+`assess-scope`, `enrich-paper-text`, `discover-full-text`, `add-pdfs`,
+`fetch-acm-browser`, `assess-paper-inputs`, `agentic-paper-analysis`,
+`reflect-paper-analysis`, `extract-datasets`, `check-availability`,
+`resolve-reuse`, `export`.
+
+### Inspecting runs
 
 ```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli run \
-  --venue SIGCOMM \
-  --year 2025 \
-  --url https://conferences.sigcomm.org/sigcomm/2025/program/papers-info/ \
-  --out sigcomm-2025.csv \
-  --format csv \
-  --yes \
-  --db taxonomy.sqlite
+PYTHONPATH=src python3 -m wireless_taxonomy.cli status --db taxonomy.sqlite      # run history
+PYTHONPATH=src python3 -m wireless_taxonomy.cli review --db taxonomy.sqlite      # items flagged for review
+PYTHONPATH=src python3 -m wireless_taxonomy.cli llm-config --db taxonomy.sqlite  # configured LLM providers
 ```
 
-For debugging, prefer running individual stages. This makes it easier to inspect each artifact and rerun only the failing stage.
+### Command reference
 
-## Environment
+| Command | Purpose |
+| --- | --- |
+| `init` | Create/upgrade the SQLite database. |
+| `ingest` | Load a paper list from `--url`, `--bibtex`, or `--csv`. |
+| `run` | Full pipeline ingest → analysis → export. |
+| `enrich-abstracts` | Backfill abstracts from OpenAlex/Crossref/Semantic Scholar. |
+| `classify-wireless` | Keyword wireless classification (title + abstract). |
+| `classify-candidates` | Wireless-candidate labels (yes/no/maybe) for gold eval. |
+| `paper-set` | Export the conference-scoped fetched paper set. |
+| `jaccard` | IoU of automated vs manual list for one run. |
+| `jaccard-all` | IoU across every conference instance, with micro/macro roll-ups. |
+| `import-gold` | Import a manual gold sheet of wireless papers. |
+| `eval-overlap` | Precision/recall/F1/Jaccard vs the gold set. |
+| `verify-paper-list` | Quality-check an ingested list. |
+| `assess-scope` | Check a source is networking/wireless-relevant. |
+| `export` | Write the taxonomy workbook (csv/xlsx/json). |
+| `status` / `review` / `llm-config` | Inspect runs, review queue, LLM config. |
 
-Copy `.env.example` to `.env` and fill in the providers you want.
+Run any command with `--help` for its full flags.
 
-Important variables:
-
-```text
-WIRELESS_TAXONOMY_LLM_PROVIDER=openai
-WIRELESS_TAXONOMY_LLM_FALLBACKS=anthropic,google
-
-WIRELESS_TAXONOMY_ENABLE_WEB_SEARCH=1
-
-SEMANTIC_SCHOLAR_API_KEY=
-S2_API_KEY=
-WIRELESS_TAXONOMY_UNPAYWALL_EMAIL=
-UNPAYWALL_EMAIL=
-
-OPENAI_API_KEY=
-ANTHROPIC_API_KEY=
-GEMINI_API_KEY=
-GOOGLE_API_KEY=
-```
-
-Semantic Scholar's keyed API limit is currently treated conservatively:
-
-```text
-WIRELESS_TAXONOMY_SEMANTIC_SCHOLAR_MIN_INTERVAL_SECONDS=1.10
-WIRELESS_TAXONOMY_SEMANTIC_SCHOLAR_RETRIES=2
-```
-
-Unpaywall requires an email address, not an API key.
-
-Check the detected LLM configuration with:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli llm-config
-```
-
-## Full-Text Strategy
-
-Full text is required for high-quality taxonomy synthesis. The pipeline tries to maximize legal, programmatic retrieval before asking for manual input.
-
-Preferred order:
-
-1. source/proceedings links
-2. open-access resolvers
-3. Semantic Scholar title/author/DOI lookup
-4. Unpaywall DOI lookup
-5. arXiv/OpenReview title lookup
-6. bounded web search
-7. local PDF directory
-8. authenticated browser fallback for sources like ACM, only when the user has legitimate access
-
-The system records every candidate, artifact, snippet, and failure reason so missing full text is diagnosable instead of silent.
-
-## Review Philosophy
-
-The pipeline should not pretend uncertain claims are certain. When evidence is weak, missing, ambiguous, or contradicted, the item should be routed to review.
-
-Review rows are created for cases such as:
-
-- malformed or suspicious paper lists
-- missing important paper metadata
-- failed full-text retrieval despite PDF candidates
-- unmatched local PDFs
-- weak dataset claims
-- missing modality or OSI evidence
-- reflection-stage grounding failures
-- uncertain dataset availability
-
-## Refactor/Cleanup Completed
-
-Recent cleanup focused on reducing duplicated code while preserving behavior.
-
-Completed:
-
-- removed placeholder/dead modules
-- removed unused embedding and metadata-check config
-- added `.gitignore` entries for generated artifacts
-- added optional browser dependency group
-- split PDF text extraction into `analyze/pdf_text.py`
-- split title/DOI/author matching into `analyze/text_match.py`
-- split full-text resolvers into `analyze/full_text_resolvers.py`
-- reduced `analyze/full_text.py` from roughly 1061 lines to roughly 585 lines
-- centralized paper text persistence in `Pipeline._persist_paper_text_enrichment`
-- refactored `enrich_paper_text`, `discover_full_text`, `add_pdfs`, and `fetch_acm_browser` to share one persistence path
-
-Behavior was verified after cleanup with:
+### Tests
 
 ```bash
 PYTHONPATH=src python3 -m pytest -q
-python3 -m compileall -q src tests
-```
-
-## Current Known Gaps
-
-The project is functional but not final.
-
-Known remaining work:
-
-- split `tests/test_pipeline.py` by pipeline stage
-- continue reducing `pipeline.py` by moving stage-specific logic into smaller service modules
-- improve final CSV/XLSX schema fidelity against the manual Google Sheet
-- harden LLM JSON contracts and reflection prompts
-- add more regression fixtures for full-text retrieval and taxonomy synthesis
-- decide whether older deterministic dataset extraction remains as fallback or is replaced by the agentic path
-- add stronger guardrails around authenticated publisher fallbacks
-
-## Development Notes
-
-Run tests:
-
-```bash
-PYTHONPATH=src python3 -m pytest -q
-```
-
-Run compile check:
-
-```bash
-python3 -m compileall -q src tests
-```
-
-Inspect CLI:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli --help
-```
-
-Recommended debugging workflow:
-
-1. Run `ingest`.
-2. Run `verify-paper-list`.
-3. Run `assess-scope`.
-4. Run `enrich-paper-text`.
-5. Run `discover-full-text`.
-6. If needed, run `add-pdfs`.
-7. Run `assess-paper-inputs`.
-8. Run `agentic-paper-analysis` for one paper first.
-9. Run `reflect-paper-analysis`.
-10. Export JSON before CSV/XLSX for easier inspection.
-
-Example JSON export for debugging:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli export \
-  --run-id 1 \
-  --format json \
-  --scope related \
-  --out debug-run.json \
-  --db taxonomy.sqlite
 ```
