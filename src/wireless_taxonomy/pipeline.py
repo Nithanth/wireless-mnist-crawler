@@ -22,7 +22,14 @@ from wireless_taxonomy.evidence import EvidenceLogger
 from wireless_taxonomy.export.spreadsheet import SpreadsheetExporter
 from wireless_taxonomy.export.json_export import JsonExporter
 from wireless_taxonomy.export.paper_set import PaperSetExporter
-from wireless_taxonomy.evaluate.jaccard import JaccardReport, compute_paper_list_jaccard, write_jaccard_report
+from wireless_taxonomy.evaluate.jaccard import (
+    JaccardAggregate,
+    JaccardReport,
+    compute_paper_list_jaccard,
+    compute_paper_list_jaccard_all,
+    write_jaccard_aggregate,
+    write_jaccard_report,
+)
 from wireless_taxonomy.ingest.base import validate_paper_seeds
 from wireless_taxonomy.ingest.bibtex import BibtexIngestAdapter
 from wireless_taxonomy.ingest.csv import CsvIngestAdapter
@@ -1075,6 +1082,33 @@ class Pipeline:
         if out:
             write_jaccard_report(report, out)
         return report
+
+    def jaccard_all(
+        self,
+        manual_csv: str,
+        title_col: str | None = None,
+        authors_col: str | None = None,
+        conference_col: str | None = None,
+        year_col: str | None = None,
+        wireless_only: bool = True,
+        wireless_source: str = "classify",
+        fuzzy: bool = True,
+        out: str | None = None,
+    ) -> JaccardAggregate:
+        aggregate = compute_paper_list_jaccard_all(
+            self.conn,
+            manual_csv,
+            title_col=title_col,
+            authors_col=authors_col,
+            conference_col=conference_col,
+            year_col=year_col,
+            wireless_only=wireless_only,
+            wireless_source=wireless_source,
+            fuzzy=fuzzy,
+        )
+        if out:
+            write_jaccard_aggregate(aggregate, out)
+        return aggregate
 
     def status(self, run_id: int | None = None) -> list[sqlite3.Row]:
         if run_id is None:

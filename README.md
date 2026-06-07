@@ -473,6 +473,27 @@ Paper-list coverage (Jaccard/IoU). venue=SIGCOMM year=2024 wireless_only=True fu
 
 `--out` writes a diff report listing `matched`, `missed_by_cli` (curated wireless papers the pipeline didn't flag), `extra_from_cli` (pipeline-flagged papers absent from the manual list), and `fuzzy_matches` (each near-match with its `title_similarity`, `author_overlap`, and `shared_authors`) so coverage gaps — and any fuzzy matches you want to eyeball — are diagnosable, not just a single number.
 
+### Aggregate across every conference (`jaccard-all`)
+
+A single run is one `(venue, year)`. When the DB holds many conference instances (you ran `ingest` for each conference/year in your sheet), `jaccard-all` runs the comparison once per instance against the same master CSV — each instance self-filters the sheet to its own venue+year — and rolls the results up:
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli jaccard-all \
+  --manual "Wireless Taxonomy Record - List of Papers.csv" \
+  --out aggregate.json --db taxonomy.sqlite
+```
+
+```text
+NSDI 2024: index=0.8000 intersection=16 union=20 automated=18 manual=18 fuzzy_matches=3 missed_by_cli=2 extra_from_cli=2
+SIGCOMM 2025: index=0.7500 intersection=6 union=8 automated=7 manual=7 fuzzy_matches=1 missed_by_cli=1 extra_from_cli=1
+SKIPPED GLOBECOM 2023: No 'classify-wireless' run found for this conference. ...
+Aggregate coverage (Jaccard/IoU). conferences=2 skipped=1 micro=0.7857 macro=0.7750
+```
+
+- **micro** pools every paper (Σ intersection / Σ union) — larger conferences weigh more.
+- **macro** averages the per-conference indices — every conference counts equally.
+- Conferences missing a prerequisite (e.g. no `classify-wireless` run when `--wireless-only`) are **skipped**, not fatal, and listed with the reason. All the `jaccard` flags (`--all-papers`, `--exact`, `--wireless-source`, column overrides) apply.
+
 ## One-Command Run
 
 The CLI has a convenience `run` command:

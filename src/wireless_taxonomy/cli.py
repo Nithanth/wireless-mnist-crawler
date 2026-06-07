@@ -463,6 +463,60 @@ def jaccard(
         pipeline.close()
 
 
+@app.command("jaccard-all")
+def jaccard_all(
+    manual: str = typer.Option(..., "--manual", help="CSV of the manually curated (multi-conference) paper list."),
+    title_col: Optional[str] = typer.Option(None, "--title-col", help="Manual CSV title column. Auto-detected when omitted."),
+    authors_col: Optional[str] = typer.Option(None, "--authors-col", help="Manual CSV authors column. Auto-detected when omitted."),
+    conference_col: Optional[str] = typer.Option(None, "--conference-col", help="Manual CSV conference/venue column. Auto-detected when omitted."),
+    year_col: Optional[str] = typer.Option(None, "--year-col", help="Manual CSV year column. Auto-detected when omitted."),
+    wireless_only: bool = typer.Option(
+        True, "--wireless-only/--all-papers", help="Compare wireless-classified papers (default) vs the full ingested list."
+    ),
+    wireless_source: str = typer.Option(
+        "classify", "--wireless-source", help="Wireless decision source: classify (keyword) or agentic (analysis)."
+    ),
+    fuzzy: bool = typer.Option(
+        True, "--fuzzy/--exact", help="Match near-duplicate titles (difflib + author overlap) vs exact only."
+    ),
+    out: Optional[str] = typer.Option(None, "--out", help="Write the full aggregate report JSON to this path."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    """Jaccard across every conference instance in the DB, with micro/macro roll-ups."""
+    pipeline = _pipeline(db)
+    try:
+        aggregate = pipeline.jaccard_all(
+            manual,
+            title_col=title_col,
+            authors_col=authors_col,
+            conference_col=conference_col,
+            year_col=year_col,
+            wireless_only=wireless_only,
+            wireless_source=wireless_source,
+            fuzzy=fuzzy,
+            out=out,
+        )
+        for report in aggregate.reports:
+            typer.echo(
+                f"{report.venue} {report.year}: index={report.jaccard_index:.4f} "
+                f"intersection={report.intersection_count} union={report.union_count} "
+                f"automated={report.automated_count} manual={report.manual_count} "
+                f"fuzzy_matches={len(report.fuzzy_matches)} "
+                f"missed_by_cli={len(report.missed_by_cli)} extra_from_cli={len(report.extra_from_cli)}"
+            )
+        for entry in aggregate.skipped:
+            typer.echo(f"SKIPPED {entry['venue']} {entry['year']}: {entry['reason']}")
+        typer.echo(
+            "Aggregate coverage (Jaccard/IoU). "
+            f"conferences={len(aggregate.reports)} skipped={len(aggregate.skipped)} "
+            f"micro={aggregate.micro_index:.4f} macro={aggregate.macro_index:.4f}"
+        )
+        if out:
+            typer.echo(f"Wrote aggregate report: {out}")
+    finally:
+        pipeline.close()
+
+
 @app.command()
 def status(run_id: Optional[int] = typer.Option(None, "--run-id"), db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
     pipeline = _pipeline(db)

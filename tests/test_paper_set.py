@@ -185,6 +185,53 @@ def test_jaccard_fuzzy_matches_near_duplicate_with_author_boost(tmp_path: Path) 
     assert strict.extra_from_cli == ["Example Wireless Dataset Paper"]
 
 
+def _ingest_two_conferences(tmp_path: Path) -> tuple[Pipeline, int, int]:
+    pipeline = Pipeline(load_settings(tmp_path / "taxonomy.sqlite"))
+    sigcomm = pipeline.ingest("SIGCOMM", 2025, "url", str(FIXTURES / "sigcomm_2025_papers_info.html"))
+    nsdi_csv = tmp_path / "nsdi.csv"
+    _write_manual(
+        nsdi_csv,
+        [{"Paper Title": "Some Other Conference Paper", "Authors": "", "Conference": "NSDI", "Year": "2024"}],
+    )
+    nsdi = pipeline.ingest("NSDI", 2024, "csv", str(nsdi_csv))
+    return pipeline, sigcomm, nsdi
+
+
+def test_jaccard_all_aggregates_micro_macro(tmp_path: Path) -> None:
+    pipeline, _, _ = _ingest_two_conferences(tmp_path)
+    out = tmp_path / "aggregate.json"
+    try:
+        aggregate = pipeline.jaccard_all(str(MANUAL), wireless_only=False, out=str(out))
+    finally:
+        pipeline.close()
+
+    # Two conferences, sorted by venue name: NSDI 2024 then SIGCOMM 2025.
+    assert [(r.venue, r.year) for r in aggregate.reports] == [("NSDI", 2024), ("SIGCOMM", 2025)]
+    by_venue = {r.venue: r for r in aggregate.reports}
+    assert by_venue["NSDI"].jaccard_index == pytest.approx(1.0)  # 1 matched / 1 union
+    assert by_venue["SIGCOMM"].jaccard_index == pytest.approx(1 / 3)  # 1 matched / 3 union
+    # micro pools papers: (1+1) / (1+3); macro averages indices: (1.0 + 1/3) / 2
+    assert aggregate.micro_index == pytest.approx(0.5)
+    assert aggregate.macro_index == pytest.approx((1.0 + 1 / 3) / 2)
+
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["conferences"] == 2
+    assert payload["micro_jaccard_index"] == pytest.approx(0.5)
+
+
+def test_jaccard_all_skips_unclassified_conferences(tmp_path: Path) -> None:
+    pipeline, sigcomm, _ = _ingest_two_conferences(tmp_path)
+    try:
+        pipeline.classify_wireless(sigcomm)  # only SIGCOMM gets a wireless classification run
+        aggregate = pipeline.jaccard_all(str(MANUAL), wireless_only=True)
+    finally:
+        pipeline.close()
+
+    assert [r.venue for r in aggregate.reports] == ["SIGCOMM"]
+    assert [entry["venue"] for entry in aggregate.skipped] == ["NSDI"]
+    assert "classify-wireless" in aggregate.skipped[0]["reason"]
+
+
 def test_detect_title_column_errors_when_missing() -> None:
     with pytest.raises(ValueError):
         detect_title_column(["foo", "bar"])
