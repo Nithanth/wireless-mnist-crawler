@@ -19,6 +19,10 @@ compares on title + abstract. Data is persisted in SQLite.
 
 ## CLI usage
 
+The CLI is **three commands**: `classify` (the whole per-conference loop, with a
+pretty yes/maybe/no breakdown), `eval` (DB-free snapshot scoring against a gold
+sheet), and `llm-config` (which LLM providers are configured).
+
 ### Setup
 
 Requires Python ≥ 3.11. The tool is intentionally light — its only runtime
@@ -26,102 +30,86 @@ dependencies are `typer`/`click`.
 
 ```bash
 pip install -e .
-# optional: only needed to import a gold sheet saved as .xlsx (CSV needs nothing)
+# optional: only needed to read a gold sheet saved as .xlsx (CSV needs nothing)
 pip install -e ".[xlsx]"
 ```
 
-Every command runs through the Typer app. Use the installed entrypoint:
+Run via the installed entrypoint or the module directly (used below):
 
 ```bash
 wireless-taxonomy --help
-```
-
-or run the module directly (used in the examples below):
-
-```bash
 PYTHONPATH=src python3 -m wireless_taxonomy.cli --help
 ```
 
-All commands take `--db` (default `taxonomy.sqlite`). Initialize a database:
+### 1. `classify` — loop a conference and label every paper
+
+Pulls the accepted-paper list from DBLP, backfills missing DOIs + abstracts
+(OpenAlex/Crossref/Semantic Scholar, with a USENIX page-scrape fallback for
+NSDI/OSDI/ATC/Security), classifies each paper as wireless from title+abstract,
+and prints a **yes/maybe/no breakdown** (counts + % of the conference set). No
+gold sheet involved.
 
 ```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli init --db taxonomy.sqlite
+PYTHONPATH=src python3 -m wireless_taxonomy.cli classify \
+  --venue NSDI --years 2023:2025 --llm \
+  --csv nsdi.csv --json nsdi.json
 ```
 
-### Coverage evaluation (main workflow)
+`--years` takes a single year (`2024`) or an inclusive range (`2023:2025`); a
+range prints a per-year breakdown plus an aggregate. Example output:
 
-Goal: measure how well automated wireless detection matches a manually curated
-list for a conference. Pull the list from DBLP, backfill abstracts, classify,
-import the gold sheet, then score.
+```
+NSDI 2024 — 112 papers (abstracts: 112/112, 100%)
+  yes     19  ( 17.0%)
+  maybe    8  (  7.1%)
+  no      85  ( 75.9%)
+```
+
+- `--no-llm` uses the keyword baseline (no API key needed); `--llm` (default)
+  uses the configured provider.
+- `--csv` / `--json` export the **full** labelled set — every paper with its
+  `label`, `confidence`, and abstract flags, not just the wireless ones. This is
+  exactly what `eval` consumes.
+- `--source bibtex|csv|url --source-value <path-or-url>` swaps the paper-list
+  source away from DBLP; `--no-resolve-dois` skips the programmatic DOI backfill.
+
+### 2. `eval` — DB-free snapshot scoring vs a gold sheet
+
+Scoring is a pure, point-in-time computation, so it runs with **no DB and no
+network** — straight from files. Give it the full labelled CSV from `classify
+--csv` and a gold sheet; it matches **DOI → exact title → fuzzy title** per
+(venue, year) and reports `jaccard / precision / recall / f1`.
 
 ```bash
-# 1. Paper list straight from DBLP (title/authors/DOI; no abstracts)
-PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest \
-  --venue SIGCOMM --year 2024 --dblp --db taxonomy.sqlite
-# -> Ingest completed. run_id=1
-# (--bibtex file.bib / --csv file.csv / --url <program page> also work)
-
-# 2. Backfill abstracts from OpenAlex/Crossref/Semantic Scholar (by DOI, then
-#    title). Papers with no DOI (e.g. USENIX/NSDI) first get one resolved from
-#    their title via Crossref/OpenAlex; pass --no-resolve-dois to skip that.
-#    For USENIX venues (NSDI/OSDI/ATC/Security), which the JSON APIs cover
-#    poorly, the enricher falls back to scraping the abstract from the paper's
-#    USENIX page (DBLP links it), recovering coverage those APIs miss.
-PYTHONPATH=src python3 -m wireless_taxonomy.cli enrich-abstracts --run-id 1 --db taxonomy.sqlite
-
-# 3. Classify wireless candidates (title+abstract). Keyword needs no API key;
-#    add --llm to use the configured LLM (see llm-config).
-PYTHONPATH=src python3 -m wireless_taxonomy.cli classify-candidates --run-id 1 --db taxonomy.sqlite
-
-# 4. Import the curated gold sheet (once; loads every venue/year it contains)
-PYTHONPATH=src python3 -m wireless_taxonomy.cli import-gold \
-  --path "List of Papers.csv" --db taxonomy.sqlite
-
-# 5. Score the automated set vs the gold set
-PYTHONPATH=src python3 -m wireless_taxonomy.cli eval-overlap --classifier keyword --db taxonomy.sqlite
+PYTHONPATH=src python3 -m wireless_taxonomy.cli eval \
+  --classified nsdi.csv --gold "List of Papers.csv" \
+  --pass high --drop-workshops \
+  --out report.json --md report.md
 ```
 
-`eval-overlap` reports per-conference-year, per-venue, and overall
-`jaccard / precision / recall / f1` (`--pass low` counts `yes|maybe`;
-`--classifier llm` scores the LLM labels). Matching is **DOI → exact title →
-fuzzy title**. Two reporting flags:
+- `--pass high` scores `label == yes`; `--pass low` counts `yes|maybe`.
+- `--drop-workshops` drops curated papers **absent from the classified
+  universe** (co-located workshop papers not in the DBLP main proceedings) from
+  the calculation, so they don't count as misses. This works purely from files
+  because `classify --csv` writes the full proceedings universe. (Default is
+  `--keep-workshops`.)
+- Repeat `--classified` / `--gold` to union multiple files. Only conferences
+  present in the classified CSV(s) are scored — unrun venue-years in the sheet
+  are ignored, not penalised.
 
-- `--drop-workshops` — drop curated papers absent from the ingested main
-  proceedings (co-located workshop papers) from the calculation, so they don't
-  count as misses. They're still listed separately under "dropped workshop
-  papers". Default is `--keep-workshops`.
-- `--md results.md` — write a readable Markdown report (overall table, per
-  conference-year + per-venue tables, and per-conference discrepancy lists:
-  false positives, classifier misses, dropped/missing papers). Pair with
-  `--out results.json` for the machine-readable version.
+The same logic is importable:
+`from wireless_taxonomy.eval.standalone import eval_files`.
+
+### 3. `llm-config` — show configured LLM providers
 
 ```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli eval-overlap \
-  --classifier llm --pass high --drop-workshops \
-  --out results.json --md results.md --db taxonomy.sqlite
+PYTHONPATH=src python3 -m wireless_taxonomy.cli llm-config
 ```
-
-### Sheet-free classification loop (`classify-conference`)
-
-Classify a whole venue+year without a gold sheet — it ingests the accepted list
-from DBLP, backfills missing DOIs and abstracts, classifies each paper from
-title+abstract, and emits the wireless papers. This is the reusable unit the
-experiment harness drives:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli classify-conference \
-  --venue SIGCOMM --year 2024 --llm --pass high \
-  --out sigcomm2024.json --csv sigcomm2024.csv --db taxonomy.sqlite
-```
-
-`--no-llm` uses the keyword baseline; `--source bibtex|csv|url --source-value
-<path-or-url>` swaps the paper-list source away from DBLP; `--no-resolve-dois`
-skips the programmatic DOI backfill.
 
 ### Experiment harness (`scripts/evaluate_coverage.py`)
 
-Drives the CLI end to end across many conference-years and scores the result
-against your curated sheet. Runnable from the repo root:
+Drives the two commands end to end across many conference-years and scores the
+result against your curated sheet. Runnable from the repo root:
 
 ```bash
 python scripts/evaluate_coverage.py \
@@ -131,95 +119,21 @@ python scripts/evaluate_coverage.py \
 ```
 
 Drop in a sheet and the harness **auto-detects which conferences to evaluate**:
-with no `--venue-year`, it asks the CLI (`gold-venues`) which DBLP-ingestable
-venue-years the sheet(s) contain and loops over exactly those. Pass `--gold`
-more than once to union several sheets, or `--venue-year SIGCOMM:2024` to pin an
-explicit set. For each venue+year it runs `classify-conference`, then imports the
-gold sheet(s) once and runs `eval-overlap`, writing `build/results/report.md` +
-`report.json` plus a per-conference list.
-
-```bash
-# Just list the conferences a sheet contains (VENUE:YEAR per line)
-PYTHONPATH=src python3 -m wireless_taxonomy.cli gold-venues --path "List of Papers.csv"
-```
-
-### Decoupled snapshot eval (`eval-files`)
-
-The scoring is a pure, point-in-time computation, so it can run with **no DB and
-no network** — straight from two files. Give it a classified CSV (from
-`classify-conference --csv`) and a gold sheet; it matches DOI → exact title →
-fuzzy title per (venue, year) and emits the same metrics/report:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli eval-files \
-  --classified sigcomm2024.csv --gold "List of Papers.csv" \
-  --out report.json --md report.md
-```
-
-Repeat `--classified`/`--gold` to union multiple files. Only conferences present
-in the classified CSV(s) are scored (unrun venue-years in the sheet are ignored,
-not penalised). Workshop scoping (`--drop-workshops`) needs the ingested
-proceedings universe, so it's only on the DB-backed `eval-overlap`. The same
-logic is importable: `from wireless_taxonomy.eval.standalone import eval_files`.
-
-### Export the fetched paper set (`paper-set`)
-
-Export the conference-scoped set of fetched papers (e.g. to inspect or diff):
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli paper-set \
-  --run-id 1 --out papers.csv --format csv --db taxonomy.sqlite
-```
-
-Columns: `match_key, title, abstract, authors, doi, year, venue, wireless_label, wireless_confidence`.
-`--wireless-only` filters to papers classified wireless (run `classify-wireless`
-first for the keyword label).
-
-### Compare two automated sources (`diff-sets`)
-
-To gauge how reliable a source is, export a `paper-set` from each approach and
-diff them — e.g. a URL+LLM ingest vs the DBLP+OpenAlex ingest of the same
-conference. Export each to its own file, then:
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli diff-sets \
-  --a url_llm.csv --b dblp_openalex.csv \
-  --label-a "URL+LLM" --label-b "DBLP+OpenAlex" \
-  --reference b --out diff.json --csv diff.csv
-```
-
-It prints the **Jaccard (IoU)** of the two sets, the papers unique to each side,
-and **abstract coverage per side**. Matching is **DOI-first** → exact title →
-fuzzy (author-boosted); `--exact` disables fuzzy. Pass **`--reference a|b`** to
-treat that side as ground truth and also report **precision / recall / F1** —
-e.g. with `--reference b` and B=DBLP, recall = fraction of real papers the other
-source caught, precision = fraction of its papers that are real. No database
-needed — it reads the files.
-
-### Inspecting runs
-
-```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli status --db taxonomy.sqlite      # run history
-PYTHONPATH=src python3 -m wireless_taxonomy.cli llm-config --db taxonomy.sqlite  # configured LLM providers
-```
+with no `--venue-year`, it derives the DBLP-ingestable venue-years from the
+sheet(s) and loops over exactly those. Pass `--gold` more than once to union
+several sheets, or `--venue-year SIGCOMM:2024` to pin an explicit set. For each
+venue+year it runs `classify` (writing a full labelled CSV), then runs the
+single `eval` over all those CSVs, writing `build/results/report.md` +
+`report.json`. The CLI is the single source of truth; the script just
+orchestrates it.
 
 ### Command reference
 
 | Command | Purpose |
 | --- | --- |
-| `init` | Create/upgrade the SQLite database. |
-| `ingest` | Load a paper list from `--dblp`, `--url`, `--bibtex`, or `--csv`. |
-| `enrich-abstracts` | Backfill abstracts (and missing DOIs via Crossref/OpenAlex) from open APIs. |
-| `classify-wireless` | Keyword wireless classification (title + abstract). |
-| `classify-candidates` | Wireless-candidate labels (yes/no/maybe) for gold eval (`--llm` optional). |
-| `classify-conference` | Sheet-free loop: ingest+backfill+classify a venue/year, emit the wireless list. |
-| `import-gold` | Import a manual gold sheet (csv/xlsx) of wireless papers. |
-| `gold-venues` | List the distinct DBLP-ingestable VENUE:YEAR conferences in gold sheet(s). |
-| `eval-overlap` | Precision/recall/F1/Jaccard of the automated set vs the gold set (DB-backed; supports `--drop-workshops`). |
-| `eval-files` | DB-free snapshot eval: score a classified CSV vs a gold sheet, no DB/network. |
-| `paper-set` | Export the conference-scoped fetched paper set. |
-| `diff-sets` | Diff two paper-set exports (IoU + abstract coverage) to compare sources. |
-| `status` / `llm-config` | Inspect run history and configured LLM providers. |
+| `classify` | Loop a venue over a year (or `--years A:B` range): DBLP ingest → DOI/abstract backfill → classify; prints the yes/maybe/no breakdown and exports the full labelled set. |
+| `eval` | DB-free snapshot eval: score a classified CSV vs a gold sheet (DOI→title→fuzzy), with optional `--drop-workshops`. No DB/network. |
+| `llm-config` | Show which LLM providers are configured. |
 
 Run any command with `--help` for its full flags.
 

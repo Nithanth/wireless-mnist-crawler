@@ -11,14 +11,14 @@ conferences to evaluate:
 
 Pass `--gold` more than once to union several sheets, or `--venue-year` to pin an
 explicit set instead of auto-detecting. When `--venue-year` is omitted the
-harness asks the CLI (`gold-venues`) which DBLP-ingestable conferences the
-sheet(s) contain and loops over exactly those.
+harness derives the DBLP-ingestable conferences from the sheet(s) itself.
 
-For each venue+year it calls `classify-conference` (sheet-free: DBLP ingest ->
-DOI/abstract backfill -> classify), then imports the gold sheet(s) once and runs
-`eval-overlap` to score the automated set against the curated sheet. The CLI is
-the single source of truth; this script only orchestrates it and collects the
-reports, so the same commands can be reproduced by hand.
+For each venue+year it calls `classify` (sheet-free: DBLP ingest -> DOI/abstract
+backfill -> classify), which writes the **full** labelled CSV. It then runs the
+single, DB-free `eval` command over all those CSVs to score them against the
+curated sheet(s). The CLI is the single source of truth; this script only
+orchestrates it and collects the reports, so the same commands can be reproduced
+by hand.
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
+sys.path.insert(0, str(SRC_DIR))
 
 
 def _cli_env() -> dict[str, str]:
@@ -45,21 +46,22 @@ def run_cli(args: list[str]) -> None:
     subprocess.run(cmd, check=True, env=_cli_env(), cwd=REPO_ROOT)
 
 
-def run_cli_capture(args: list[str]) -> str:
-    cmd = [sys.executable, "-m", "wireless_taxonomy.cli", *args]
-    proc = subprocess.run(cmd, check=True, env=_cli_env(), cwd=REPO_ROOT, capture_output=True, text=True)
-    if proc.stderr.strip():
-        print(proc.stderr.strip(), file=sys.stderr)
-    return proc.stdout
-
-
 def venue_years_from_gold(gold_paths: list[str]) -> list[tuple[str, int]]:
-    """Ask the CLI which conferences the gold sheet(s) contain (DBLP-ingestable)."""
-    args = ["gold-venues"]
-    for path in gold_paths:
-        args += ["--path", path]
-    out = run_cli_capture(args)
-    return [parse_venue_year(line.strip()) for line in out.splitlines() if line.strip()]
+    """Derive the DBLP-ingestable conferences the gold sheet(s) contain."""
+    from wireless_taxonomy.ingest.dblp import resolve_stream
+    from wireless_taxonomy.ingest.gold import distinct_venue_years
+
+    pairs = distinct_venue_years(gold_paths)
+    ingestable: list[tuple[str, int]] = []
+    skipped: list[str] = []
+    for venue, year in pairs:
+        if resolve_stream(venue) is None:
+            skipped.append(f"{venue}:{year}")
+            continue
+        ingestable.append((venue, year))
+    if skipped:
+        print("skipped (no DBLP stream mapping): " + ", ".join(skipped), file=sys.stderr)
+    return ingestable
 
 
 def parse_venue_year(value: str) -> tuple[str, int]:
@@ -95,9 +97,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--fuzzy-threshold", type=float, default=0.92)
     parser.add_argument("--drop-workshops", action="store_true", help="Drop curated papers absent from main proceedings.")
     parser.add_argument("--no-resolve-dois", action="store_true", help="Skip programmatic DOI backfill.")
-    parser.add_argument("--db", default="build/eval.sqlite", help="SQLite DB path (shared across all conferences).")
+    parser.add_argument("--db", default="build/eval.sqlite", help="SQLite work DB (shared across all conferences).")
     parser.add_argument("--out-dir", default="build/results", help="Directory for per-conference lists and the report.")
-    parser.add_argument("--source", default="dblp", help="Paper-list source for classify-conference.")
+    parser.add_argument("--source", default="dblp", help="Paper-list source for classify.")
     args = parser.parse_args(argv)
 
     venue_years = args.venue_years or venue_years_from_gold(args.gold)
@@ -116,38 +118,33 @@ def main(argv: list[str] | None = None) -> int:
     use_llm_flag = "--llm" if args.classifier == "llm" else "--no-llm"
     resolve_flag = "--no-resolve-dois" if args.no_resolve_dois else "--resolve-dois"
 
-    # 1) Sheet-free classify loop, one conference at a time, into a shared DB.
+    # 1) Sheet-free classify loop -> one full labelled CSV per conference-year.
+    classified_csvs: list[Path] = []
     for venue, year in venue_years:
         slug = f"{venue.replace(' ', '_')}_{year}"
+        csv_path = out_dir / f"{slug}.csv"
         run_cli(
             [
-                "classify-conference",
+                "classify",
                 "--venue", venue,
-                "--year", str(year),
+                "--years", str(year),
                 use_llm_flag,
                 resolve_flag,
-                "--pass", args.pass_mode,
                 "--source", args.source,
                 "--db", str(db_path),
-                "--out", str(out_dir / f"{slug}.json"),
-                "--csv", str(out_dir / f"{slug}.csv"),
+                "--json", str(out_dir / f"{slug}.json"),
+                "--csv", str(csv_path),
             ]
         )
+        classified_csvs.append(csv_path)
 
-    # 2) Import the curated sheet(s) once (matched per venue/year inside the DB).
+    # 2) DB-free snapshot eval: score the full labelled CSVs against the sheet(s).
+    eval_args = ["eval", "--pass", args.pass_mode, "--fuzzy-threshold", str(args.fuzzy_threshold)]
+    for csv_path in classified_csvs:
+        eval_args += ["--classified", str(csv_path)]
     for gold_path in args.gold:
-        run_cli(["import-gold", "--path", gold_path, "--db", str(db_path)])
-
-    # 3) Score the automated set against the curated sheet.
-    eval_args = [
-        "eval-overlap",
-        "--classifier", args.classifier,
-        "--pass", args.pass_mode,
-        "--fuzzy-threshold", str(args.fuzzy_threshold),
-        "--db", str(db_path),
-        "--out", str(out_dir / "report.json"),
-        "--md", str(out_dir / "report.md"),
-    ]
+        eval_args += ["--gold", gold_path]
+    eval_args += ["--out", str(out_dir / "report.json"), "--md", str(out_dir / "report.md")]
     eval_args.append("--drop-workshops" if args.drop_workshops else "--keep-workshops")
     run_cli(eval_args)
 

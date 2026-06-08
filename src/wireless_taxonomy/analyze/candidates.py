@@ -4,11 +4,16 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from wireless_taxonomy.analyze.wireless import WirelessClassifier
 from wireless_taxonomy.config import LlmSettings
 from wireless_taxonomy.llm import LlmRequest, LlmRouter
 
 Label = Literal["yes", "no", "maybe"]
+
+WIRELESS_TERMS = {
+    "5g", "6g", "lte", "wi-fi", "wifi", "802.11", "mmwave", "rf", "mimo",
+    "antenna", "spectrum", "cellular", "base station", "ran", "csi", "rssi",
+    "sinr", "rsrp", "rsrq", "beamforming", "backscatter", "lorawan", "bluetooth",
+}
 
 
 @dataclass(frozen=True)
@@ -38,23 +43,29 @@ class KeywordCandidateClassifier:
     """Deterministic baseline over title + abstract using keyword rules."""
 
     classifier = "keyword"
-
-    def __init__(self) -> None:
-        self._inner = WirelessClassifier()
-        self.model_version = self._inner.model_version
+    model_version = "keyword-rules-v0"
 
     def classify(self, paper: dict[str, Any]) -> CandidatePrediction:
         paper_id = int(paper["id"])
         title = str(paper.get("title") or "")
         abstract = paper.get("abstract")
-        result = self._inner.classify(paper_id, title, abstract)
+        text = f"{title} {abstract or ''}".lower()
+        matched = sorted(term for term in WIRELESS_TERMS if term in text)
+        if matched:
+            label: Label = "yes"
+            confidence = 0.91
+            evidence = f"Matched wireless terms: {', '.join(matched)}"
+        else:
+            label = "maybe"
+            confidence = 0.50
+            evidence = "No strong wireless terms in keyword classifier"
         return CandidatePrediction(
             paper_id=paper_id,
             classifier=self.classifier,
             model_version=self.model_version,
-            label=result.label,
-            confidence=result.confidence,
-            evidence=result.evidence,
+            label=label,
+            confidence=confidence,
+            evidence=evidence,
             used_abstract=bool(abstract and str(abstract).strip()),
         )
 

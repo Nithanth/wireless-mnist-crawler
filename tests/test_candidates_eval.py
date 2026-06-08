@@ -129,7 +129,32 @@ def test_gold_reader_uses_defaults_when_columns_missing(tmp_path: Path) -> None:
     assert records[0].venue == "MobiCom" and records[0].year == 2024
 
 
-def test_end_to_end_keyword_candidates_and_jaccard(tmp_path: Path) -> None:
+class _NoEnricher:
+    def fetch(self, title, doi=None, source_url=None):  # noqa: ARG002
+        return None
+
+
+class _NoResolver:
+    def resolve(self, title):  # noqa: ARG002
+        return None
+
+
+def _write_classified_csv(result: dict, path: Path) -> None:
+    import csv as _csv
+
+    fields = ["title", "authors", "doi", "venue", "year", "label", "confidence", "used_abstract", "has_abstract"]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(result["papers"])
+
+
+def test_end_to_end_classify_full_set_and_file_eval(tmp_path: Path, monkeypatch) -> None:
+    # Keep the pipeline offline: the fixture already carries abstracts + DOIs,
+    # but stub the network enricher/resolver so nothing reaches out.
+    monkeypatch.setattr("wireless_taxonomy.analyze.abstracts.AbstractEnricher", lambda: _NoEnricher())
+    monkeypatch.setattr("wireless_taxonomy.analyze.abstracts.DoiResolver", lambda: _NoResolver())
+
     db = tmp_path / "taxonomy.sqlite"
     gold = tmp_path / "gold.csv"
     gold.write_text(
@@ -138,24 +163,58 @@ def test_end_to_end_keyword_candidates_and_jaccard(tmp_path: Path) -> None:
         "Some Paper Not In Conference,SIGCOMM,2025\n",
         encoding="utf-8",
     )
+
     pipeline = Pipeline(load_settings(db))
     try:
-        run_id = pipeline.ingest("SIGCOMM", 2025, "url", str(FIXTURES / "sigcomm_2025_papers_info.html"))
-        pipeline.classify_candidates(run_id, use_llm=False)
-        pipeline.import_gold(str(gold))
-
-        high = pipeline.evaluate_overlap(classifier="keyword", pass_mode="high")
-        low = pipeline.evaluate_overlap(classifier="keyword", pass_mode="low")
+        result = pipeline.classify_conference(
+            "SIGCOMM", 2025, use_llm=False, source_type="url",
+            source_value=str(FIXTURES / "sigcomm_2025_papers_info.html"),
+        )
     finally:
         pipeline.close()
 
-    high_instance = high["instances"][0]
-    assert high_instance["tp"] == 1 and high_instance["fp"] == 0 and high_instance["fn"] == 1
-    assert high_instance["jaccard"] == 0.5
-    # The missing gold paper is not in the ingested universe -> coverage gap, not a miss.
-    assert high_instance["fn_missing_from_universe"] == 1 and high_instance["fn_missed"] == 0
+    # classify_conference returns the FULL labelled set (every paper), not just wireless.
+    assert result["total_papers"] == 2
+    assert result["counts"]["yes"] == 1  # the RF/SINR paper
+    assert result["counts"]["maybe"] == 1  # the wired datacenter paper
+    assert result["counts"]["no"] == 0
 
-    low_instance = low["instances"][0]
+    classified = tmp_path / "classified.csv"
+    _write_classified_csv(result, classified)
+
+    from wireless_taxonomy.eval.standalone import eval_files
+
+    # High pass (yes only): TP=1 (wireless paper), FP=0, FN=1 (the off-proceedings gold paper).
+    high = eval_files([str(classified)], [str(gold)], pass_mode="high")
+    hi = high["instances"][0]
+    assert hi["tp"] == 1 and hi["fp"] == 0 and hi["fn"] == 1
+    assert hi["jaccard"] == 0.5
+    # The missing gold paper is absent from the classified universe -> coverage gap.
+    assert hi["fn_missing_from_universe"] == 1 and hi["fn_missed"] == 0
+
+    # Dropping workshops removes that off-proceedings gold paper from the denominator.
+    high_drop = eval_files([str(classified)], [str(gold)], pass_mode="high", drop_workshops=True)
+    assert high_drop["overall"]["fn"] == 0 and high_drop["overall"]["jaccard"] == 1.0
+
     # Low pass also flags the "maybe" datacenter paper -> one false positive.
-    assert low_instance["tp"] == 1 and low_instance["fp"] == 1 and low_instance["fn"] == 1
-    assert low_instance["jaccard"] == round(1 / 3, 4)
+    low = eval_files([str(classified)], [str(gold)], pass_mode="low")
+    lo = low["instances"][0]
+    assert lo["tp"] == 1 and lo["fp"] == 1 and lo["fn"] == 1
+    assert lo["jaccard"] == round(1 / 3, 4)
+
+
+def test_eval_drop_workshops_requires_label_column(tmp_path: Path) -> None:
+    from wireless_taxonomy.eval.standalone import eval_files
+
+    classified = tmp_path / "classified.csv"
+    classified.write_text("title,venue,year\nA Wireless Paper,SIGCOMM,2025\n", encoding="utf-8")
+    gold = tmp_path / "gold.csv"
+    gold.write_text("title,conference,year\nA Wireless Paper,SIGCOMM,2025\n", encoding="utf-8")
+
+    # No label column -> no universe -> drop_workshops can't be honoured.
+    with pytest.raises(ValueError):
+        eval_files([str(classified)], [str(gold)], drop_workshops=True)
+
+    # Without dropping, a label-less CSV still scores (every row is a predicted positive).
+    report = eval_files([str(classified)], [str(gold)])
+    assert report["overall"]["tp"] == 1
