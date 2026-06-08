@@ -95,9 +95,10 @@ def ingest(
     url: Optional[str] = typer.Option(None, "--url"),
     bibtex: Optional[str] = typer.Option(None, "--bibtex"),
     csv_path: Optional[str] = typer.Option(None, "--csv"),
+    dblp: bool = typer.Option(False, "--dblp", help="Fetch the main-track paper list from DBLP for --venue/--year."),
     db: str = typer.Option("taxonomy.sqlite", "--db"),
 ) -> None:
-    source_type, source_value = _source(url, bibtex, csv_path)
+    source_type, source_value = _source(url, bibtex, csv_path, dblp)
     pipeline = _pipeline(db)
     try:
         run_id = pipeline.ingest(venue, year, source_type, source_value)
@@ -122,11 +123,16 @@ def classify_wireless(run_id: int = typer.Option(..., "--run-id"), db: str = typ
 def enrich_abstracts(
     run_id: int = typer.Option(..., "--run-id"),
     overwrite: bool = typer.Option(False, "--overwrite/--missing-only", help="Refetch even papers that already have an abstract."),
+    resolve_dois: bool = typer.Option(
+        True,
+        "--resolve-dois/--no-resolve-dois",
+        help="Backfill missing DOIs from title via Crossref/OpenAlex before fetching abstracts.",
+    ),
     db: str = typer.Option("taxonomy.sqlite", "--db"),
 ) -> None:
     pipeline = _pipeline(db)
     try:
-        stage_run = pipeline.enrich_abstracts(run_id, overwrite=overwrite)
+        stage_run = pipeline.enrich_abstracts(run_id, overwrite=overwrite, resolve_dois=resolve_dois)
         typer.echo(f"Abstract enrichment completed. run_id={stage_run}")
     finally:
         pipeline.close()
@@ -144,6 +150,65 @@ def classify_candidates(
         typer.echo(f"Candidate classification completed. run_id={stage_run}")
     finally:
         pipeline.close()
+
+
+@app.command("classify-conference")
+def classify_conference(
+    venue: str = typer.Option(..., "--venue"),
+    year: int = typer.Option(..., "--year"),
+    llm: bool = typer.Option(True, "--llm/--no-llm", help="Use the LLM classifier (default) or the keyword baseline."),
+    pass_mode: str = typer.Option("high", "--pass", help="high = 'yes' only; low = 'yes'|'maybe'."),
+    resolve_dois: bool = typer.Option(True, "--resolve-dois/--no-resolve-dois", help="Backfill missing DOIs before classifying."),
+    source: str = typer.Option("dblp", "--source", help="Paper-list source: dblp (default), bibtex, csv, or url."),
+    source_value: Optional[str] = typer.Option(None, "--source-value", help="Path or URL when --source is not dblp."),
+    out: Optional[str] = typer.Option(None, "--out", help="Write the classified list as JSON here."),
+    csv_out: Optional[str] = typer.Option(None, "--csv", help="Write the classified list as CSV here."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    """Sheet-free: loop a venue+year through ingest -> DOI/abstract backfill -> classify, and emit the wireless list."""
+    if source != "dblp" and not source_value:
+        raise typer.BadParameter("--source-value is required when --source is not 'dblp'.")
+    pipeline = _pipeline(db)
+    try:
+        result = pipeline.classify_conference(
+            venue,
+            year,
+            use_llm=llm,
+            pass_mode=pass_mode,
+            resolve_dois=resolve_dois,
+            source_type=source,
+            source_value=source_value,
+        )
+    finally:
+        pipeline.close()
+
+    if out:
+        out_path = Path(out)
+        if out_path.suffix.lower() != ".json":
+            out_path = out_path.with_suffix(".json")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    if csv_out:
+        import csv as _csv
+
+        csv_path = Path(csv_out)
+        if csv_path.suffix.lower() != ".csv":
+            csv_path = csv_path.with_suffix(".csv")
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        fields = ["title", "authors", "doi", "venue", "year", "wireless_label", "confidence", "used_abstract", "has_abstract"]
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(result["papers"])
+
+    typer.echo(
+        f"{result['venue']} {result['year']}: {result['wireless_count']} wireless / "
+        f"{result['total_papers']} papers ({result['papers_with_abstract']} with abstracts) "
+        f"via {result['classifier']} classifier (--pass {result['pass_mode']})."
+    )
+    for paper in result["papers"]:
+        conf = paper["confidence"]
+        typer.echo(f"  [{conf}] {paper['title']}")
 
 
 @app.command("import-gold")
@@ -348,10 +413,12 @@ def llm_config(db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
         typer.echo(f"- {provider.provider}: model={provider.model}, key={key_status}")
 
 
-def _source(url: str | None, bibtex: str | None, csv_path: str | None) -> tuple[str, str]:
+def _source(url: str | None, bibtex: str | None, csv_path: str | None, dblp: bool = False) -> tuple[str, str]:
     provided = [(name, value) for name, value in [("url", url), ("bibtex", bibtex), ("csv", csv_path)] if value]
+    if dblp:
+        provided.append(("dblp", ""))
     if len(provided) != 1:
-        raise typer.BadParameter("Provide exactly one of --url, --bibtex, or --csv.")
+        raise typer.BadParameter("Provide exactly one of --dblp, --url, --bibtex, or --csv.")
     return provided[0][0], provided[0][1] or ""
 
 

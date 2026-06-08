@@ -23,6 +23,13 @@ class AbstractResult:
     source_url: str
 
 
+@dataclass(frozen=True)
+class DoiResult:
+    doi: str
+    provider: str
+    source_url: str
+
+
 class AbstractEnricher:
     """Fetches paper abstracts from open metadata APIs (no ACM full text).
 
@@ -104,6 +111,78 @@ class AbstractEnricher:
             return url
         sep = "&" if "?" in url else "?"
         return f"{url}{sep}mailto={quote(self._mailto)}"
+
+
+class DoiResolver:
+    """Resolves a DOI for a paper from its title via open metadata APIs.
+
+    Used to backfill DOIs for papers whose source list carries none (notably
+    USENIX/NSDI, which DBLP indexes without DOIs). Crossref's bibliographic
+    query is the primary source; OpenAlex is the fallback. The candidate title
+    must match the query title (guards against the API returning a near-miss).
+    """
+
+    def __init__(self, fetch_json: FetchJson | None = None, providers: list[str] | None = None) -> None:
+        self.fetch_json = fetch_json or _default_fetch_json
+        self.providers = providers or ["crossref", "openalex"]
+        self._mailto = (os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip()
+
+    def resolve(self, title: str | None) -> DoiResult | None:
+        if not title or not title.strip():
+            return None
+        for provider in self.providers:
+            handler = getattr(self, f"_{provider}", None)
+            if handler is None:
+                continue
+            try:
+                result = handler(title)
+            except Exception:
+                result = None
+            if result is not None:
+                return result
+        return None
+
+    def _crossref(self, title: str) -> DoiResult | None:
+        source_url = "https://api.crossref.org/works?" + urlencode(
+            {"query.bibliographic": title, "rows": "1", "select": "DOI,title"}
+        )
+        payload = self.fetch_json(self._with_mailto(source_url))
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        items = message.get("items") if isinstance(message.get("items"), list) else []
+        first = items[0] if items and isinstance(items[0], dict) else {}
+        candidate_titles = first.get("title") if isinstance(first.get("title"), list) else []
+        candidate_title = _str(candidate_titles[0]) if candidate_titles else ""
+        doi = _str(first.get("DOI"))
+        if doi and candidate_title and title_matches(title, candidate_title):
+            return DoiResult(doi.lower(), "crossref", source_url)
+        return None
+
+    def _openalex(self, title: str) -> DoiResult | None:
+        source_url = "https://api.openalex.org/works?" + urlencode(
+            {"search": title, "per-page": "1", "select": "doi,title"}
+        )
+        payload = self.fetch_json(self._with_mailto(source_url))
+        results = payload.get("results") if isinstance(payload.get("results"), list) else []
+        first = results[0] if results and isinstance(results[0], dict) else {}
+        candidate_title = _str(first.get("title"))
+        doi = _normalize_doi_url(_str(first.get("doi")))
+        if doi and candidate_title and title_matches(title, candidate_title):
+            return DoiResult(doi.lower(), "openalex", source_url)
+        return None
+
+    def _with_mailto(self, url: str) -> str:
+        if not self._mailto:
+            return url
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}mailto={quote(self._mailto)}"
+
+
+def _normalize_doi_url(value: str) -> str:
+    text = (value or "").strip()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        if text.lower().startswith(prefix):
+            return text[len(prefix):]
+    return text
 
 
 def _openalex_abstract(payload: dict[str, Any]) -> str:

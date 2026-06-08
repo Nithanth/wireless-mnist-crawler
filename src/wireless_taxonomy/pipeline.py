@@ -13,6 +13,7 @@ from wireless_taxonomy.export.paper_set import PaperSetExporter
 from wireless_taxonomy.ingest.base import validate_paper_seeds
 from wireless_taxonomy.ingest.bibtex import BibtexIngestAdapter
 from wireless_taxonomy.ingest.csv import CsvIngestAdapter
+from wireless_taxonomy.ingest.dblp import DblpIngestAdapter
 from wireless_taxonomy.ingest.gold import GoldSheetReader
 from wireless_taxonomy.ingest.url import UrlIngestAdapter
 from wireless_taxonomy.models import EvidenceClaim, PaperSeed, new_id, utc_now
@@ -101,31 +102,63 @@ class Pipeline:
         logger.event("classify_wireless_completed", {"paper_count": len(rows), "review_count": review_count})
         return stage_run_id
 
-    def enrich_abstracts(self, run_id: int, overwrite: bool = False, enricher=None) -> int:
-        """Backfill missing paper abstracts from open metadata APIs.
+    def enrich_abstracts(
+        self,
+        run_id: int,
+        overwrite: bool = False,
+        enricher=None,
+        resolve_dois: bool = True,
+        doi_resolver=None,
+    ) -> int:
+        """Backfill missing paper abstracts (and optionally DOIs) from open APIs.
 
         Pulls abstracts from OpenAlex/Crossref/Semantic Scholar (metadata, not
-        the paywalled PDF), so it sidesteps the ACM full-text block.
+        the paywalled PDF), so it sidesteps the ACM full-text block. When
+        ``resolve_dois`` is set, papers with no DOI (e.g. USENIX/NSDI, which DBLP
+        indexes without DOIs) first get one resolved from their title via
+        Crossref/OpenAlex; the recovered DOI then drives a more reliable
+        abstract lookup and makes downstream gold matching exact.
         """
-        from wireless_taxonomy.analyze.abstracts import AbstractEnricher
+        from wireless_taxonomy.analyze.abstracts import AbstractEnricher, DoiResolver
 
         source_run = self._require_run(run_id)
         conference_instance_id = source_run["conference_instance_id"]
         stage_run_id = self._create_run(conference_instance_id, "enrich-abstracts", "run", str(run_id))
         logger = EvidenceLogger(self.settings.evidence_dir, stage_run_id)
         enricher = enricher or AbstractEnricher()
+        if resolve_dois:
+            doi_resolver = doi_resolver or DoiResolver()
         rows = self.conn.execute(
             "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
         ).fetchall()
         filled = 0
         attempted = 0
+        dois_resolved = 0
         with transaction(self.conn):
             for paper in rows:
+                doi = (paper["doi"] or "").strip()
+                if resolve_dois and not doi and (paper["title"] or "").strip():
+                    doi_result = doi_resolver.resolve(paper["title"])
+                    if doi_result is not None:
+                        doi = doi_result.doi
+                        self.conn.execute("UPDATE papers SET doi = ? WHERE id = ?", (doi, paper["id"]))
+                        self._insert_evidence(
+                            stage_run_id,
+                            paper["id"],
+                            None,
+                            "doi_backfill",
+                            doi_result.provider,
+                            doi,
+                            doi_result.source_url,
+                            0.8,
+                            {"provider": doi_result.provider},
+                        )
+                        dois_resolved += 1
                 existing = (paper["abstract"] or "").strip()
                 if existing and not overwrite:
                     continue
                 attempted += 1
-                result = enricher.fetch(paper["title"], paper["doi"])
+                result = enricher.fetch(paper["title"], doi or None)
                 if result is None:
                     continue
                 self.conn.execute("UPDATE papers SET abstract = ? WHERE id = ?", (result.abstract, paper["id"]))
@@ -143,11 +176,18 @@ class Pipeline:
                 filled += 1
             self._complete_run(
                 stage_run_id,
-                f"Filled {filled}/{attempted} missing abstracts ({len(rows)} papers total).",
+                f"Filled {filled}/{attempted} missing abstracts, resolved {dois_resolved} DOIs "
+                f"({len(rows)} papers total).",
             )
         logger.event(
             "enrich_abstracts_completed",
-            {"papers": len(rows), "attempted": attempted, "filled": filled, "overwrite": overwrite},
+            {
+                "papers": len(rows),
+                "attempted": attempted,
+                "filled": filled,
+                "dois_resolved": dois_resolved,
+                "overwrite": overwrite,
+            },
         )
         return stage_run_id
 
@@ -200,6 +240,85 @@ class Pipeline:
             {"classifier": classifier.classifier, "paper_count": len(rows), "labels": counts},
         )
         return stage_run_id
+
+    def classify_conference(
+        self,
+        venue: str,
+        year: int,
+        use_llm: bool = True,
+        pass_mode: str = "high",
+        resolve_dois: bool = True,
+        source_type: str = "dblp",
+        source_value: str | None = None,
+    ) -> dict:
+        """Sheet-free classification loop for a single venue/year.
+
+        Ingests the accepted-paper list (DBLP by default), backfills missing DOIs
+        and abstracts from open APIs, classifies each paper as wireless from
+        title+abstract, and returns the wireless-flagged papers. No gold sheet is
+        involved, so this is the reusable unit the experiment harness can call
+        per conference-year.
+        """
+        if pass_mode not in {"high", "low"}:
+            raise ValueError("pass_mode must be 'high' or 'low'")
+        ingest_run = self.ingest(venue, year, source_type, source_value or "")
+        self.enrich_abstracts(ingest_run, resolve_dois=resolve_dois)
+        classify_run = self.classify_candidates(ingest_run, use_llm=use_llm)
+        classifier = "llm" if use_llm else "keyword"
+        flag_column = "high_pass" if pass_mode == "high" else "low_pass"
+        conference_instance_id = self._require_run(ingest_run)["conference_instance_id"]
+        rows = self.conn.execute(
+            f"""
+            SELECT p.title, p.authors, p.doi, p.abstract, ci.year, v.name AS venue,
+                   wcp.label, wcp.confidence, wcp.used_abstract
+            FROM papers p
+            JOIN conference_instances ci ON ci.id = p.conference_instance_id
+            JOIN venues v ON v.id = ci.venue_id
+            JOIN wireless_candidate_predictions wcp ON wcp.paper_id = p.id
+            WHERE p.conference_instance_id = ? AND wcp.run_id = ? AND wcp.{flag_column} = 1
+            ORDER BY wcp.confidence DESC, p.title
+            """,
+            (conference_instance_id, classify_run),
+        ).fetchall()
+        papers = [
+            {
+                "title": row["title"],
+                "authors": row["authors"] or "",
+                "doi": row["doi"] or "",
+                "venue": row["venue"],
+                "year": row["year"],
+                "wireless_label": row["label"],
+                "confidence": round(float(row["confidence"]), 4) if row["confidence"] is not None else "",
+                "used_abstract": bool(row["used_abstract"]),
+                "has_abstract": bool((row["abstract"] or "").strip()),
+            }
+            for row in rows
+        ]
+        total = int(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM papers WHERE conference_instance_id = ?",
+                (conference_instance_id,),
+            ).fetchone()["n"]
+        )
+        with_abstract = int(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM papers WHERE conference_instance_id = ? "
+                "AND abstract IS NOT NULL AND TRIM(abstract) <> ''",
+                (conference_instance_id,),
+            ).fetchone()["n"]
+        )
+        return {
+            "venue": venue,
+            "year": year,
+            "classifier": classifier,
+            "pass_mode": pass_mode,
+            "total_papers": total,
+            "papers_with_abstract": with_abstract,
+            "wireless_count": len(papers),
+            "ingest_run_id": ingest_run,
+            "classify_run_id": classify_run,
+            "papers": papers,
+        }
 
     def import_gold(
         self,
@@ -385,7 +504,9 @@ class Pipeline:
             return BibtexIngestAdapter(venue, year, source_value)
         if source_type == "csv":
             return CsvIngestAdapter(venue, year, source_value)
-        raise ValueError("source_type must be url, bibtex, or csv")
+        if source_type == "dblp":
+            return DblpIngestAdapter(venue, year)
+        raise ValueError("source_type must be url, bibtex, csv, or dblp")
 
     def _conference_instance_id(self, venue: str, year: int, source_url: str | None = None) -> int:
         with transaction(self.conn):

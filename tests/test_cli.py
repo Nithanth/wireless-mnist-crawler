@@ -20,6 +20,7 @@ def test_cli_help_renders_without_typer_click_compat_error() -> None:
     assert "ingest" in result.stdout
     assert "enrich-abstracts" in result.stdout
     assert "classify-candidates" in result.stdout
+    assert "classify-conference" in result.stdout
     assert "import-gold" in result.stdout
     assert "eval-overlap" in result.stdout
     assert "paper-set" in result.stdout
