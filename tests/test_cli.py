@@ -24,6 +24,7 @@ def test_cli_help_renders_without_typer_click_compat_error() -> None:
     assert "import-gold" in result.stdout
     assert "gold-venues" in result.stdout
     assert "eval-overlap" in result.stdout
+    assert "eval-files" in result.stdout
     assert "paper-set" in result.stdout
     assert "diff-sets" in result.stdout
     # Half B commands were removed in the slim-down.

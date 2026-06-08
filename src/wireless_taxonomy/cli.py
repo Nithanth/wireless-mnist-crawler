@@ -263,6 +263,42 @@ def gold_venues(
         )
 
 
+@app.command("eval-files")
+def eval_files_cmd(
+    classified: List[str] = typer.Option(..., "--classified", help="Classified wireless CSV from classify-conference; repeatable."),
+    gold: List[str] = typer.Option(..., "--gold", help="Curated gold sheet (csv/xlsx); repeatable."),
+    fuzzy_threshold: float = typer.Option(0.92, "--fuzzy-threshold", help="Title fuzzy-match ratio; 1.0 disables fuzzy."),
+    out: Optional[str] = typer.Option(None, "--out", help="Write the JSON report here."),
+    md: Optional[str] = typer.Option(None, "--md", help="Write the Markdown report here."),
+) -> None:
+    """DB-free snapshot eval: score classified CSV(s) against gold sheet(s).
+
+    No database or network — pure file-in, metrics-out. Matches DOI → exact
+    title → fuzzy title per (venue, year), and scores only the conferences
+    present in the classified CSV(s). (Workshop scoping needs the DB flow; use
+    ``eval-overlap --drop-workshops`` for that.)
+    """
+    from wireless_taxonomy.eval.standalone import eval_files_to_outputs
+
+    report = eval_files_to_outputs(
+        list(classified),
+        list(gold),
+        json_out=out,
+        md_out=md,
+        fuzzy_threshold=fuzzy_threshold,
+    )
+    overall = report["overall"]
+    typer.echo(
+        f"overall: jaccard={overall['jaccard']} precision={overall['precision']} "
+        f"recall={overall['recall']} f1={overall['f1']} "
+        f"(TP {overall['tp']} / FP {overall['fp']} / FN {overall['fn']})"
+    )
+    ignored = report.get("ignored_gold_instances") or []
+    if ignored:
+        pairs = ", ".join(f"{r['venue']}:{r['year']}({r['gold_papers']})" for r in ignored)
+        typer.echo(f"ignored gold venue-years not in classified set: {pairs}", err=True)
+
+
 @app.command("eval-overlap")
 def eval_overlap(
     classifier: str = typer.Option("keyword", "--classifier", help="Which prediction set to score: keyword or llm."),

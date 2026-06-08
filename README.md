@@ -64,6 +64,9 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli ingest \
 # 2. Backfill abstracts from OpenAlex/Crossref/Semantic Scholar (by DOI, then
 #    title). Papers with no DOI (e.g. USENIX/NSDI) first get one resolved from
 #    their title via Crossref/OpenAlex; pass --no-resolve-dois to skip that.
+#    For USENIX venues (NSDI/OSDI/ATC/Security), which the JSON APIs cover
+#    poorly, the enricher falls back to scraping the abstract from the paper's
+#    USENIX page (DBLP links it), recovering coverage those APIs miss.
 PYTHONPATH=src python3 -m wireless_taxonomy.cli enrich-abstracts --run-id 1 --db taxonomy.sqlite
 
 # 3. Classify wireless candidates (title+abstract). Keyword needs no API key;
@@ -123,14 +126,41 @@ against your curated sheet. Runnable from the repo root:
 ```bash
 python scripts/evaluate_coverage.py \
   --gold "List of Papers.csv" \
-  --venue-year SIGCOMM:2024 --venue-year IMC:2023 --venue-year NSDI:2024 \
   --classifier llm --drop-workshops \
   --db build/eval.sqlite --out-dir build/results
 ```
 
-For each venue+year it runs `classify-conference`, then imports the gold sheet
-once and runs `eval-overlap`, writing `build/results/report.md` + `report.json`
-plus a per-conference list. Omit `--venue-year` to use the default CS venue set.
+Drop in a sheet and the harness **auto-detects which conferences to evaluate**:
+with no `--venue-year`, it asks the CLI (`gold-venues`) which DBLP-ingestable
+venue-years the sheet(s) contain and loops over exactly those. Pass `--gold`
+more than once to union several sheets, or `--venue-year SIGCOMM:2024` to pin an
+explicit set. For each venue+year it runs `classify-conference`, then imports the
+gold sheet(s) once and runs `eval-overlap`, writing `build/results/report.md` +
+`report.json` plus a per-conference list.
+
+```bash
+# Just list the conferences a sheet contains (VENUE:YEAR per line)
+PYTHONPATH=src python3 -m wireless_taxonomy.cli gold-venues --path "List of Papers.csv"
+```
+
+### Decoupled snapshot eval (`eval-files`)
+
+The scoring is a pure, point-in-time computation, so it can run with **no DB and
+no network** — straight from two files. Give it a classified CSV (from
+`classify-conference --csv`) and a gold sheet; it matches DOI → exact title →
+fuzzy title per (venue, year) and emits the same metrics/report:
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli eval-files \
+  --classified sigcomm2024.csv --gold "List of Papers.csv" \
+  --out report.json --md report.md
+```
+
+Repeat `--classified`/`--gold` to union multiple files. Only conferences present
+in the classified CSV(s) are scored (unrun venue-years in the sheet are ignored,
+not penalised). Workshop scoping (`--drop-workshops`) needs the ingested
+proceedings universe, so it's only on the DB-backed `eval-overlap`. The same
+logic is importable: `from wireless_taxonomy.eval.standalone import eval_files`.
 
 ### Export the fetched paper set (`paper-set`)
 
@@ -184,7 +214,9 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli llm-config --db taxonomy.sqlite 
 | `classify-candidates` | Wireless-candidate labels (yes/no/maybe) for gold eval (`--llm` optional). |
 | `classify-conference` | Sheet-free loop: ingest+backfill+classify a venue/year, emit the wireless list. |
 | `import-gold` | Import a manual gold sheet (csv/xlsx) of wireless papers. |
-| `eval-overlap` | Precision/recall/F1/Jaccard of the automated set vs the gold set. |
+| `gold-venues` | List the distinct DBLP-ingestable VENUE:YEAR conferences in gold sheet(s). |
+| `eval-overlap` | Precision/recall/F1/Jaccard of the automated set vs the gold set (DB-backed; supports `--drop-workshops`). |
+| `eval-files` | DB-free snapshot eval: score a classified CSV vs a gold sheet, no DB/network. |
 | `paper-set` | Export the conference-scoped fetched paper set. |
 | `diff-sets` | Diff two paper-set exports (IoU + abstract coverage) to compare sources. |
 | `status` / `llm-config` | Inspect run history and configured LLM providers. |
