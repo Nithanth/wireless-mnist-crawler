@@ -136,7 +136,10 @@ def classify(
         True, "--cache/--no-cache", help="Read/write resolved abstracts+DOIs to a disk index for fast, deterministic re-runs."
     ),
     cache_path: str = typer.Option(
-        ".wt_cache.json", "--cache-path", help="Where the abstract/DOI cache lives (used unless --no-cache)."
+        ".wt_cache.json", "--cache-path", help="Where the abstract/DOI/LLM cache lives (used unless --no-cache)."
+    ),
+    refresh_llm: bool = typer.Option(
+        False, "--refresh-llm", help="Ignore cached LLM labels and re-call the model (fresh classification)."
     ),
     db: str = typer.Option("taxonomy.sqlite", "--db", help="SQLite work DB (created/reused)."),
 ) -> None:
@@ -172,15 +175,17 @@ def classify(
                     source_type=source,
                     source_value=source_value,
                     cache=metadata_cache,
+                    refresh_llm=refresh_llm,
                 )
             )
     finally:
         pipeline.close()
         if metadata_cache is not None:
             metadata_cache.save()
+            stats = metadata_cache.stats()
             typer.echo(
-                f"Cache: {metadata_cache.stats()['abstracts']} abstracts, "
-                f"{metadata_cache.stats()['dois']} DOIs at {cache_path}"
+                f"Cache: {stats['abstracts']} abstracts, {stats['dois']} DOIs, "
+                f"{stats.get('llm', 0)} LLM labels at {cache_path}"
             )
 
     all_papers = [paper for result in results for paper in result["papers"]]

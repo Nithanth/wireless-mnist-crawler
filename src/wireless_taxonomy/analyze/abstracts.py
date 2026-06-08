@@ -10,11 +10,19 @@ from urllib.parse import quote, urlencode
 from wireless_taxonomy.analyze.text_match import title_matches
 
 FetchJson = Callable[[str], dict[str, Any]]
+FetchJsonPost = Callable[[str, dict[str, Any]], Any]
 FetchText = Callable[[str], str]
 
 _JATS_TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _MIN_ABSTRACT_CHARS = 40
+
+# Semantic Scholar's batch endpoint returns abstracts for up to 500 DOIs in a
+# single request. Querying it once per conference (instead of one GET per paper)
+# is both far faster and, crucially, avoids the per-request 429 throttling that
+# otherwise drops most abstracts on a shared egress IP.
+_S2_BATCH_URL = "https://api.semanticscholar.org/graph/v1/paper/batch?fields=title,abstract"
+_S2_BATCH_SIZE = 400
 
 _ARXIV_ENTRY_RE = re.compile(r"<entry>(.*?)</entry>", re.DOTALL)
 _ARXIV_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.DOTALL)
@@ -49,17 +57,25 @@ class AbstractEnricher:
         providers: list[str] | None = None,
         fetch_text: FetchText | None = None,
         cache: Any | None = None,
+        fetch_json_post: FetchJsonPost | None = None,
     ) -> None:
         self.fetch_json = fetch_json or _default_fetch_json
         self.fetch_text = fetch_text or _default_fetch_text
+        self.fetch_json_post = fetch_json_post or _default_fetch_json_post
         self.cache = cache
-        # "usenix" is a page-scrape fallback: it only fires when a USENIX paper
-        # URL is supplied, so it costs nothing for venues the JSON APIs cover.
+        # Abstracts fetched up-front by the Semantic Scholar batch endpoint,
+        # keyed by normalized DOI. Checked before the per-paper provider chain
+        # so a single batched request serves the whole conference.
+        self._batch_abstracts: dict[str, AbstractResult] = {}
+        # "usenix" is a page-scrape fallback that only fires when a USENIX paper
+        # URL is supplied; it's a cheap no-op otherwise, so trying it first lets
+        # USENIX papers (NSDI/OSDI/ATC, which carry no DOI) resolve immediately
+        # instead of burning 429-throttled title searches against the JSON APIs.
         # "arxiv" is a title search (preprint coverage); "acm" is an opt-in,
         # best-effort browser scrape (ACM is Cloudflare-protected) enabled via
         # WIRELESS_TAXONOMY_ACM_BROWSER=1.
         if providers is None:
-            providers = ["openalex", "crossref", "semantic_scholar", "usenix", "arxiv"]
+            providers = ["usenix", "openalex", "crossref", "semantic_scholar", "arxiv"]
             if _acm_browser_enabled():
                 providers.append("acm")
         self.providers = providers
@@ -80,6 +96,20 @@ class AbstractEnricher:
                     cached.get("provider", "cache"),
                     cached.get("source_url", ""),
                 )
+        if doi:
+            batched = self._batch_abstracts.get(_norm_doi(doi))
+            if batched is not None:
+                if self.cache is not None:
+                    self.cache.set_abstract(
+                        title,
+                        doi,
+                        {
+                            "abstract": batched.abstract,
+                            "provider": batched.provider,
+                            "source_url": batched.source_url,
+                        },
+                    )
+                return batched
         for provider in self.providers:
             handler = getattr(self, f"_{provider}", None)
             if handler is None:
@@ -244,6 +274,55 @@ class AbstractEnricher:
             return AbstractResult(abstract, "acm", page_url)
         return None
 
+    def prefetch_semantic_scholar(self, items: list[tuple[str | None, str | None]]) -> int:
+        """Batch-fetch abstracts by DOI from Semantic Scholar in one request.
+
+        ``items`` is a list of ``(title, doi)`` pairs. Papers whose DOI yields an
+        abstract are stored (and cached, if a cache is attached) so the later
+        per-paper ``fetch`` short-circuits without a network call. Papers the
+        batch misses fall through to the normal provider chain. The batch call is
+        best-effort: any error (including an unrecoverable 429) leaves the
+        per-paper path untouched.
+        """
+        by_doi: dict[str, tuple[str | None, str]] = {}
+        for title, doi in items:
+            norm = _norm_doi(doi)
+            if norm and norm not in by_doi:
+                by_doi[norm] = (title, (doi or "").strip())
+        if not by_doi:
+            return 0
+        ordered = list(by_doi.values())
+        stored = 0
+        for start in range(0, len(ordered), _S2_BATCH_SIZE):
+            chunk = ordered[start : start + _S2_BATCH_SIZE]
+            ids = [f"DOI:{doi}" for _title, doi in chunk]
+            try:
+                records = self.fetch_json_post(_S2_BATCH_URL, {"ids": ids})
+            except Exception:
+                records = None
+            if not isinstance(records, list):
+                continue
+            for (title, doi), record in zip(chunk, records):
+                if not isinstance(record, dict):
+                    continue
+                abstract = _str(record.get("abstract"))
+                if not abstract or len(abstract) < _MIN_ABSTRACT_CHARS:
+                    continue
+                result = AbstractResult(abstract, "semantic_scholar", _S2_BATCH_URL)
+                self._batch_abstracts[_norm_doi(doi)] = result
+                if self.cache is not None:
+                    self.cache.set_abstract(
+                        title,
+                        doi,
+                        {
+                            "abstract": abstract,
+                            "provider": "semantic_scholar",
+                            "source_url": _S2_BATCH_URL,
+                        },
+                    )
+                stored += 1
+        return stored
+
     def _with_mailto(self, url: str) -> str:
         if not self._mailto:
             return url
@@ -380,7 +459,39 @@ def _str(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
 
+def _norm_doi(doi: str | None) -> str:
+    return (doi or "").strip().lower()
+
+
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_MAX_RETRY_WAIT = 30.0
+
+
+def _retry_wait_seconds(exc: Exception, attempt: int) -> float:
+    """Backoff before a retry, honoring a server ``Retry-After`` header on 429.
+
+    Rate-limited APIs (OpenAlex, Semantic Scholar) often return ``Retry-After``;
+    respecting it recovers throttled requests that plain exponential backoff
+    would give up on, which is the difference between a paper getting an abstract
+    and silently becoming a "miss".
+    """
+    headers = getattr(exc, "headers", None)
+    if headers is not None:
+        raw = headers.get("Retry-After")
+        if raw:
+            try:
+                return min(float(raw), _MAX_RETRY_WAIT)
+            except (TypeError, ValueError):
+                pass
+    return min(1.5 * (2**attempt), 20.0)
+
+
+def _s2_headers() -> dict[str, str]:
+    headers = {"User-Agent": "wireless-taxonomy/0.1"}
+    api_key = (os.getenv("SEMANTIC_SCHOLAR_API_KEY") or os.getenv("S2_API_KEY") or "").strip()
+    if api_key:
+        headers["x-api-key"] = api_key
+    return headers
 
 
 def _default_fetch_json(url: str) -> dict[str, Any]:
@@ -391,12 +502,11 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
 
     headers = {"User-Agent": "wireless-taxonomy/0.1"}
     if "api.semanticscholar.org" in url:
-        api_key = (os.getenv("SEMANTIC_SCHOLAR_API_KEY") or os.getenv("S2_API_KEY") or "").strip()
-        if api_key:
-            headers["x-api-key"] = api_key
+        headers = _s2_headers()
     attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "3")))
     last_error: Exception | None = None
     for attempt in range(attempts):
+        wait = min(1.5 * (2**attempt), 20.0)
         try:
             with urlopen(Request(url, headers=headers), timeout=30) as response:
                 payload = _json.loads(response.read().decode("utf-8"))
@@ -405,13 +515,44 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
             last_error = exc
             if exc.code not in _RETRYABLE_STATUS:
                 raise
+            wait = _retry_wait_seconds(exc, attempt)
         except URLError as exc:
             last_error = exc
         if attempt + 1 < attempts:
-            time.sleep(min(1.5 * (2**attempt), 20.0))
+            time.sleep(wait)
     if last_error is not None:
         raise last_error
     return {}
+
+
+def _default_fetch_json_post(url: str, body: dict[str, Any]) -> Any:
+    import json as _json
+    import time
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    headers = _s2_headers() if "api.semanticscholar.org" in url else {"User-Agent": "wireless-taxonomy/0.1"}
+    headers["Content-Type"] = "application/json"
+    data = _json.dumps(body).encode("utf-8")
+    attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "3")))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        wait = min(1.5 * (2**attempt), 20.0)
+        try:
+            with urlopen(Request(url, data=data, headers=headers, method="POST"), timeout=60) as response:
+                return _json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code not in _RETRYABLE_STATUS:
+                raise
+            wait = _retry_wait_seconds(exc, attempt)
+        except URLError as exc:
+            last_error = exc
+        if attempt + 1 < attempts:
+            time.sleep(wait)
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 _BROWSER_UA = (

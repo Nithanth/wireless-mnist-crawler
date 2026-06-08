@@ -218,3 +218,60 @@ def test_eval_drop_workshops_requires_label_column(tmp_path: Path) -> None:
     # Without dropping, a label-less CSV still scores (every row is a predicted positive).
     report = eval_files([str(classified)], [str(gold)])
     assert report["overall"]["tp"] == 1
+
+
+class _CountingRouter:
+    """Fake LLM router that records how many times the model was called."""
+
+    def __init__(self, label: str = "yes") -> None:
+        self.calls = 0
+        self.label = label
+
+    def configured_providers(self):
+        from wireless_taxonomy.config import ProviderConfig
+
+        return (ProviderConfig("openai", "gpt-test", "OPENAI_API_KEY", True),)
+
+    def complete(self, request):  # noqa: ARG002
+        from wireless_taxonomy.llm import LlmResponse
+
+        self.calls += 1
+        return LlmResponse(
+            provider="openai",
+            model="gpt-test",
+            content="{}",
+            parsed={"label": self.label, "confidence": 0.9, "evidence": "test"},
+        )
+
+
+def test_llm_label_cache_reuses_and_refreshes(tmp_path: Path) -> None:
+    from wireless_taxonomy.analyze.cache import MetadataCache
+    from wireless_taxonomy.analyze.candidates import LlmCandidateClassifier
+
+    cache = MetadataCache(tmp_path / "cache.json")
+    router = _CountingRouter(label="yes")
+    settings = load_settings(tmp_path / "taxonomy.sqlite").llm
+    paper = {"id": 1, "title": "RF Sensing at the Edge", "abstract": "We use mmWave radios."}
+
+    clf = LlmCandidateClassifier(settings, router=router, cache=cache)
+    first = clf.classify(paper)
+    assert first.label == "yes" and router.calls == 1
+    assert cache.dirty is True  # label was written to the cache
+
+    # Second classify of the identical paper hits the cache -> no new model call.
+    second = clf.classify(paper)
+    assert second.label == "yes" and router.calls == 1
+
+    # A changed abstract invalidates the content-addressed key -> fresh call.
+    clf.classify({"id": 1, "title": "RF Sensing at the Edge", "abstract": "Now about Wi-Fi."})
+    assert router.calls == 2
+
+    # --refresh-llm bypasses the cache even for an identical paper.
+    refresher = LlmCandidateClassifier(settings, router=router, cache=cache, refresh=True)
+    refresher.classify(paper)
+    assert router.calls == 3
+
+    # The cache persists across instances: a fresh non-refresh classifier reuses it.
+    reuse = LlmCandidateClassifier(settings, router=_CountingRouter(label="no"), cache=cache)
+    reused = reuse.classify(paper)
+    assert reused.label == "yes"  # cached "yes", not the new router's "no"
