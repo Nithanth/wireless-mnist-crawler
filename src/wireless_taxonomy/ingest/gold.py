@@ -132,6 +132,23 @@ class GoldSheetReader:
         return columns, rows
 
 
+def distinct_venue_years(
+    paths: list[str],
+    default_venue: str | None = None,
+    default_year: int | None = None,
+) -> list[tuple[str, int]]:
+    """Return the sorted, de-duplicated (venue, year) pairs across gold sheet(s).
+
+    Lets the eval harness drive itself off whatever conferences a dropped-in
+    sheet actually contains, instead of a hardcoded venue list.
+    """
+    seen: dict[tuple[str, int], None] = {}
+    for path in paths:
+        for record in GoldSheetReader(path, default_venue, default_year).read():
+            seen.setdefault((record.venue, record.year), None)
+    return sorted(seen, key=lambda vy: (vy[0].lower(), vy[1]))
+
+
 def _find(lower_map: dict[str, str], keys: tuple[str, ...]) -> str | None:
     for key in keys:
         if key in lower_map:

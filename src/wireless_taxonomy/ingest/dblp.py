@@ -29,6 +29,12 @@ _DOI_RE = re.compile(r"10\.\d{4,9}/\S+")
 _DISAMBIGUATION_RE = re.compile(r"\s+\d{4}$")
 
 
+def resolve_stream(venue: str) -> str | None:
+    """Return the DBLP stream for a venue, or None if it has no mapping."""
+    key = re.sub(r"[^a-z0-9-]", "", venue.strip().lower())
+    return _DBLP_STREAMS.get(key)
+
+
 def stream_for_venue(venue: str) -> str:
     key = re.sub(r"[^a-z0-9-]", "", venue.strip().lower())
     stream = _DBLP_STREAMS.get(key)
