@@ -68,6 +68,7 @@ class Pipeline:
         enricher=None,
         resolve_dois: bool = True,
         doi_resolver=None,
+        cache=None,
     ) -> int:
         """Backfill missing paper abstracts (and optionally DOIs) from open APIs.
 
@@ -84,9 +85,9 @@ class Pipeline:
         conference_instance_id = source_run["conference_instance_id"]
         stage_run_id = self._create_run(conference_instance_id, "enrich-abstracts", "run", str(run_id))
         logger = EvidenceLogger(self.settings.evidence_dir, stage_run_id)
-        enricher = enricher or AbstractEnricher()
+        enricher = enricher or AbstractEnricher(cache=cache)
         if resolve_dois:
-            doi_resolver = doi_resolver or DoiResolver()
+            doi_resolver = doi_resolver or DoiResolver(cache=cache)
         rows = self.conn.execute(
             "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
         ).fetchall()
@@ -118,6 +119,11 @@ class Pipeline:
                 if existing and not overwrite:
                     continue
                 attempted += 1
+                # Persist the cache periodically so a long, slow run never loses
+                # already-resolved (or already-missed) abstracts/DOIs if it's
+                # interrupted. Keyed on attempts so all-miss runs still save.
+                if cache is not None and attempted % 20 == 0:
+                    cache.save()
                 result = enricher.fetch(paper["title"], doi or None, source_urls.get(paper["id"]))
                 if result is None:
                     continue
@@ -139,6 +145,8 @@ class Pipeline:
                 f"Filled {filled}/{attempted} missing abstracts, resolved {dois_resolved} DOIs "
                 f"({len(rows)} papers total).",
             )
+        if cache is not None:
+            cache.save()
         logger.event(
             "enrich_abstracts_completed",
             {
@@ -209,6 +217,7 @@ class Pipeline:
         resolve_dois: bool = True,
         source_type: str = "dblp",
         source_value: str | None = None,
+        cache=None,
     ) -> dict:
         """Sheet-free classification loop for a single venue/year.
 
@@ -221,7 +230,7 @@ class Pipeline:
         positives (by label) and the proceedings universe (all rows).
         """
         ingest_run = self.ingest(venue, year, source_type, source_value or "")
-        self.enrich_abstracts(ingest_run, resolve_dois=resolve_dois)
+        self.enrich_abstracts(ingest_run, resolve_dois=resolve_dois, cache=cache)
         classify_run = self.classify_candidates(ingest_run, use_llm=use_llm)
         classifier = "llm" if use_llm else "keyword"
         conference_instance_id = self._require_run(ingest_run)["conference_instance_id"]

@@ -98,6 +98,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--drop-workshops", action="store_true", help="Drop curated papers absent from main proceedings.")
     parser.add_argument("--no-resolve-dois", action="store_true", help="Skip programmatic DOI backfill.")
     parser.add_argument("--db", default="build/eval.sqlite", help="SQLite work DB (shared across all conferences).")
+    parser.add_argument(
+        "--cache-path",
+        default="build/abstract_cache.json",
+        help="Disk cache of resolved abstracts/DOIs (shared across all conferences) so re-runs are fast.",
+    )
     parser.add_argument("--out-dir", default="build/results", help="Directory for per-conference lists and the report.")
     parser.add_argument("--source", default="dblp", help="Paper-list source for classify.")
     args = parser.parse_args(argv)
@@ -132,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
                 resolve_flag,
                 "--source", args.source,
                 "--db", str(db_path),
+                "--cache-path", args.cache_path,
                 "--json", str(out_dir / f"{slug}.json"),
                 "--csv", str(csv_path),
             ]

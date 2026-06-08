@@ -152,8 +152,8 @@ def _write_classified_csv(result: dict, path: Path) -> None:
 def test_end_to_end_classify_full_set_and_file_eval(tmp_path: Path, monkeypatch) -> None:
     # Keep the pipeline offline: the fixture already carries abstracts + DOIs,
     # but stub the network enricher/resolver so nothing reaches out.
-    monkeypatch.setattr("wireless_taxonomy.analyze.abstracts.AbstractEnricher", lambda: _NoEnricher())
-    monkeypatch.setattr("wireless_taxonomy.analyze.abstracts.DoiResolver", lambda: _NoResolver())
+    monkeypatch.setattr("wireless_taxonomy.analyze.abstracts.AbstractEnricher", lambda **kw: _NoEnricher())
+    monkeypatch.setattr("wireless_taxonomy.analyze.abstracts.DoiResolver", lambda **kw: _NoResolver())
 
     db = tmp_path / "taxonomy.sqlite"
     gold = tmp_path / "gold.csv"

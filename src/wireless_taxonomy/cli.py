@@ -132,6 +132,12 @@ def classify(
     source_value: Optional[str] = typer.Option(None, "--source-value", help="Path or URL when --source is not dblp."),
     json_out: Optional[str] = typer.Option(None, "--json", help="Write the full labelled set (all years) as JSON here."),
     csv_out: Optional[str] = typer.Option(None, "--csv", help="Write the full labelled set (all years) as CSV here."),
+    cache: bool = typer.Option(
+        True, "--cache/--no-cache", help="Read/write resolved abstracts+DOIs to a disk index for fast, deterministic re-runs."
+    ),
+    cache_path: str = typer.Option(
+        ".wt_cache.json", "--cache-path", help="Where the abstract/DOI cache lives (used unless --no-cache)."
+    ),
     db: str = typer.Option("taxonomy.sqlite", "--db", help="SQLite work DB (created/reused)."),
 ) -> None:
     """Loop a venue over a year (or range): fetch list, backfill abstracts, label.
@@ -147,6 +153,12 @@ def classify(
         raise typer.BadParameter("--source-value is required when --source is not 'dblp'.")
     year_list = _parse_years(years)
 
+    metadata_cache = None
+    if cache:
+        from wireless_taxonomy.analyze.cache import MetadataCache
+
+        metadata_cache = MetadataCache(cache_path)
+
     results: list[dict] = []
     pipeline = _pipeline(db)
     try:
@@ -159,10 +171,17 @@ def classify(
                     resolve_dois=resolve_dois,
                     source_type=source,
                     source_value=source_value,
+                    cache=metadata_cache,
                 )
             )
     finally:
         pipeline.close()
+        if metadata_cache is not None:
+            metadata_cache.save()
+            typer.echo(
+                f"Cache: {metadata_cache.stats()['abstracts']} abstracts, "
+                f"{metadata_cache.stats()['dois']} DOIs at {cache_path}"
+            )
 
     all_papers = [paper for result in results for paper in result["papers"]]
 
