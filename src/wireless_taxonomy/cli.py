@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import json
+import csv as _csv
 import inspect
+import json
 from pathlib import Path
 from typing import List, Optional
 
@@ -10,13 +11,6 @@ import typer
 from typer.core import TyperArgument, TyperOption
 
 from wireless_taxonomy.config import load_settings
-from wireless_taxonomy.evaluate.run_diff import (
-    diff_paper_sets,
-    format_diff_summary,
-    load_paper_set,
-    write_diff_csv,
-    write_diff_report,
-)
 from wireless_taxonomy.pipeline import Pipeline
 
 _OPTION_MAKE_METAVAR = TyperOption.make_metavar
@@ -71,202 +65,161 @@ def _patch_typer_click_compat() -> None:
 
 _patch_typer_click_compat()
 
-app = typer.Typer(help="Build accuracy-first wireless paper and dataset taxonomy records.")
+app = typer.Typer(
+    help=(
+        "Measure automated wireless-paper classification coverage per conference-year.\n\n"
+        "Three commands:\n"
+        "  classify   loop a venue over a year (or year range), fetch the paper "
+        "list, backfill abstracts, label each paper, and print/export the "
+        "yes/maybe/no breakdown.\n"
+        "  eval       DB-free snapshot scoring of a labelled CSV vs a gold sheet.\n"
+        "  llm-config show which LLM providers are configured."
+    )
+)
+
+_CSV_FIELDS = ["title", "authors", "doi", "venue", "year", "label", "confidence", "used_abstract", "has_abstract"]
 
 
 def _pipeline(db: str) -> Pipeline:
     return Pipeline(load_settings(db))
 
 
+def _parse_years(years: str) -> list[int]:
+    """Parse ``2024`` or an inclusive range ``2023:2025`` into a list of years."""
+    text = years.strip()
+    if ":" in text:
+        start_s, _, end_s = text.partition(":")
+        try:
+            start, end = int(start_s), int(end_s)
+        except ValueError as exc:
+            raise typer.BadParameter("--years range must look like 2023:2025.") from exc
+        if start > end:
+            raise typer.BadParameter("--years range start must be <= end.")
+        return list(range(start, end + 1))
+    try:
+        return [int(text)]
+    except ValueError as exc:
+        raise typer.BadParameter("--years must be a year (2024) or range (2023:2025).") from exc
+
+
+def _pct(count: int, total: int) -> float:
+    return round(100.0 * count / total, 1) if total else 0.0
+
+
+def _echo_breakdown(result: dict) -> None:
+    counts = result["counts"]
+    total = result["total_papers"]
+    with_abs = result["papers_with_abstract"]
+    abs_pct = _pct(with_abs, total)
+    typer.echo(
+        f"{result['venue']} {result['year']} — {total} papers "
+        f"(abstracts: {with_abs}/{total}, {abs_pct:.0f}%)"
+    )
+    for label in ("yes", "maybe", "no"):
+        n = counts.get(label, 0)
+        typer.echo(f"  {label:<5} {n:>4}  ({_pct(n, total):>5.1f}%)")
+
+
 @app.command()
-def init(db: str = typer.Option("taxonomy.sqlite", "--db", help="SQLite database path.")) -> None:
-    pipeline = _pipeline(db)
-    try:
-        pipeline.init_db()
-        typer.echo(f"Initialized database: {Path(db)}")
-    finally:
-        pipeline.close()
-
-
-@app.command()
-def ingest(
-    venue: str = typer.Option(..., "--venue"),
-    year: int = typer.Option(..., "--year"),
-    url: Optional[str] = typer.Option(None, "--url"),
-    bibtex: Optional[str] = typer.Option(None, "--bibtex"),
-    csv_path: Optional[str] = typer.Option(None, "--csv"),
-    dblp: bool = typer.Option(False, "--dblp", help="Fetch the main-track paper list from DBLP for --venue/--year."),
-    db: str = typer.Option("taxonomy.sqlite", "--db"),
-) -> None:
-    source_type, source_value = _source(url, bibtex, csv_path, dblp)
-    pipeline = _pipeline(db)
-    try:
-        run_id = pipeline.ingest(venue, year, source_type, source_value)
-        typer.echo(f"Ingest completed. run_id={run_id}")
-    finally:
-        pipeline.close()
-
-
-
-
-@app.command("classify-wireless")
-def classify_wireless(run_id: int = typer.Option(..., "--run-id"), db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
-    pipeline = _pipeline(db)
-    try:
-        stage_run = pipeline.classify_wireless(run_id)
-        typer.echo(f"Wireless classification completed. run_id={stage_run}")
-    finally:
-        pipeline.close()
-
-
-@app.command("enrich-abstracts")
-def enrich_abstracts(
-    run_id: int = typer.Option(..., "--run-id"),
-    overwrite: bool = typer.Option(False, "--overwrite/--missing-only", help="Refetch even papers that already have an abstract."),
-    resolve_dois: bool = typer.Option(
-        True,
-        "--resolve-dois/--no-resolve-dois",
-        help="Backfill missing DOIs from title via Crossref/OpenAlex before fetching abstracts.",
-    ),
-    db: str = typer.Option("taxonomy.sqlite", "--db"),
-) -> None:
-    pipeline = _pipeline(db)
-    try:
-        stage_run = pipeline.enrich_abstracts(run_id, overwrite=overwrite, resolve_dois=resolve_dois)
-        typer.echo(f"Abstract enrichment completed. run_id={stage_run}")
-    finally:
-        pipeline.close()
-
-
-@app.command("classify-candidates")
-def classify_candidates(
-    run_id: int = typer.Option(..., "--run-id"),
-    llm: bool = typer.Option(False, "--llm/--no-llm", help="Use the configured LLM instead of the keyword baseline."),
-    db: str = typer.Option("taxonomy.sqlite", "--db"),
-) -> None:
-    pipeline = _pipeline(db)
-    try:
-        stage_run = pipeline.classify_candidates(run_id, use_llm=llm)
-        typer.echo(f"Candidate classification completed. run_id={stage_run}")
-    finally:
-        pipeline.close()
-
-
-@app.command("classify-conference")
-def classify_conference(
-    venue: str = typer.Option(..., "--venue"),
-    year: int = typer.Option(..., "--year"),
+def classify(
+    venue: str = typer.Option(..., "--venue", help="Conference venue, e.g. NSDI, SIGCOMM, IMC."),
+    years: str = typer.Option(..., "--years", help="A year (2024) or inclusive range (2023:2025)."),
     llm: bool = typer.Option(True, "--llm/--no-llm", help="Use the LLM classifier (default) or the keyword baseline."),
-    pass_mode: str = typer.Option("high", "--pass", help="high = 'yes' only; low = 'yes'|'maybe'."),
-    resolve_dois: bool = typer.Option(True, "--resolve-dois/--no-resolve-dois", help="Backfill missing DOIs before classifying."),
+    resolve_dois: bool = typer.Option(
+        True, "--resolve-dois/--no-resolve-dois", help="Backfill missing DOIs from title before classifying."
+    ),
     source: str = typer.Option("dblp", "--source", help="Paper-list source: dblp (default), bibtex, csv, or url."),
     source_value: Optional[str] = typer.Option(None, "--source-value", help="Path or URL when --source is not dblp."),
-    out: Optional[str] = typer.Option(None, "--out", help="Write the classified list as JSON here."),
-    csv_out: Optional[str] = typer.Option(None, "--csv", help="Write the classified list as CSV here."),
-    db: str = typer.Option("taxonomy.sqlite", "--db"),
+    json_out: Optional[str] = typer.Option(None, "--json", help="Write the full labelled set (all years) as JSON here."),
+    csv_out: Optional[str] = typer.Option(None, "--csv", help="Write the full labelled set (all years) as CSV here."),
+    db: str = typer.Option("taxonomy.sqlite", "--db", help="SQLite work DB (created/reused)."),
 ) -> None:
-    """Sheet-free: loop a venue+year through ingest -> DOI/abstract backfill -> classify, and emit the wireless list."""
+    """Loop a venue over a year (or range): fetch list, backfill abstracts, label.
+
+    Runs the full per-year pipeline (DBLP list -> DOI/abstract backfill ->
+    yes/maybe/no classification).
+    Prints a yes/maybe/no breakdown (counts + % of the conference set) per year
+    and, for a range, an aggregate. ``--csv``/``--json`` export the **full**
+    labelled set (every paper, not just the wireless ones), which is exactly what
+    ``eval`` consumes.
+    """
     if source != "dblp" and not source_value:
         raise typer.BadParameter("--source-value is required when --source is not 'dblp'.")
+    year_list = _parse_years(years)
+
+    results: list[dict] = []
     pipeline = _pipeline(db)
     try:
-        result = pipeline.classify_conference(
-            venue,
-            year,
-            use_llm=llm,
-            pass_mode=pass_mode,
-            resolve_dois=resolve_dois,
-            source_type=source,
-            source_value=source_value,
-        )
+        for year in year_list:
+            results.append(
+                pipeline.classify_conference(
+                    venue,
+                    year,
+                    use_llm=llm,
+                    resolve_dois=resolve_dois,
+                    source_type=source,
+                    source_value=source_value,
+                )
+            )
     finally:
         pipeline.close()
 
-    if out:
-        out_path = Path(out)
+    all_papers = [paper for result in results for paper in result["papers"]]
+
+    for result in results:
+        _echo_breakdown(result)
+        typer.echo("")
+
+    if len(results) > 1:
+        agg_counts = {"yes": 0, "maybe": 0, "no": 0}
+        agg_total = 0
+        agg_abs = 0
+        for result in results:
+            for label, n in result["counts"].items():
+                agg_counts[label] = agg_counts.get(label, 0) + n
+            agg_total += result["total_papers"]
+            agg_abs += result["papers_with_abstract"]
+        span = f"{year_list[0]}–{year_list[-1]}"
+        typer.echo(
+            f"{venue} {span} (aggregate) — {agg_total} papers "
+            f"(abstracts: {agg_abs}/{agg_total}, {_pct(agg_abs, agg_total):.0f}%)"
+        )
+        for label in ("yes", "maybe", "no"):
+            n = agg_counts.get(label, 0)
+            typer.echo(f"  {label:<5} {n:>4}  ({_pct(n, agg_total):>5.1f}%)")
+
+    if json_out:
+        out_path = Path(json_out)
         if out_path.suffix.lower() != ".json":
             out_path = out_path.with_suffix(".json")
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        out_path.write_text(
+            json.dumps({"venue": venue, "years": year_list, "runs": results}, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        typer.echo(f"Wrote JSON: {out_path}")
     if csv_out:
-        import csv as _csv
-
         csv_path = Path(csv_out)
         if csv_path.suffix.lower() != ".csv":
             csv_path = csv_path.with_suffix(".csv")
         csv_path.parent.mkdir(parents=True, exist_ok=True)
-        fields = ["title", "authors", "doi", "venue", "year", "wireless_label", "confidence", "used_abstract", "has_abstract"]
         with csv_path.open("w", newline="", encoding="utf-8") as fh:
-            writer = _csv.DictWriter(fh, fieldnames=fields)
+            writer = _csv.DictWriter(fh, fieldnames=_CSV_FIELDS)
             writer.writeheader()
-            writer.writerows(result["papers"])
-
-    typer.echo(
-        f"{result['venue']} {result['year']}: {result['wireless_count']} wireless / "
-        f"{result['total_papers']} papers ({result['papers_with_abstract']} with abstracts) "
-        f"via {result['classifier']} classifier (--pass {result['pass_mode']})."
-    )
-    for paper in result["papers"]:
-        conf = paper["confidence"]
-        typer.echo(f"  [{conf}] {paper['title']}")
+            writer.writerows(all_papers)
+        typer.echo(f"Wrote CSV: {csv_path}")
 
 
-@app.command("import-gold")
-def import_gold(
-    path: str = typer.Option(..., "--path", help="Manual gold sheet (csv or xlsx) of wireless papers."),
-    venue: Optional[str] = typer.Option(None, "--venue", help="Default venue if the sheet has no conference column."),
-    year: Optional[int] = typer.Option(None, "--year", help="Default year if the sheet has no year column."),
-    wireless_only: bool = typer.Option(
-        False, "--wireless-only/--all-rows",
-        help="If the sheet lists ALL papers with a wireless flag column, keep only flagged-wireless rows.",
-    ),
-    db: str = typer.Option("taxonomy.sqlite", "--db"),
-) -> None:
-    pipeline = _pipeline(db)
-    try:
-        stage_run = pipeline.import_gold(path, venue=venue, year=year, wireless_only=wireless_only)
-        typer.echo(f"Gold import completed. run_id={stage_run}")
-    finally:
-        pipeline.close()
-
-
-@app.command("gold-venues")
-def gold_venues(
-    path: List[str] = typer.Option(..., "--path", help="Gold sheet(s) (csv/xlsx); repeat for multiple."),
-    venue: Optional[str] = typer.Option(None, "--venue", help="Default venue if a sheet has no conference column."),
-    year: Optional[int] = typer.Option(None, "--year", help="Default year if a sheet has no year column."),
-    ingestable_only: bool = typer.Option(
-        True, "--ingestable-only/--all",
-        help="Only list venues that resolve to a known DBLP stream (skip e.g. journals).",
-    ),
-) -> None:
-    """List the distinct VENUE:YEAR conferences detected across the gold sheet(s).
-
-    Lets the eval harness (or you) drive the classify loop off whatever a
-    dropped-in sheet contains, instead of a hardcoded venue list. Resolvable
-    conferences print to stdout as ``VENUE:YEAR``; skipped ones go to stderr.
-    """
-    from wireless_taxonomy.ingest.dblp import resolve_stream
-    from wireless_taxonomy.ingest.gold import distinct_venue_years
-
-    pairs = distinct_venue_years(list(path), default_venue=venue, default_year=year)
-    skipped: list[str] = []
-    for v, y in pairs:
-        if ingestable_only and resolve_stream(v) is None:
-            skipped.append(f"{v}:{y}")
-            continue
-        typer.echo(f"{v}:{y}")
-    if skipped:
-        typer.echo(
-            "skipped (no DBLP stream mapping): " + ", ".join(skipped),
-            err=True,
-        )
-
-
-@app.command("eval-files")
-def eval_files_cmd(
-    classified: List[str] = typer.Option(..., "--classified", help="Classified wireless CSV from classify-conference; repeatable."),
+@app.command()
+def eval(
+    classified: List[str] = typer.Option(..., "--classified", help="Full labelled CSV from `classify --csv`; repeatable."),
     gold: List[str] = typer.Option(..., "--gold", help="Curated gold sheet (csv/xlsx); repeatable."),
+    pass_mode: str = typer.Option("high", "--pass", help="high = label 'yes' only; low = 'yes' or 'maybe'."),
+    drop_workshops: bool = typer.Option(
+        False,
+        "--drop-workshops/--keep-workshops",
+        help="Drop curated papers absent from the classified universe (co-located workshops) from the calculation.",
+    ),
     fuzzy_threshold: float = typer.Option(0.92, "--fuzzy-threshold", help="Title fuzzy-match ratio; 1.0 disables fuzzy."),
     out: Optional[str] = typer.Option(None, "--out", help="Write the JSON report here."),
     md: Optional[str] = typer.Option(None, "--md", help="Write the Markdown report here."),
@@ -275,21 +228,38 @@ def eval_files_cmd(
 
     No database or network — pure file-in, metrics-out. Matches DOI → exact
     title → fuzzy title per (venue, year), and scores only the conferences
-    present in the classified CSV(s). (Workshop scoping needs the DB flow; use
-    ``eval-overlap --drop-workshops`` for that.)
+    present in the classified CSV(s). ``--drop-workshops`` excludes curated
+    papers absent from the classified universe (the full set written by
+    ``classify --csv``) instead of counting them as misses.
     """
+    if pass_mode not in {"high", "low"}:
+        raise typer.BadParameter("--pass must be 'high' or 'low'.")
     from wireless_taxonomy.eval.standalone import eval_files_to_outputs
 
-    report = eval_files_to_outputs(
-        list(classified),
-        list(gold),
-        json_out=out,
-        md_out=md,
-        fuzzy_threshold=fuzzy_threshold,
-    )
+    try:
+        report = eval_files_to_outputs(
+            list(classified),
+            list(gold),
+            json_out=out,
+            md_out=md,
+            pass_mode=pass_mode,
+            drop_workshops=drop_workshops,
+            fuzzy_threshold=fuzzy_threshold,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    scope_note = "main-proceedings only" if drop_workshops else "workshops included"
+    typer.echo(f"snapshot eval: pass={pass_mode} fuzzy={fuzzy_threshold} scope={scope_note}")
+    for row in report["instances"]:
+        typer.echo(
+            f"- {row['venue']} {row['year']}: jaccard={row['jaccard']} "
+            f"precision={row['precision']} recall={row['recall']} f1={row['f1']} "
+            f"(tp={row['tp']} fp={row['fp']} fn={row['fn']})"
+        )
     overall = report["overall"]
     typer.echo(
-        f"overall: jaccard={overall['jaccard']} precision={overall['precision']} "
+        f"OVERALL: jaccard={overall['jaccard']} precision={overall['precision']} "
         f"recall={overall['recall']} f1={overall['f1']} "
         f"(TP {overall['tp']} / FP {overall['fp']} / FN {overall['fn']})"
     )
@@ -297,178 +267,10 @@ def eval_files_cmd(
     if ignored:
         pairs = ", ".join(f"{r['venue']}:{r['year']}({r['gold_papers']})" for r in ignored)
         typer.echo(f"ignored gold venue-years not in classified set: {pairs}", err=True)
-
-
-@app.command("eval-overlap")
-def eval_overlap(
-    classifier: str = typer.Option("keyword", "--classifier", help="Which prediction set to score: keyword or llm."),
-    pass_mode: str = typer.Option("high", "--pass", help="high = label yes only; low = label yes or maybe."),
-    fuzzy_threshold: float = typer.Option(0.92, "--fuzzy-threshold", help="Title fuzzy-match ratio; 1.0 disables fuzzy."),
-    drop_workshops: bool = typer.Option(
-        False,
-        "--drop-workshops/--keep-workshops",
-        help="Drop curated papers absent from the main proceedings (co-located workshops) from the calculation.",
-    ),
-    out: Optional[str] = typer.Option(None, "--out", help="Optional path to write the full JSON report."),
-    md_out: Optional[str] = typer.Option(None, "--md", help="Optional path to write a readable Markdown report."),
-    db: str = typer.Option("taxonomy.sqlite", "--db"),
-) -> None:
-    pipeline = _pipeline(db)
-    try:
-        report = pipeline.evaluate_overlap(
-            classifier=classifier,
-            pass_mode=pass_mode,
-            fuzzy_threshold=fuzzy_threshold,
-            scope_to_universe=drop_workshops,
-        )
-        overall = report["overall"]
-        scope_note = "main-proceedings only" if drop_workshops else "workshops included"
-        typer.echo(
-            f"Overlap eval: classifier={report['classifier']} pass={report['pass_mode']} "
-            f"fuzzy={report['fuzzy_threshold']} scope={scope_note}"
-        )
-        if not report["instances"]:
-            typer.echo("No gold-backed conference instances found. Run import-gold first.")
-        for row in report["instances"]:
-            typer.echo(
-                f"- {row['venue']} {row['year']}: jaccard={row['jaccard']} "
-                f"precision={row['precision']} recall={row['recall']} f1={row['f1']} "
-                f"(tp={row['tp']} fp={row['fp']} fn={row['fn']}; "
-                f"fn_miss={row['fn_missed']} fn_not_ingested={row['fn_missing_from_universe']})"
-            )
-        for row in report["per_conference"]:
-            typer.echo(
-                f"= {row['venue']} (all years): jaccard={row['jaccard']} "
-                f"precision={row['precision']} recall={row['recall']} f1={row['f1']}"
-            )
-        typer.echo(
-            f"OVERALL: jaccard={overall['jaccard']} precision={overall['precision']} "
-            f"recall={overall['recall']} f1={overall['f1']} "
-            f"(tp={overall['tp']} fp={overall['fp']} fn={overall['fn']})"
-        )
-        if out:
-            Path(out).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-            typer.echo(f"Wrote report: {out}")
-        if md_out:
-            from wireless_taxonomy.eval.overlap import to_markdown
-
-            Path(md_out).write_text(to_markdown(report), encoding="utf-8")
-            typer.echo(f"Wrote Markdown report: {md_out}")
-    finally:
-        pipeline.close()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-@app.command("paper-set")
-def paper_set(
-    run_id: int = typer.Option(..., "--run-id"),
-    out: str = typer.Option(..., "--out"),
-    fmt: str = typer.Option("csv", "--format", help="csv or json."),
-    wireless_only: bool = typer.Option(
-        False, "--wireless-only/--all-papers", help="Restrict to papers the pipeline classified as wireless."
-    ),
-    wireless_source: str = typer.Option(
-        "classify", "--wireless-source", help="Wireless decision source: classify (keyword) or agentic (analysis)."
-    ),
-    db: str = typer.Option("taxonomy.sqlite", "--db"),
-) -> None:
-    """Export the conference-scoped set of fetched papers (match_key, title, abstract, ...)."""
-    pipeline = _pipeline(db)
-    try:
-        path = pipeline.export_paper_set(run_id, out, fmt, wireless_only=wireless_only, wireless_source=wireless_source)
-        typer.echo(f"Exported paper set ({fmt}): {path}")
-    finally:
-        pipeline.close()
-
-
-@app.command("diff-sets")
-def diff_sets(
-    a: str = typer.Option(..., "--a", help="First paper-set export (csv or json) — e.g. the URL+LLM run."),
-    b: str = typer.Option(..., "--b", help="Second paper-set export (csv or json) — e.g. the DBLP+OpenAlex run."),
-    label_a: str = typer.Option("A", "--label-a", help="Display label for the first set."),
-    label_b: str = typer.Option("B", "--label-b", help="Display label for the second set."),
-    fuzzy: bool = typer.Option(
-        True,
-        "--fuzzy/--exact",
-        help="Match near-duplicate titles (difflib + author overlap) vs exact normalized title only.",
-    ),
-    reference: Optional[str] = typer.Option(
-        None,
-        "--reference",
-        help="Treat one side as ground truth ('a' or 'b') to also report precision/recall/F1.",
-    ),
-    out: Optional[str] = typer.Option(None, "--out", help="Write the full diff report JSON to this path."),
-    csv_out: Optional[str] = typer.Option(
-        None, "--csv", help="Write a per-paper diff CSV (status / match type / abstract flags) to this path."
-    ),
-) -> None:
-    """Diff two `paper-set` exports to measure how reliably two automated sources agree.
-
-    Compares two automated paper sets (e.g. a URL+LLM ingest vs a DBLP+OpenAlex
-    ingest) and reports their Jaccard overlap, the papers unique to each side, and
-    abstract coverage per side. Matching is DOI-first, then exact title, then fuzzy.
-    Pass `--reference a|b` to also get precision/recall/F1 against that ground-truth
-    side. No database needed — it operates on the exported files.
-    """
-    if reference is not None and reference not in ("a", "b"):
-        raise typer.BadParameter("--reference must be 'a' or 'b'")
-    rows_a = load_paper_set(a)
-    rows_b = load_paper_set(b)
-    summary, diff_rows = diff_paper_sets(
-        rows_a, rows_b, fuzzy=fuzzy, label_a=label_a, label_b=label_b, reference=reference
-    )
-    typer.echo(format_diff_summary(summary))
     if out:
-        path = write_diff_report(summary, diff_rows, out)
-        typer.echo(f"Wrote diff report: {path}")
-    if csv_out:
-        path = write_diff_csv(diff_rows, csv_out)
-        typer.echo(f"Wrote per-paper diff CSV: {path}")
-
-
-
-
-
-
-@app.command()
-def status(run_id: Optional[int] = typer.Option(None, "--run-id"), db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
-    pipeline = _pipeline(db)
-    try:
-        rows = pipeline.status(run_id)
-        if not rows:
-            typer.echo("No runs found.")
-            return
-        for row in rows:
-            typer.echo(f"#{row['id']} {row['stage']} {row['status']} - {row['message'] or ''}")
-    finally:
-        pipeline.close()
+        typer.echo(f"Wrote JSON: {out}")
+    if md:
+        typer.echo(f"Wrote Markdown: {md}")
 
 
 @app.command("llm-config")
@@ -480,17 +282,6 @@ def llm_config(db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
     for provider in settings.llm.ordered_providers():
         key_status = "configured" if provider.api_key_configured else f"missing {provider.api_key_env}"
         typer.echo(f"- {provider.provider}: model={provider.model}, key={key_status}")
-
-
-def _source(url: str | None, bibtex: str | None, csv_path: str | None, dblp: bool = False) -> tuple[str, str]:
-    provided = [(name, value) for name, value in [("url", url), ("bibtex", bibtex), ("csv", csv_path)] if value]
-    if dblp:
-        provided.append(("dblp", ""))
-    if len(provided) != 1:
-        raise typer.BadParameter("Provide exactly one of --dblp, --url, --bibtex, or --csv.")
-    return provided[0][0], provided[0][1] or ""
-
-
 
 
 if __name__ == "__main__":

@@ -58,15 +58,6 @@ class ReviewItem:
 
 
 @dataclass(frozen=True)
-class WirelessClassification:
-    paper_id: int
-    label: Literal["yes", "no", "maybe"]
-    confidence: float
-    evidence: str
-    model_version: str = "keyword-rules-v0"
-
-
-@dataclass(frozen=True)
 class DatasetClaim:
     paper_id: int
     dataset_name: str
