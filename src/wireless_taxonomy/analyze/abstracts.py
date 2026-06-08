@@ -10,6 +10,7 @@ from urllib.parse import quote, urlencode
 from wireless_taxonomy.analyze.text_match import title_matches
 
 FetchJson = Callable[[str], dict[str, Any]]
+FetchText = Callable[[str], str]
 
 _JATS_TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
@@ -38,25 +39,37 @@ class AbstractEnricher:
     tried in order and the first usable abstract wins.
     """
 
-    def __init__(self, fetch_json: FetchJson | None = None, providers: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        fetch_json: FetchJson | None = None,
+        providers: list[str] | None = None,
+        fetch_text: FetchText | None = None,
+    ) -> None:
         self.fetch_json = fetch_json or _default_fetch_json
-        self.providers = providers or ["openalex", "crossref", "semantic_scholar"]
+        self.fetch_text = fetch_text or _default_fetch_text
+        # "usenix" is a page-scrape fallback: it only fires when a USENIX paper
+        # URL is supplied, so it costs nothing for venues the JSON APIs cover.
+        self.providers = providers or ["openalex", "crossref", "semantic_scholar", "usenix"]
         self._mailto = (os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip()
 
-    def fetch(self, title: str | None, doi: str | None) -> AbstractResult | None:
+    def fetch(
+        self, title: str | None, doi: str | None, url: str | None = None
+    ) -> AbstractResult | None:
         for provider in self.providers:
             handler = getattr(self, f"_{provider}", None)
             if handler is None:
                 continue
             try:
-                result = handler(title, doi)
+                result = handler(title, doi, url)
             except Exception:
                 result = None
             if result is not None:
                 return result
         return None
 
-    def _openalex(self, title: str | None, doi: str | None) -> AbstractResult | None:
+    def _openalex(
+        self, title: str | None, doi: str | None, url: str | None = None
+    ) -> AbstractResult | None:
         payload: dict[str, Any] = {}
         source_url = ""
         if doi:
@@ -74,7 +87,9 @@ class AbstractEnricher:
             return AbstractResult(abstract, "openalex", source_url)
         return None
 
-    def _crossref(self, title: str | None, doi: str | None) -> AbstractResult | None:
+    def _crossref(
+        self, title: str | None, doi: str | None, url: str | None = None
+    ) -> AbstractResult | None:
         if not doi:
             return None
         source_url = f"https://api.crossref.org/works/{quote(doi, safe='')}"
@@ -85,7 +100,9 @@ class AbstractEnricher:
             return AbstractResult(abstract, "crossref", source_url)
         return None
 
-    def _semantic_scholar(self, title: str | None, doi: str | None) -> AbstractResult | None:
+    def _semantic_scholar(
+        self, title: str | None, doi: str | None, url: str | None = None
+    ) -> AbstractResult | None:
         if doi:
             source_url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{quote(doi, safe='')}?fields=title,abstract"
             payload = self.fetch_json(source_url)
@@ -104,6 +121,29 @@ class AbstractEnricher:
             abstract = _str(first.get("abstract"))
             if abstract and len(abstract) >= _MIN_ABSTRACT_CHARS:
                 return AbstractResult(abstract, "semantic_scholar", source_url)
+        return None
+
+    def _usenix(
+        self, title: str | None, doi: str | None, url: str | None = None
+    ) -> AbstractResult | None:
+        """Scrape the abstract from a USENIX paper page.
+
+        USENIX (NSDI/OSDI/ATC/Security) deposits no DOIs in DBLP, so the JSON
+        metadata APIs frequently miss these abstracts. DBLP, however, links the
+        paper's ``ee`` directly to its USENIX page, whose body holds the full
+        abstract. This fallback only fires for those URLs.
+        """
+        if not url or "usenix.org" not in url:
+            return None
+        html = self.fetch_text(url)
+        if not html:
+            return None
+        page_title = _html_h1(html)
+        if title and page_title and not title_matches(title, page_title):
+            return None
+        abstract = _usenix_abstract(html)
+        if abstract and len(abstract) >= _MIN_ABSTRACT_CHARS:
+            return AbstractResult(abstract, "usenix", url)
         return None
 
     def _with_mailto(self, url: str) -> str:
@@ -247,3 +287,75 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
     if last_error is not None:
         raise last_error
     return {}
+
+
+_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+_USENIX_FIELD_RE = re.compile(r"field-name-field-paper-description\b")
+_H1_RE = re.compile(r"<h1[^>]*>(.*?)</h1>", re.IGNORECASE | re.DOTALL)
+_USENIX_TRAILERS = ("BibTeX", "@inproceedings", "Open Access", "Presentation Video", "Download")
+_USENIX_VENUE_TAIL_RE = re.compile(r"\s+[A-Z]{2,6}\s*['\u2019]?\s*\d{2}\s*$")
+
+
+def _default_fetch_text(url: str) -> str:
+    import time
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    headers = {
+        "User-Agent": _BROWSER_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "3")))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with urlopen(Request(url, headers=headers), timeout=30) as response:
+                return response.read().decode("utf-8", "ignore")
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code not in _RETRYABLE_STATUS:
+                return ""
+        except URLError as exc:
+            last_error = exc
+        if attempt + 1 < attempts:
+            time.sleep(min(1.5 * (2**attempt), 20.0))
+    if last_error is not None:
+        return ""
+    return ""
+
+
+def _html_h1(html: str) -> str:
+    match = _H1_RE.search(html or "")
+    if not match:
+        return ""
+    return _strip_jats(match.group(1))
+
+
+def _usenix_abstract(html: str) -> str:
+    """Extract the abstract text from a USENIX paper page.
+
+    The abstract sits in a ``field-name-field-paper-description`` block. We slice
+    from that marker, strip tags, and cut at the page's trailing boilerplate
+    (BibTeX, media links) so only the abstract prose remains.
+    """
+    if not html:
+        return ""
+    match = _USENIX_FIELD_RE.search(html)
+    if not match:
+        return ""
+    # Start after the opening tag closes so the div's own class attribute text
+    # isn't captured as prose.
+    tag_end = html.find(">", match.end())
+    start = tag_end + 1 if tag_end != -1 else match.end()
+    segment = html[start : start + 12000]
+    text = _strip_jats(segment)
+    for trailer in _USENIX_TRAILERS:
+        idx = text.find(trailer)
+        if idx > 0:
+            text = text[:idx]
+    text = _USENIX_VENUE_TAIL_RE.sub("", text.strip())
+    return text.strip()

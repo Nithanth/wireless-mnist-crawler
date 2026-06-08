@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import click
 import typer
@@ -228,6 +228,75 @@ def import_gold(
         typer.echo(f"Gold import completed. run_id={stage_run}")
     finally:
         pipeline.close()
+
+
+@app.command("gold-venues")
+def gold_venues(
+    path: List[str] = typer.Option(..., "--path", help="Gold sheet(s) (csv/xlsx); repeat for multiple."),
+    venue: Optional[str] = typer.Option(None, "--venue", help="Default venue if a sheet has no conference column."),
+    year: Optional[int] = typer.Option(None, "--year", help="Default year if a sheet has no year column."),
+    ingestable_only: bool = typer.Option(
+        True, "--ingestable-only/--all",
+        help="Only list venues that resolve to a known DBLP stream (skip e.g. journals).",
+    ),
+) -> None:
+    """List the distinct VENUE:YEAR conferences detected across the gold sheet(s).
+
+    Lets the eval harness (or you) drive the classify loop off whatever a
+    dropped-in sheet contains, instead of a hardcoded venue list. Resolvable
+    conferences print to stdout as ``VENUE:YEAR``; skipped ones go to stderr.
+    """
+    from wireless_taxonomy.ingest.dblp import resolve_stream
+    from wireless_taxonomy.ingest.gold import distinct_venue_years
+
+    pairs = distinct_venue_years(list(path), default_venue=venue, default_year=year)
+    skipped: list[str] = []
+    for v, y in pairs:
+        if ingestable_only and resolve_stream(v) is None:
+            skipped.append(f"{v}:{y}")
+            continue
+        typer.echo(f"{v}:{y}")
+    if skipped:
+        typer.echo(
+            "skipped (no DBLP stream mapping): " + ", ".join(skipped),
+            err=True,
+        )
+
+
+@app.command("eval-files")
+def eval_files_cmd(
+    classified: List[str] = typer.Option(..., "--classified", help="Classified wireless CSV from classify-conference; repeatable."),
+    gold: List[str] = typer.Option(..., "--gold", help="Curated gold sheet (csv/xlsx); repeatable."),
+    fuzzy_threshold: float = typer.Option(0.92, "--fuzzy-threshold", help="Title fuzzy-match ratio; 1.0 disables fuzzy."),
+    out: Optional[str] = typer.Option(None, "--out", help="Write the JSON report here."),
+    md: Optional[str] = typer.Option(None, "--md", help="Write the Markdown report here."),
+) -> None:
+    """DB-free snapshot eval: score classified CSV(s) against gold sheet(s).
+
+    No database or network — pure file-in, metrics-out. Matches DOI → exact
+    title → fuzzy title per (venue, year), and scores only the conferences
+    present in the classified CSV(s). (Workshop scoping needs the DB flow; use
+    ``eval-overlap --drop-workshops`` for that.)
+    """
+    from wireless_taxonomy.eval.standalone import eval_files_to_outputs
+
+    report = eval_files_to_outputs(
+        list(classified),
+        list(gold),
+        json_out=out,
+        md_out=md,
+        fuzzy_threshold=fuzzy_threshold,
+    )
+    overall = report["overall"]
+    typer.echo(
+        f"overall: jaccard={overall['jaccard']} precision={overall['precision']} "
+        f"recall={overall['recall']} f1={overall['f1']} "
+        f"(TP {overall['tp']} / FP {overall['fp']} / FN {overall['fn']})"
+    )
+    ignored = report.get("ignored_gold_instances") or []
+    if ignored:
+        pairs = ", ".join(f"{r['venue']}:{r['year']}({r['gold_papers']})" for r in ignored)
+        typer.echo(f"ignored gold venue-years not in classified set: {pairs}", err=True)
 
 
 @app.command("eval-overlap")

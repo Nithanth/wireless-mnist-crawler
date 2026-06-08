@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Coverage-evaluation harness — drives the wireless-taxonomy CLI end to end.
 
-Runnable from the repo root:
+Runnable from the repo root. Drop in a sheet and it auto-detects which
+conferences to evaluate:
 
     python scripts/evaluate_coverage.py \
         --gold "List of Papers.csv" \
-        --venue-year SIGCOMM:2024 --venue-year IMC:2023 --venue-year NSDI:2024 \
         --classifier llm --drop-workshops \
         --db build/eval.sqlite --out-dir build/results
 
+Pass `--gold` more than once to union several sheets, or `--venue-year` to pin an
+explicit set instead of auto-detecting. When `--venue-year` is omitted the
+harness asks the CLI (`gold-venues`) which DBLP-ingestable conferences the
+sheet(s) contain and loops over exactly those.
+
 For each venue+year it calls `classify-conference` (sheet-free: DBLP ingest ->
-DOI/abstract backfill -> classify), then imports the gold sheet once and runs
+DOI/abstract backfill -> classify), then imports the gold sheet(s) once and runs
 `eval-overlap` to score the automated set against the curated sheet. The CLI is
 the single source of truth; this script only orchestrates it and collects the
 reports, so the same commands can be reproduced by hand.
@@ -26,19 +31,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = REPO_ROOT / "src"
 
-# Convenience default — the CS venues with clean DBLP main-track TOCs.
-DEFAULT_VENUE_YEARS = [
-    ("SIGCOMM", 2022),
-    ("SIGCOMM", 2023),
-    ("SIGCOMM", 2024),
-    ("IMC", 2023),
-    ("IMC", 2024),
-    ("IMC", 2025),
-    ("NSDI", 2023),
-    ("NSDI", 2024),
-    ("NSDI", 2025),
-]
-
 
 def _cli_env() -> dict[str, str]:
     env = os.environ.copy()
@@ -53,6 +45,23 @@ def run_cli(args: list[str]) -> None:
     subprocess.run(cmd, check=True, env=_cli_env(), cwd=REPO_ROOT)
 
 
+def run_cli_capture(args: list[str]) -> str:
+    cmd = [sys.executable, "-m", "wireless_taxonomy.cli", *args]
+    proc = subprocess.run(cmd, check=True, env=_cli_env(), cwd=REPO_ROOT, capture_output=True, text=True)
+    if proc.stderr.strip():
+        print(proc.stderr.strip(), file=sys.stderr)
+    return proc.stdout
+
+
+def venue_years_from_gold(gold_paths: list[str]) -> list[tuple[str, int]]:
+    """Ask the CLI which conferences the gold sheet(s) contain (DBLP-ingestable)."""
+    args = ["gold-venues"]
+    for path in gold_paths:
+        args += ["--path", path]
+    out = run_cli_capture(args)
+    return [parse_venue_year(line.strip()) for line in out.splitlines() if line.strip()]
+
+
 def parse_venue_year(value: str) -> tuple[str, int]:
     if ":" not in value:
         raise argparse.ArgumentTypeError(f"--venue-year must be VENUE:YEAR, got {value!r}")
@@ -65,14 +74,21 @@ def parse_venue_year(value: str) -> tuple[str, int]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--gold", required=True, help="Curated gold sheet (csv/xlsx) of wireless papers.")
+    parser.add_argument(
+        "--gold",
+        dest="gold",
+        action="append",
+        required=True,
+        metavar="SHEET",
+        help="Curated gold sheet (csv/xlsx). Repeat to evaluate several sheets at once.",
+    )
     parser.add_argument(
         "--venue-year",
         dest="venue_years",
         action="append",
         type=parse_venue_year,
         metavar="VENUE:YEAR",
-        help="Conference-year to evaluate (repeatable). Defaults to the CS venue set.",
+        help="Conference-year to evaluate (repeatable). Omit to auto-detect from the gold sheet(s).",
     )
     parser.add_argument("--classifier", choices=["llm", "keyword"], default="llm", help="Classifier to score.")
     parser.add_argument("--pass", dest="pass_mode", choices=["high", "low"], default="high")
@@ -84,7 +100,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", default="dblp", help="Paper-list source for classify-conference.")
     args = parser.parse_args(argv)
 
-    venue_years = args.venue_years or DEFAULT_VENUE_YEARS
+    venue_years = args.venue_years or venue_years_from_gold(args.gold)
+    if not venue_years:
+        parser.error(
+            "No conferences to evaluate: the gold sheet(s) yielded no DBLP-ingestable "
+            "venue/year pairs. Pass --venue-year explicitly."
+        )
+    print(f"Evaluating {len(venue_years)} conference-year(s): "
+          + ", ".join(f"{v}:{y}" for v, y in venue_years))
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     db_path = Path(args.db)
@@ -111,8 +134,9 @@ def main(argv: list[str] | None = None) -> int:
             ]
         )
 
-    # 2) Import the curated sheet once (matched per venue/year inside the DB).
-    run_cli(["import-gold", "--path", args.gold, "--db", str(db_path)])
+    # 2) Import the curated sheet(s) once (matched per venue/year inside the DB).
+    for gold_path in args.gold:
+        run_cli(["import-gold", "--path", gold_path, "--db", str(db_path)])
 
     # 3) Score the automated set against the curated sheet.
     eval_args = [

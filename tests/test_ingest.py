@@ -74,3 +74,32 @@ def test_llm_payload_is_normalized_to_paper_seeds() -> None:
     assert seeds[0].title == "A Heterogeneous Page Paper"
     assert seeds[0].authors == ["Ada Lovelace; Grace Hopper"]
     assert seeds[0].source_confidence == 0.92
+
+
+def test_distinct_venue_years_dedupes_and_sorts(tmp_path) -> None:
+    from wireless_taxonomy.ingest.gold import distinct_venue_years
+
+    sheet = tmp_path / "gold.csv"
+    sheet.write_text(
+        "Paper Title,Conference,Year\n"
+        "A,SIGCOMM,2024\n"
+        "B,SIGCOMM,2024\n"
+        "C,NSDI,2023\n"
+        "D,IEEE Trans. Wireless Comm.,2024\n",
+        encoding="utf-8",
+    )
+    assert distinct_venue_years([str(sheet)]) == [
+        ("IEEE Trans. Wireless Comm.", 2024),
+        ("NSDI", 2023),
+        ("SIGCOMM", 2024),
+    ]
+
+
+def test_distinct_venue_years_unions_multiple_sheets(tmp_path) -> None:
+    from wireless_taxonomy.ingest.gold import distinct_venue_years
+
+    a = tmp_path / "a.csv"
+    a.write_text("Paper Title,Conference,Year\nA,IMC,2023\n", encoding="utf-8")
+    b = tmp_path / "b.csv"
+    b.write_text("Paper Title,Conference,Year\nB,IMC,2023\nC,NSDI,2024\n", encoding="utf-8")
+    assert distinct_venue_years([str(a), str(b)]) == [("IMC", 2023), ("NSDI", 2024)]
