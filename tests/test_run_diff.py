@@ -20,6 +20,33 @@ def _row(title, *, authors="", abstract="", doi="", wireless_label=""):
     }
 
 
+def test_doi_match_beats_title_drift() -> None:
+    # Same paper, very different titles, but a shared DOI -> still matched.
+    a = [_row("Spectrum Sensing: A Field Study", doi="10.1145/x")]
+    b = [_row("On Sensing the RF Spectrum in the Wild", doi="10.1145/X")]  # DOI case-insensitive
+    summary, rows = diff_paper_sets(a, b)
+    assert summary.shared == 1
+    assert summary.doi_count == 1
+    assert summary.only_in_a == 0 and summary.only_in_b == 0
+    assert rows[0]["match_type"] == "doi"
+
+
+def test_reference_precision_recall() -> None:
+    # B is ground truth (3 papers); A predicts 2 correct + 1 extra.
+    a = [_row("Alpha", doi="10.1/a"), _row("Beta", doi="10.1/b"), _row("Hallucinated")]
+    b = [_row("Alpha", doi="10.1/a"), _row("Beta", doi="10.1/b"), _row("Gamma", doi="10.1/g")]
+    summary, _ = diff_paper_sets(a, b, reference="b")
+    metrics = summary.metrics()
+    assert metrics is not None
+    assert metrics.tp == 2 and metrics.fp == 1 and metrics.fn == 1
+    assert metrics.precision == 2 / 3  # 2 of 3 predicted are real
+    assert metrics.recall == 2 / 3  # 2 of 3 real papers caught
+    # Jaccard is symmetric and unchanged by the reference choice.
+    assert summary.jaccard == 0.5
+    text = format_diff_summary(summary)
+    assert "precision" in text and "recall" in text
+
+
 def test_diff_counts_shared_and_unique() -> None:
     a = [_row("Deep Learning for Radio"), _row("MIMO Beamforming"), _row("Only In A")]
     b = [_row("deep learning for radio"), _row("MIMO Beamforming"), _row("Only In B")]

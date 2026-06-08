@@ -498,6 +498,11 @@ def diff_sets(
         "--fuzzy/--exact",
         help="Match near-duplicate titles (difflib + author overlap) vs exact normalized title only.",
     ),
+    reference: Optional[str] = typer.Option(
+        None,
+        "--reference",
+        help="Treat one side as ground truth ('a' or 'b') to also report precision/recall/F1.",
+    ),
     out: Optional[str] = typer.Option(None, "--out", help="Write the full diff report JSON to this path."),
     csv_out: Optional[str] = typer.Option(
         None, "--csv", help="Write a per-paper diff CSV (status / match type / abstract flags) to this path."
@@ -507,11 +512,17 @@ def diff_sets(
 
     Compares two automated paper sets (e.g. a URL+LLM ingest vs a DBLP+OpenAlex
     ingest) and reports their Jaccard overlap, the papers unique to each side, and
-    abstract coverage per side. No database needed — it operates on the exported files.
+    abstract coverage per side. Matching is DOI-first, then exact title, then fuzzy.
+    Pass `--reference a|b` to also get precision/recall/F1 against that ground-truth
+    side. No database needed — it operates on the exported files.
     """
+    if reference is not None and reference not in ("a", "b"):
+        raise typer.BadParameter("--reference must be 'a' or 'b'")
     rows_a = load_paper_set(a)
     rows_b = load_paper_set(b)
-    summary, diff_rows = diff_paper_sets(rows_a, rows_b, fuzzy=fuzzy, label_a=label_a, label_b=label_b)
+    summary, diff_rows = diff_paper_sets(
+        rows_a, rows_b, fuzzy=fuzzy, label_a=label_a, label_b=label_b, reference=reference
+    )
     typer.echo(format_diff_summary(summary))
     if out:
         path = write_diff_report(summary, diff_rows, out)
