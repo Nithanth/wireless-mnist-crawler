@@ -303,10 +303,18 @@ class Pipeline:
         )
         return stage_run_id
 
-    def evaluate_overlap(self, classifier: str = "keyword", pass_mode: str = "high", fuzzy_threshold: float = 0.92) -> dict:
+    def evaluate_overlap(
+        self,
+        classifier: str = "keyword",
+        pass_mode: str = "high",
+        fuzzy_threshold: float = 0.92,
+        scope_to_universe: bool = False,
+    ) -> dict:
         """Jaccard/IoU of the predicted wireless set vs the gold set, per venue/year.
 
-        Only conference instances that have an imported gold set are scored.
+        Only conference instances that have an imported gold set are scored. When
+        ``scope_to_universe`` is set, gold papers absent from the ingested main
+        proceedings (co-located workshop papers) are dropped from the denominator.
         """
         if pass_mode not in {"high", "low"}:
             raise ValueError("pass_mode must be 'high' or 'low'")
@@ -393,11 +401,12 @@ class Pipeline:
                 }
             )
 
-        aggregates = overlap.aggregate(instance_rows)
+        aggregates = overlap.aggregate(instance_rows, scope_to_universe=scope_to_universe)
         return {
             "classifier": classifier,
             "pass_mode": pass_mode,
             "fuzzy_threshold": fuzzy_threshold,
+            "scope_to_universe": scope_to_universe,
             "instances": aggregates["per_conference_year"],
             "per_conference": aggregates["per_conference"],
             "overall": aggregates["overall"],

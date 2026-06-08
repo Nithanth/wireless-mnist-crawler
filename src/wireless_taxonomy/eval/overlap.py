@@ -126,27 +126,31 @@ def jaccard(pred_keys: set[str], gold_keys: set[str]) -> float:
     return len(pred_keys & gold_keys) / len(union) if union else 0.0
 
 
-def aggregate(instance_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate(instance_rows: list[dict[str, Any]], *, scope_to_universe: bool = False) -> dict[str, Any]:
     """Aggregate per-(venue, year) count rows into per-venue and overall metrics.
 
     ``instance_rows`` each carry: venue, year, tp, fp, fn, fn_missed,
-    fn_missing_from_universe. Uses pandas for the grouping the user asked for.
+    fn_missing_from_universe. When ``scope_to_universe`` is set, gold papers that
+    are not in the ingested main-proceedings universe (``fn_missing_from_universe``
+    — i.e. co-located workshop papers) are dropped from the denominator, so the
+    effective FN is ``fn_missed`` only. Uses pandas for the grouping.
     """
     import pandas as pd
 
     if not instance_rows:
-        return {"per_conference_year": [], "per_conference": [], "overall": Metrics(0, 0, 0).to_dict()}
+        empty = _row_with_metrics({"tp": 0, "fp": 0, "fn": 0}, scope_to_universe=scope_to_universe)
+        return {"per_conference_year": [], "per_conference": [], "overall": empty}
 
     df = pd.DataFrame(instance_rows)
     count_cols = ["tp", "fp", "fn", "fn_missed", "fn_missing_from_universe"]
 
-    per_year = [_row_with_metrics(row) for row in instance_rows]
+    per_year = [_row_with_metrics(row, scope_to_universe=scope_to_universe) for row in instance_rows]
 
     per_conf_df = df.groupby("venue", as_index=False)[count_cols].sum()
-    per_conf = [_row_with_metrics(row) for row in per_conf_df.to_dict("records")]
+    per_conf = [_row_with_metrics(row, scope_to_universe=scope_to_universe) for row in per_conf_df.to_dict("records")]
 
     totals = df[count_cols].sum().to_dict()
-    overall = _row_with_metrics(totals)
+    overall = _row_with_metrics(totals, scope_to_universe=scope_to_universe)
 
     return {
         "per_conference_year": per_year,
@@ -155,13 +159,102 @@ def aggregate(instance_rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _row_with_metrics(row: dict[str, Any]) -> dict[str, Any]:
-    metrics = Metrics(int(row["tp"]), int(row["fp"]), int(row["fn"]))
+def _row_with_metrics(row: dict[str, Any], *, scope_to_universe: bool = False) -> dict[str, Any]:
+    fn_missed = int(row.get("fn_missed", 0))
+    fn_missing = int(row.get("fn_missing_from_universe", 0))
+    effective_fn = fn_missed if scope_to_universe else int(row["fn"])
+    metrics = Metrics(int(row["tp"]), int(row["fp"]), effective_fn)
     out: dict[str, Any] = {}
     for key in ("venue", "year"):
         if key in row and row[key] is not None:
             out[key] = row[key]
     out.update(metrics.to_dict())
-    out["fn_missed"] = int(row.get("fn_missed", 0))
-    out["fn_missing_from_universe"] = int(row.get("fn_missing_from_universe", 0))
+    out["fn_missed"] = fn_missed
+    out["fn_missing_from_universe"] = fn_missing
+    out["scoped_to_universe"] = scope_to_universe
     return out
+
+
+def to_markdown(report: dict[str, Any]) -> str:
+    """Render an `evaluate_overlap` report as a readable Markdown document."""
+
+    scoped = report.get("scope_to_universe", False)
+    lines: list[str] = []
+    lines.append("# Wireless classification vs. manual sheet")
+    lines.append("")
+    lines.append(
+        f"- **Classifier:** `{report.get('classifier')}`  |  **Pass:** `{report.get('pass_mode')}`  |  "
+        f"**Fuzzy threshold:** `{report.get('fuzzy_threshold')}`"
+    )
+    lines.append(
+        f"- **Scope:** {'main proceedings only — workshop papers dropped' if scoped else 'all gold papers (workshops included)'}"
+    )
+    lines.append(
+        "- **Matching:** DOI → exact title → fuzzy title. Jaccard (IoU) = TP / (TP+FP+FN); "
+        "precision = TP/(TP+FP); recall = TP/(TP+FN)."
+    )
+    lines.append("")
+
+    overall = report.get("overall", {})
+    lines.append("## Overall")
+    lines.append("")
+    lines.append("| metric | value |")
+    lines.append("| --- | --- |")
+    lines.append(f"| Jaccard (IoU) | **{overall.get('jaccard')}** |")
+    lines.append(f"| precision | {overall.get('precision')} |")
+    lines.append(f"| recall | {overall.get('recall')} |")
+    lines.append(f"| F1 | {overall.get('f1')} |")
+    lines.append(f"| TP / FP / FN | {overall.get('tp')} / {overall.get('fp')} / {overall.get('fn')} |")
+    if scoped:
+        lines.append(f"| dropped workshop papers | {overall.get('fn_missing_from_universe')} |")
+    lines.append("")
+
+    def _table(rows: list[dict[str, Any]], year: bool) -> None:
+        header = "| venue | year | jaccard | precision | recall | f1 | tp | fp | fn | fn_miss | dropped |"
+        if not year:
+            header = "| venue | jaccard | precision | recall | f1 | tp | fp | fn | fn_miss | dropped |"
+        lines.append(header)
+        lines.append("| " + " | ".join(["---"] * (header.count("|") - 1)) + " |")
+        for r in rows:
+            cells = [str(r.get("venue", ""))]
+            if year:
+                cells.append(str(r.get("year", "")))
+            cells += [
+                str(r.get("jaccard")), str(r.get("precision")), str(r.get("recall")), str(r.get("f1")),
+                str(r.get("tp")), str(r.get("fp")), str(r.get("fn")),
+                str(r.get("fn_missed")), str(r.get("fn_missing_from_universe")),
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+        lines.append("")
+
+    if report.get("instances"):
+        lines.append("## Per conference-year")
+        lines.append("")
+        _table(report["instances"], year=True)
+
+    if report.get("per_conference"):
+        lines.append("## Per venue (all years)")
+        lines.append("")
+        _table(report["per_conference"], year=False)
+
+    mismatches = report.get("mismatches") or []
+    if mismatches:
+        lines.append("## Discrepancies")
+        lines.append("")
+        lines.append(
+            "`classifier_miss` = paper is in the main proceedings but the classifier didn't flag it. "
+            "`missing_from_universe` = paper in your sheet but not in the main proceedings (workshop / out of scope)."
+        )
+        lines.append("")
+        for m in mismatches:
+            fp = m.get("false_positives") or []
+            miss = m.get("false_negatives_classifier_miss") or []
+            outside = m.get("false_negatives_missing_from_universe") or []
+            lines.append(f"### {m.get('venue')} {m.get('year')}")
+            lines.append(f"- false positives ({len(fp)}): {', '.join(fp) if fp else '—'}")
+            lines.append(f"- classifier misses ({len(miss)}): {', '.join(miss) if miss else '—'}")
+            label = "dropped workshop papers" if scoped else "missing from proceedings"
+            lines.append(f"- {label} ({len(outside)}): {', '.join(outside) if outside else '—'}")
+            lines.append("")
+
+    return "\n".join(lines)

@@ -63,6 +63,50 @@ def test_metrics_and_aggregate() -> None:
     assert agg["overall"]["jaccard"] == round(3 / 5, 4)
 
 
+def test_aggregate_scope_to_universe_drops_workshop_fn() -> None:
+    # One gold miss is a workshop paper (missing_from_universe); scoping drops it from FN.
+    rows = [
+        {"venue": "SIGCOMM", "year": 2024, "tp": 2, "fp": 1, "fn": 2, "fn_missed": 1, "fn_missing_from_universe": 1},
+    ]
+    full = overlap.aggregate(rows)["overall"]
+    scoped = overlap.aggregate(rows, scope_to_universe=True)["overall"]
+    # Unscoped: FN=2 -> jaccard 2/5; recall 2/4.
+    assert full["fn"] == 2 and full["jaccard"] == round(2 / 5, 4) and full["recall"] == 0.5
+    # Scoped: workshop FN dropped -> FN=1 -> jaccard 2/4; recall 2/3. Precision unchanged.
+    assert scoped["fn"] == 1 and scoped["jaccard"] == 0.5
+    assert scoped["recall"] == round(2 / 3, 4) and scoped["precision"] == full["precision"]
+    assert scoped["fn_missing_from_universe"] == 1 and scoped["scoped_to_universe"] is True
+
+
+def test_to_markdown_renders_tables_and_scope() -> None:
+    report = {
+        "classifier": "llm",
+        "pass_mode": "high",
+        "fuzzy_threshold": 0.92,
+        "scope_to_universe": True,
+        "instances": [
+            {"venue": "SIGCOMM", "year": 2024, "jaccard": 0.5, "precision": 0.6, "recall": 0.7,
+             "f1": 0.65, "tp": 2, "fp": 1, "fn": 1, "fn_missed": 1, "fn_missing_from_universe": 1},
+        ],
+        "per_conference": [
+            {"venue": "SIGCOMM", "jaccard": 0.5, "precision": 0.6, "recall": 0.7,
+             "f1": 0.65, "tp": 2, "fp": 1, "fn": 1, "fn_missed": 1, "fn_missing_from_universe": 1},
+        ],
+        "overall": {"jaccard": 0.5, "precision": 0.6, "recall": 0.7, "f1": 0.65,
+                    "tp": 2, "fp": 1, "fn": 1, "fn_missing_from_universe": 1},
+        "mismatches": [
+            {"venue": "SIGCOMM", "year": 2024, "false_positives": ["Extra Paper"],
+             "false_negatives_classifier_miss": ["Missed Paper"],
+             "false_negatives_missing_from_universe": ["Workshop Paper"]},
+        ],
+    }
+    md = overlap.to_markdown(report)
+    assert "# Wireless classification vs. manual sheet" in md
+    assert "workshop papers dropped" in md
+    assert "| SIGCOMM | 2024 |" in md
+    assert "Workshop Paper" in md and "Extra Paper" in md
+
+
 def test_gold_reader_flexible_columns_and_wireless_filter(tmp_path: Path) -> None:
     sheet = tmp_path / "gold.csv"
     sheet.write_text(

@@ -217,14 +217,29 @@ def eval_overlap(
     classifier: str = typer.Option("keyword", "--classifier", help="Which prediction set to score: keyword or llm."),
     pass_mode: str = typer.Option("high", "--pass", help="high = label yes only; low = label yes or maybe."),
     fuzzy_threshold: float = typer.Option(0.92, "--fuzzy-threshold", help="Title fuzzy-match ratio; 1.0 disables fuzzy."),
+    drop_workshops: bool = typer.Option(
+        False,
+        "--drop-workshops/--keep-workshops",
+        help="Drop curated papers absent from the main proceedings (co-located workshops) from the calculation.",
+    ),
     out: Optional[str] = typer.Option(None, "--out", help="Optional path to write the full JSON report."),
+    md_out: Optional[str] = typer.Option(None, "--md", help="Optional path to write a readable Markdown report."),
     db: str = typer.Option("taxonomy.sqlite", "--db"),
 ) -> None:
     pipeline = _pipeline(db)
     try:
-        report = pipeline.evaluate_overlap(classifier=classifier, pass_mode=pass_mode, fuzzy_threshold=fuzzy_threshold)
+        report = pipeline.evaluate_overlap(
+            classifier=classifier,
+            pass_mode=pass_mode,
+            fuzzy_threshold=fuzzy_threshold,
+            scope_to_universe=drop_workshops,
+        )
         overall = report["overall"]
-        typer.echo(f"Overlap eval: classifier={report['classifier']} pass={report['pass_mode']} fuzzy={report['fuzzy_threshold']}")
+        scope_note = "main-proceedings only" if drop_workshops else "workshops included"
+        typer.echo(
+            f"Overlap eval: classifier={report['classifier']} pass={report['pass_mode']} "
+            f"fuzzy={report['fuzzy_threshold']} scope={scope_note}"
+        )
         if not report["instances"]:
             typer.echo("No gold-backed conference instances found. Run import-gold first.")
         for row in report["instances"]:
@@ -247,6 +262,11 @@ def eval_overlap(
         if out:
             Path(out).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             typer.echo(f"Wrote report: {out}")
+        if md_out:
+            from wireless_taxonomy.eval.overlap import to_markdown
+
+            Path(md_out).write_text(to_markdown(report), encoding="utf-8")
+            typer.echo(f"Wrote Markdown report: {md_out}")
     finally:
         pipeline.close()
 
