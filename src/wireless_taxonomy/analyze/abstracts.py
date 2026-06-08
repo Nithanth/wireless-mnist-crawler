@@ -16,6 +16,10 @@ _JATS_TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
 _MIN_ABSTRACT_CHARS = 40
 
+_ARXIV_ENTRY_RE = re.compile(r"<entry>(.*?)</entry>", re.DOTALL)
+_ARXIV_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.DOTALL)
+_ARXIV_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
+
 
 @dataclass(frozen=True)
 class AbstractResult:
@@ -44,17 +48,38 @@ class AbstractEnricher:
         fetch_json: FetchJson | None = None,
         providers: list[str] | None = None,
         fetch_text: FetchText | None = None,
+        cache: Any | None = None,
     ) -> None:
         self.fetch_json = fetch_json or _default_fetch_json
         self.fetch_text = fetch_text or _default_fetch_text
+        self.cache = cache
         # "usenix" is a page-scrape fallback: it only fires when a USENIX paper
         # URL is supplied, so it costs nothing for venues the JSON APIs cover.
-        self.providers = providers or ["openalex", "crossref", "semantic_scholar", "usenix"]
+        # "arxiv" is a title search (preprint coverage); "acm" is an opt-in,
+        # best-effort browser scrape (ACM is Cloudflare-protected) enabled via
+        # WIRELESS_TAXONOMY_ACM_BROWSER=1.
+        if providers is None:
+            providers = ["openalex", "crossref", "semantic_scholar", "usenix", "arxiv"]
+            if _acm_browser_enabled():
+                providers.append("acm")
+        self.providers = providers
         self._mailto = (os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip()
 
     def fetch(
         self, title: str | None, doi: str | None, url: str | None = None
     ) -> AbstractResult | None:
+        if self.cache is not None:
+            cached = self.cache.get_abstract(title, doi)
+            if cached is not None:
+                # A cached miss (no provider had an abstract) is remembered so
+                # re-runs don't pay the full no-hit chain cost again.
+                if not cached.get("abstract") or cached.get("provider") == "miss":
+                    return None
+                return AbstractResult(
+                    cached.get("abstract", ""),
+                    cached.get("provider", "cache"),
+                    cached.get("source_url", ""),
+                )
         for provider in self.providers:
             handler = getattr(self, f"_{provider}", None)
             if handler is None:
@@ -64,7 +89,19 @@ class AbstractEnricher:
             except Exception:
                 result = None
             if result is not None:
+                if self.cache is not None:
+                    self.cache.set_abstract(
+                        title,
+                        doi,
+                        {
+                            "abstract": result.abstract,
+                            "provider": result.provider,
+                            "source_url": result.source_url,
+                        },
+                    )
                 return result
+        if self.cache is not None:
+            self.cache.set_abstract(title, doi, {"abstract": "", "provider": "miss", "source_url": ""})
         return None
 
     def _openalex(
@@ -146,6 +183,67 @@ class AbstractEnricher:
             return AbstractResult(abstract, "usenix", url)
         return None
 
+    def _arxiv(
+        self, title: str | None, doi: str | None, url: str | None = None
+    ) -> AbstractResult | None:
+        """Search arXiv by title and return the abstract for a matching preprint.
+
+        arXiv's API has no DOI lookup for non-arXiv DOIs, so we query by title
+        words and guard with a title match (arXiv's relevance ranking otherwise
+        returns an unrelated top hit). Helps preprint-heavy systems papers; ACM
+        measurement papers are rarely on arXiv.
+        """
+        if not title or not title.strip():
+            return None
+        words = re.findall(r"[A-Za-z0-9]+", title)
+        if not words:
+            return None
+        query = " AND ".join(f"all:{word}" for word in words[:8])
+        source_url = "https://export.arxiv.org/api/query?" + urlencode(
+            {"search_query": query, "max_results": "1"}
+        )
+        xml = self.fetch_text(source_url)
+        if not xml:
+            return None
+        entry = _ARXIV_ENTRY_RE.search(xml)
+        if not entry:
+            return None
+        block = entry.group(1)
+        cand_title = _ARXIV_TITLE_RE.search(block)
+        cand_summary = _ARXIV_SUMMARY_RE.search(block)
+        if not cand_title or not cand_summary:
+            return None
+        if not title_matches(title, _WS_RE.sub(" ", cand_title.group(1)).strip()):
+            return None
+        abstract = _WS_RE.sub(" ", cand_summary.group(1)).strip()
+        if abstract and len(abstract) >= _MIN_ABSTRACT_CHARS:
+            return AbstractResult(abstract, "arxiv", source_url)
+        return None
+
+    def _acm(
+        self, title: str | None, doi: str | None, url: str | None = None
+    ) -> AbstractResult | None:
+        """Best-effort ACM Digital Library abstract scrape via a headless browser.
+
+        ACM (IMC/SIGCOMM/MobiCom) paywalls full text and, crucially, sits behind
+        Cloudflare bot protection that blocks plain HTTP *and* automated browsers
+        in most environments. This provider is therefore **opt-in** (set
+        ``WIRELESS_TAXONOMY_ACM_BROWSER=1`` and install the optional ``[acm]``
+        extra) and degrades to ``None`` when the challenge can't be cleared, so
+        it never breaks the chain. The abstract lives in the ``#abstract`` block
+        of the ``/doi/abs/<doi>`` page.
+        """
+        if not doi:
+            return None
+        page_url = f"https://dl.acm.org/doi/abs/{quote(doi, safe='')}"
+        html = _fetch_acm_browser(page_url)
+        if not html:
+            return None
+        abstract = _acm_abstract(html)
+        if abstract and len(abstract) >= _MIN_ABSTRACT_CHARS:
+            return AbstractResult(abstract, "acm", page_url)
+        return None
+
     def _with_mailto(self, url: str) -> str:
         if not self._mailto:
             return url
@@ -162,14 +260,30 @@ class DoiResolver:
     must match the query title (guards against the API returning a near-miss).
     """
 
-    def __init__(self, fetch_json: FetchJson | None = None, providers: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        fetch_json: FetchJson | None = None,
+        providers: list[str] | None = None,
+        cache: Any | None = None,
+    ) -> None:
         self.fetch_json = fetch_json or _default_fetch_json
         self.providers = providers or ["crossref", "openalex"]
+        self.cache = cache
         self._mailto = (os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip()
 
     def resolve(self, title: str | None) -> DoiResult | None:
         if not title or not title.strip():
             return None
+        if self.cache is not None:
+            cached = self.cache.get_doi(title)
+            if cached is not None:
+                if not cached.get("doi") or cached.get("provider") == "miss":
+                    return None  # remembered miss: don't re-query
+                return DoiResult(
+                    cached.get("doi", ""),
+                    cached.get("provider", "cache"),
+                    cached.get("source_url", ""),
+                )
         for provider in self.providers:
             handler = getattr(self, f"_{provider}", None)
             if handler is None:
@@ -179,7 +293,18 @@ class DoiResolver:
             except Exception:
                 result = None
             if result is not None:
+                if self.cache is not None:
+                    self.cache.set_doi(
+                        title,
+                        {
+                            "doi": result.doi,
+                            "provider": result.provider,
+                            "source_url": result.source_url,
+                        },
+                    )
                 return result
+        if self.cache is not None:
+            self.cache.set_doi(title, {"doi": "", "provider": "miss", "source_url": ""})
         return None
 
     def _crossref(self, title: str) -> DoiResult | None:
@@ -359,3 +484,91 @@ def _usenix_abstract(html: str) -> str:
             text = text[:idx]
     text = _USENIX_VENUE_TAIL_RE.sub("", text.strip())
     return text.strip()
+
+
+_ACM_ABS_META_RE = re.compile(
+    r'<meta[^>]+name=["\'](?:dc\.Description|description)["\'][^>]+content=["\'](.*?)["\']',
+    re.IGNORECASE | re.DOTALL,
+)
+_ACM_ABS_BLOCK_RE = re.compile(
+    r'(?:id=["\']abstract["\']|class=["\'][^"\']*abstractInFull[^"\']*["\'])(.*?)</section>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _acm_browser_enabled() -> bool:
+    return (os.getenv("WIRELESS_TAXONOMY_ACM_BROWSER") or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _acm_abstract(html: str) -> str:
+    """Pull the abstract from an ACM Digital Library paper page's HTML."""
+    if not html:
+        return ""
+    block = _ACM_ABS_BLOCK_RE.search(html)
+    if block:
+        text = _strip_jats(block.group(1))
+        if len(text) >= _MIN_ABSTRACT_CHARS:
+            return text
+    meta = _ACM_ABS_META_RE.search(html)
+    if meta:
+        return _strip_jats(meta.group(1))
+    return ""
+
+
+def _acm_chrome_executable() -> str | None:
+    """Locate a Chrome/Chromium binary Playwright can drive, if any."""
+    import glob
+    import shutil
+
+    explicit = (os.getenv("WIRELESS_TAXONOMY_CHROME_PATH") or "").strip()
+    if explicit and os.path.exists(explicit):
+        return explicit
+    candidates = sorted(
+        glob.glob("/opt/.devin/chrome/chrome/*/chrome-linux64/chrome"), reverse=True
+    )
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _fetch_acm_browser(url: str) -> str:
+    """Load an ACM page in a headless browser and return its HTML.
+
+    Returns ``""`` when Playwright isn't installed, no Chrome is found, or the
+    Cloudflare bot challenge can't be cleared (the common case) -- so the ACM
+    provider degrades gracefully instead of raising.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return ""
+    chrome = _acm_chrome_executable()
+    timeout_ms = int(os.getenv("WIRELESS_TAXONOMY_ACM_TIMEOUT_MS", "60000"))
+    launch_kwargs: dict[str, Any] = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    }
+    if chrome:
+        launch_kwargs["executable_path"] = chrome
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(**launch_kwargs)
+            try:
+                page = browser.new_page(user_agent=_BROWSER_UA)
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                for _ in range(6):
+                    page.wait_for_timeout(2000)
+                    if "just a moment" not in (page.title() or "").lower():
+                        break
+                if "just a moment" in (page.title() or "").lower():
+                    return ""  # Cloudflare challenge not cleared
+                return page.content() or ""
+            finally:
+                browser.close()
+    except Exception:
+        return ""

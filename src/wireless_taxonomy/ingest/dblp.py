@@ -28,6 +28,33 @@ _DBLP_STREAMS = {
 _DOI_RE = re.compile(r"10\.\d{4,9}/\S+")
 _DISAMBIGUATION_RE = re.compile(r"\s+\d{4}$")
 
+# Non-main-track entries DBLP lists alongside full papers. These are short
+# poster/demo/workshop/keynote records that aren't peer-reviewed main-track
+# papers, so they pollute the proceedings "universe" and inflate false
+# positives. They're almost always flagged by a leading title token.
+_NON_PAPER_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    r"poster|demo|demonstration|work[\s-]?in[\s-]?progress|wip|"
+    r"tutorial|keynote|panel|invited\s+(?:talk|paper|speaker)|"
+    r"extended\s+abstract|abstract|short\s+paper|"
+    r"birds[\s-]of[\s-]a[\s-]feather|bof|"
+    r"workshop\s+(?:summary|report)|session\s+details|"
+    r"front\s+matter|table\s+of\s+contents|proceedings\s+of"
+    r")\b\s*[:\-\u2013\u2014]",
+    re.IGNORECASE,
+)
+
+
+def is_non_paper_title(title: str) -> bool:
+    """True for posters/demos/workshop/keynote records (not main-track papers).
+
+    DBLP TOCs interleave these short non-paper entries with full papers; they
+    carry a leading marker like ``Poster:`` / ``Demo:`` / ``Keynote:``. Dropping
+    them at ingest keeps the proceedings universe to peer-reviewed main-track
+    papers so the eval isn't penalised by non-paper false positives.
+    """
+    return bool(_NON_PAPER_PREFIX_RE.match(title or ""))
+
 
 def resolve_stream(venue: str) -> str | None:
     """Return the DBLP stream for a venue, or None if it has no mapping."""
@@ -85,6 +112,8 @@ class DblpIngestAdapter(IngestAdapter):
             title = (info.get("title") or "").rstrip(".").strip()
             if not title:
                 continue
+            if is_non_paper_title(title):
+                continue  # poster/demo/workshop/keynote record, not main-track
             authors = _authors(info)
             doi = _doi(info)
             ee = info.get("ee") if isinstance(info.get("ee"), str) else ""

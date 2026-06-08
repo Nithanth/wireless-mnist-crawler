@@ -12,8 +12,11 @@ so we can quantify how well the automated path reproduces the manual curation.
 
 Because ACM/IEEE block automated full-text fetching, the workflow is
 deliberately metadata-only: it works from **DBLP** (authoritative paper list:
-title/authors/DOI) plus **OpenAlex/Crossref/Semantic Scholar** (abstracts), and
-compares on title + abstract. Data is persisted in SQLite.
+title/authors/DOI) plus **OpenAlex/Crossref/Semantic Scholar/arXiv** (abstracts,
+with a USENIX page-scrape fallback and an opt-in ACM scrape), and compares on
+title + abstract. Resolved abstracts/DOIs are cached to disk so re-runs are
+fast and deterministic, and DBLP poster/demo/workshop records are dropped at
+ingest so they don't pollute the proceedings set. Data is persisted in SQLite.
 
 ---
 
@@ -43,11 +46,17 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli --help
 
 ### 1. `classify` — loop a conference and label every paper
 
-Pulls the accepted-paper list from DBLP, backfills missing DOIs + abstracts
-(OpenAlex/Crossref/Semantic Scholar, with a USENIX page-scrape fallback for
-NSDI/OSDI/ATC/Security), classifies each paper as wireless from title+abstract,
-and prints a **yes/maybe/no breakdown** (counts + % of the conference set). No
-gold sheet involved.
+Pulls the accepted-paper list from DBLP (dropping poster/demo/workshop/keynote
+records so only main-track papers remain), backfills missing DOIs + abstracts,
+classifies each paper as wireless from title+abstract, and prints a
+**yes/maybe/no breakdown** (counts + % of the conference set). No gold sheet
+involved.
+
+The abstract provider chain is tried in order: **OpenAlex → Crossref → Semantic
+Scholar → USENIX page-scrape** (NSDI/OSDI/ATC/Security) **→ arXiv** (title
+search, for preprints). An **ACM Digital Library** scrape is available as an
+opt-in last resort for IMC/SIGCOMM/MobiCom — it's off by default because ACM is
+Cloudflare-protected (see *Abstract caching & providers* below).
 
 ```bash
 PYTHONPATH=src python3 -m wireless_taxonomy.cli classify \
@@ -72,6 +81,12 @@ NSDI 2024 — 112 papers (abstracts: 112/112, 100%)
   exactly what `eval` consumes.
 - `--source bibtex|csv|url --source-value <path-or-url>` swaps the paper-list
   source away from DBLP; `--no-resolve-dois` skips the programmatic DOI backfill.
+- Resolved abstracts/DOIs are cached to `--cache-path` (default `.wt_cache.json`)
+  so a re-run reads from disk instead of re-hitting the metadata APIs — the cold
+  run is network-bound (~10s per paper that misses every provider), but a warm
+  re-run is near-instant and deterministic. **Misses are cached too**, so the
+  expensive no-hit papers aren't retried. Pass `--no-cache` to disable, or
+  delete the cache file to force a full refresh (e.g. after enabling ACM).
 
 ### 2. `eval` — DB-free snapshot scoring vs a gold sheet
 
@@ -96,6 +111,21 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli eval \
 - Repeat `--classified` / `--gold` to union multiple files. Only conferences
   present in the classified CSV(s) are scored — unrun venue-years in the sheet
   are ignored, not penalised.
+
+### Abstract caching & providers
+
+- **Cache.** `classify` keeps a JSON index (`--cache-path`, default
+  `.wt_cache.json`) of resolved abstracts and DOIs, keyed by DOI and by
+  normalized title. It's read before any network call and written incrementally,
+  so interrupted runs keep their progress and re-runs are fast and reproducible.
+- **arXiv.** Tried last in the abstract chain via a title search (guarded by a
+  title match). Helpful for preprint-heavy systems papers; ACM measurement
+  papers are rarely on arXiv, so yield there is low.
+- **ACM (opt-in).** ACM paywalls full text *and* sits behind Cloudflare bot
+  protection that blocks plain HTTP and headless browsers in most environments,
+  so it's **off by default**. To attempt it: `pip install -e ".[acm]" &&
+  playwright install chromium`, then set `WIRELESS_TAXONOMY_ACM_BROWSER=1`. It
+  degrades to a no-op (never raises) when the challenge can't be cleared.
 
 The same logic is importable:
 `from wireless_taxonomy.eval.standalone import eval_files`.

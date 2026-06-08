@@ -91,7 +91,9 @@ def test_enricher_usenix_skipped_for_non_usenix_url() -> None:
 
     enricher = AbstractEnricher(fetch_json=lambda url: {}, fetch_text=fetch_text)
     assert enricher.fetch("Title", None, "https://dblp.org/db/conf/nsdi/nsdi2024.html") is None
-    assert calls == []  # never fetched the page for a non-USENIX URL
+    # The USENIX provider never fetches a non-USENIX page; only arXiv's title
+    # search may use fetch_text (against export.arxiv.org), never the DBLP URL.
+    assert all("dblp.org" not in url for url in calls)
 
 
 def test_enricher_usenix_rejects_title_mismatch() -> None:
@@ -190,3 +192,110 @@ def test_enrich_abstracts_pipeline_backfills_missing_dois(tmp_path: Path) -> Non
     finally:
         pipeline.close()
     assert all(d == "10.9999/backfilled" for d in dois)
+
+
+_ARXIV_XML = """<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <title>Massive MIMO Beamforming for Wireless Sensing</title>
+    <summary>We present a wireless sensing system that uses massive MIMO
+    beamforming and CSI features to localize devices indoors.</summary>
+  </entry>
+</feed>"""
+
+
+def test_enricher_arxiv_matches_title_and_returns_abstract() -> None:
+    enricher = AbstractEnricher(
+        fetch_json=lambda url: {},  # OpenAlex/Crossref/S2 empty
+        fetch_text=lambda url: _ARXIV_XML if "arxiv.org" in url else "",
+    )
+    result = enricher.fetch("Massive MIMO Beamforming for Wireless Sensing", None)
+    assert result is not None
+    assert result.provider == "arxiv"
+    assert "CSI features" in result.abstract
+
+
+def test_enricher_arxiv_rejects_title_mismatch() -> None:
+    enricher = AbstractEnricher(
+        fetch_json=lambda url: {},
+        fetch_text=lambda url: _ARXIV_XML if "arxiv.org" in url else "",
+    )
+    # arXiv's top hit is unrelated -> the title guard rejects it.
+    assert enricher.fetch("A Completely Different Optical Networking Paper", None) is None
+
+
+def test_cache_roundtrip(tmp_path: Path) -> None:
+    from wireless_taxonomy.analyze.cache import MetadataCache
+
+    path = tmp_path / "cache.json"
+    cache = MetadataCache(path)
+    cache.set_abstract("Some Title", "10.1/abc", {"abstract": "X" * 50, "provider": "openalex", "source_url": "u"})
+    cache.set_doi("Other Title", {"doi": "10.2/def", "provider": "crossref", "source_url": "u2"})
+    cache.save()
+    assert path.exists()
+
+    reloaded = MetadataCache(path)
+    # Hit by DOI and by normalized (case-insensitive) title.
+    assert reloaded.get_abstract(None, "10.1/ABC")["abstract"] == "X" * 50
+    assert reloaded.get_abstract("some title", None)["provider"] == "openalex"
+    assert reloaded.get_doi("OTHER TITLE")["doi"] == "10.2/def"
+
+
+def test_enricher_cache_short_circuits_network(tmp_path: Path) -> None:
+    from wireless_taxonomy.analyze.cache import MetadataCache
+
+    cache = MetadataCache(tmp_path / "c.json")
+    calls: list[str] = []
+
+    def counting_fetch(url: str) -> dict:
+        calls.append(url)
+        long = "A wireless CSI sensing abstract with enough characters to pass. " * 2
+        return {"message": {"abstract": long}} if "crossref" in url else {}
+
+    enricher = AbstractEnricher(fetch_json=counting_fetch, fetch_text=lambda url: "", cache=cache)
+    first = enricher.fetch("Cached Paper", "10.1/cached")
+    assert first is not None and first.provider == "crossref"
+    n_after_first = len(calls)
+
+    # Second fetch for the same paper must hit the cache, not the network.
+    second = enricher.fetch("Cached Paper", "10.1/cached")
+    assert second is not None
+    assert second.abstract == first.abstract
+    assert len(calls) == n_after_first  # no additional network calls
+
+
+def test_enricher_caches_and_short_circuits_misses(tmp_path: Path) -> None:
+    from wireless_taxonomy.analyze.cache import MetadataCache
+
+    cache = MetadataCache(tmp_path / "miss.json")
+    calls: list[str] = []
+
+    enricher = AbstractEnricher(
+        fetch_json=lambda url: (calls.append(url) or {}),  # every provider misses
+        fetch_text=lambda url: (calls.append(url) or ""),
+        cache=cache,
+    )
+    assert enricher.fetch("Unfindable Paper", "10.1/none") is None
+    n = len(calls)
+    assert n > 0  # the first attempt hit the network
+
+    # Second attempt for the same paper must be served from the negative cache.
+    assert enricher.fetch("Unfindable Paper", "10.1/none") is None
+    assert len(calls) == n  # no further network calls
+
+
+def test_acm_abstract_parses_block_and_meta() -> None:
+    from wireless_taxonomy.analyze.abstracts import _acm_abstract
+
+    block_html = (
+        '<section id="abstract"><div role="paragraph">'
+        "This paper measures 5G performance in the wild across many cities and operators."
+        "</div></section>"
+    )
+    assert "5G performance" in _acm_abstract(block_html)
+
+    meta_html = (
+        '<meta name="dc.Description" content="A measurement study of Starlink LEO latency over time.">'
+    )
+    assert "Starlink" in _acm_abstract(meta_html)
+    assert _acm_abstract("<html>no abstract here</html>") == ""

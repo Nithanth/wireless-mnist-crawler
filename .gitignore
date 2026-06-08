@@ -10,6 +10,8 @@ build/
 dist/
 taxonomy.sqlite
 *.sqlite
+.wt_cache.json
+*.wt_cache.json
 *.sqlite3
 *.db
 evidence/
