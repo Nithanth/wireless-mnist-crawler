@@ -52,11 +52,14 @@ classifies each paper as wireless from title+abstract, and prints a
 **yes/maybe/no breakdown** (counts + % of the conference set). No gold sheet
 involved.
 
-The abstract provider chain is tried in order: **OpenAlex → Crossref → Semantic
-Scholar → USENIX page-scrape** (NSDI/OSDI/ATC/Security) **→ arXiv** (title
-search, for preprints). An **ACM Digital Library** scrape is available as an
-opt-in last resort for IMC/SIGCOMM/MobiCom — it's off by default because ACM is
-Cloudflare-protected (see *Abstract caching & providers* below).
+Abstracts are first **batch-fetched by DOI from Semantic Scholar** in one
+request per conference (the single biggest coverage lever — see *Abstract
+caching & providers* below), then any still-missing paper falls through a
+per-paper provider chain tried in order: **USENIX page-scrape**
+(NSDI/OSDI/ATC/Security) **→ OpenAlex → Crossref → Semantic Scholar → arXiv**
+(title search, for preprints). An **ACM Digital Library** scrape is available as
+an opt-in last resort for IMC/SIGCOMM/MobiCom — it's off by default because ACM
+is Cloudflare-protected (see *Abstract caching & providers* below).
 
 ```bash
 PYTHONPATH=src python3 -m wireless_taxonomy.cli classify \
@@ -81,12 +84,16 @@ NSDI 2024 — 112 papers (abstracts: 112/112, 100%)
   exactly what `eval` consumes.
 - `--source bibtex|csv|url --source-value <path-or-url>` swaps the paper-list
   source away from DBLP; `--no-resolve-dois` skips the programmatic DOI backfill.
-- Resolved abstracts/DOIs are cached to `--cache-path` (default `.wt_cache.json`)
-  so a re-run reads from disk instead of re-hitting the metadata APIs — the cold
-  run is network-bound (~10s per paper that misses every provider), but a warm
+- Resolved abstracts/DOIs **and LLM labels** are cached to `--cache-path`
+  (default `.wt_cache.json`) so a re-run reads from disk instead of re-hitting
+  the metadata APIs or the LLM — the cold run is network-bound, but a warm
   re-run is near-instant and deterministic. **Misses are cached too**, so the
   expensive no-hit papers aren't retried. Pass `--no-cache` to disable, or
   delete the cache file to force a full refresh (e.g. after enabling ACM).
+- LLM labels are keyed by a hash of the exact prompt (title + abstract) and the
+  model identity, so a re-run reuses each saved label **unless the title,
+  abstract, or model changed**. Pass `--refresh-llm` to ignore cached labels and
+  re-call the model (a fresh classification).
 
 ### 2. `eval` — DB-free snapshot scoring vs a gold sheet
 
@@ -115,9 +122,18 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli eval \
 ### Abstract caching & providers
 
 - **Cache.** `classify` keeps a JSON index (`--cache-path`, default
-  `.wt_cache.json`) of resolved abstracts and DOIs, keyed by DOI and by
-  normalized title. It's read before any network call and written incrementally,
-  so interrupted runs keep their progress and re-runs are fast and reproducible.
+  `.wt_cache.json`) with three sections — resolved `abstracts` and `dois` (keyed
+  by DOI and normalized title) and `llm` labels (keyed by prompt+model hash). It's
+  read before any network/LLM call and written incrementally, so interrupted runs
+  keep their progress and re-runs are fast and reproducible.
+- **Semantic Scholar batch.** Before the per-paper loop, `classify` sends all
+  DOIs for the conference to Semantic Scholar's batch endpoint in one request.
+  This is what closes the ACM-venue gap: per-paper GETs get 429-throttled on a
+  shared egress IP and silently drop most abstracts (IMC 2024 measured ~46%),
+  whereas the single batched call recovers them all (IMC 2024 → 100%). Set
+  `SEMANTIC_SCHOLAR_API_KEY` (a free key) to remove shared-IP throttling
+  entirely; it's optional — the batch call works without one. Retryable
+  responses honor the server's `Retry-After` header instead of failing.
 - **arXiv.** Tried last in the abstract chain via a title search (guarded by a
   title match). Helpful for preprint-heavy systems papers; ACM measurement
   papers are rarely on arXiv, so yield there is low.

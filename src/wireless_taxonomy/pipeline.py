@@ -92,6 +92,17 @@ class Pipeline:
             "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
         ).fetchall()
         source_urls = self._paper_source_urls(conference_instance_id)
+        # Batch-fetch abstracts by DOI up front in a single Semantic Scholar
+        # request. One batched call per conference is dramatically more reliable
+        # than one GET per paper, which gets 429-throttled on a shared IP and
+        # silently drops most abstracts (notably ACM venues like IMC/SIGCOMM).
+        batch_items = [
+            (paper["title"], (paper["doi"] or "").strip())
+            for paper in rows
+            if (paper["doi"] or "").strip() and (overwrite or not (paper["abstract"] or "").strip())
+        ]
+        if batch_items and hasattr(enricher, "prefetch_semantic_scholar"):
+            enricher.prefetch_semantic_scholar(batch_items)
         filled = 0
         attempted = 0
         dois_resolved = 0
@@ -159,17 +170,29 @@ class Pipeline:
         )
         return stage_run_id
 
-    def classify_candidates(self, run_id: int, use_llm: bool = False) -> int:
+    def classify_candidates(
+        self,
+        run_id: int,
+        use_llm: bool = False,
+        cache=None,
+        refresh_llm: bool = False,
+    ) -> int:
         """Wireless-candidate screening from title + abstract only.
 
         Stores per-paper label (yes/no/maybe) plus high-pass (yes) and low-pass
         (yes|maybe) filter flags for later Jaccard evaluation against a gold set.
+        When ``cache`` is supplied, LLM labels are read from / written to it so a
+        re-run reuses saved labels (unless ``refresh_llm`` forces fresh calls).
         """
         source_run = self._require_run(run_id)
         conference_instance_id = source_run["conference_instance_id"]
         stage_run_id = self._create_run(conference_instance_id, "classify-candidates", "run", str(run_id))
         logger = EvidenceLogger(self.settings.evidence_dir, stage_run_id)
-        classifier = LlmCandidateClassifier(self.settings.llm) if use_llm else KeywordCandidateClassifier()
+        classifier = (
+            LlmCandidateClassifier(self.settings.llm, cache=cache, refresh=refresh_llm)
+            if use_llm
+            else KeywordCandidateClassifier()
+        )
         rows = self.conn.execute(
             "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
         ).fetchall()
@@ -203,6 +226,8 @@ class Pipeline:
                 f"Classified {len(rows)} papers via {classifier.classifier}; "
                 f"yes={counts['yes']} maybe={counts['maybe']} no={counts['no']}.",
             )
+        if cache is not None:
+            cache.save()
         logger.event(
             "classify_candidates_completed",
             {"classifier": classifier.classifier, "paper_count": len(rows), "labels": counts},
@@ -218,6 +243,7 @@ class Pipeline:
         source_type: str = "dblp",
         source_value: str | None = None,
         cache=None,
+        refresh_llm: bool = False,
     ) -> dict:
         """Sheet-free classification loop for a single venue/year.
 
@@ -231,7 +257,9 @@ class Pipeline:
         """
         ingest_run = self.ingest(venue, year, source_type, source_value or "")
         self.enrich_abstracts(ingest_run, resolve_dois=resolve_dois, cache=cache)
-        classify_run = self.classify_candidates(ingest_run, use_llm=use_llm)
+        classify_run = self.classify_candidates(
+            ingest_run, use_llm=use_llm, cache=cache, refresh_llm=refresh_llm
+        )
         classifier = "llm" if use_llm else "keyword"
         conference_instance_id = self._require_run(ingest_run)["conference_instance_id"]
         rows = self.conn.execute(

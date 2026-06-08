@@ -35,16 +35,20 @@ class MetadataCache:
 
         {
           "abstracts": {"<key>": {"abstract": ..., "provider": ..., "source_url": ...}},
-          "dois":      {"<title-key>": {"doi": ..., "provider": ..., "source_url": ...}}
+          "dois":      {"<title-key>": {"doi": ..., "provider": ..., "source_url": ...}},
+          "llm":       {"<content+model-hash>": {"label": ..., "confidence": ..., "evidence": ..., "model_version": ...}}
         }
 
-    Keys are ``doi:<doi>`` (preferred) or ``title:<normalized-title>``.
+    Keys are ``doi:<doi>`` (preferred) or ``title:<normalized-title>``; LLM labels
+    are keyed by a hash of the exact prompt (title+abstract) and model identity,
+    so a re-run reuses the saved label unless the inputs or model changed.
     """
 
     def __init__(self, path: str | os.PathLike[str] | None) -> None:
         self.path = Path(path) if path else None
         self.abstracts: dict[str, dict[str, str]] = {}
         self.dois: dict[str, dict[str, str]] = {}
+        self.llm: dict[str, dict[str, Any]] = {}
         self.dirty = False
         if self.path is not None and self.path.exists():
             self._load()
@@ -58,10 +62,13 @@ class MetadataCache:
         if isinstance(data, dict):
             abstracts = data.get("abstracts")
             dois = data.get("dois")
+            llm = data.get("llm")
             if isinstance(abstracts, dict):
                 self.abstracts = {k: v for k, v in abstracts.items() if isinstance(v, dict)}
             if isinstance(dois, dict):
                 self.dois = {k: v for k, v in dois.items() if isinstance(v, dict)}
+            if isinstance(llm, dict):
+                self.llm = {k: v for k, v in llm.items() if isinstance(v, dict)}
 
     # -- abstracts -----------------------------------------------------------
 
@@ -92,6 +99,16 @@ class MetadataCache:
             self.dois[key] = value
             self.dirty = True
 
+    # -- LLM labels ----------------------------------------------------------
+
+    def get_llm(self, key: str) -> dict[str, Any] | None:
+        return self.llm.get(key) if key else None
+
+    def set_llm(self, key: str, value: dict[str, Any]) -> None:
+        if key:
+            self.llm[key] = value
+            self.dirty = True
+
     # -- persistence ---------------------------------------------------------
 
     def save(self) -> None:
@@ -99,7 +116,7 @@ class MetadataCache:
         if self.path is None or not self.dirty:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload: dict[str, Any] = {"abstracts": self.abstracts, "dois": self.dois}
+        payload: dict[str, Any] = {"abstracts": self.abstracts, "dois": self.dois, "llm": self.llm}
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -111,4 +128,4 @@ class MetadataCache:
         self.dirty = False
 
     def stats(self) -> dict[str, int]:
-        return {"abstracts": len(self.abstracts), "dois": len(self.dois)}
+        return {"abstracts": len(self.abstracts), "dois": len(self.dois), "llm": len(self.llm)}
