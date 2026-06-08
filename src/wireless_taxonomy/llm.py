@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -137,21 +138,34 @@ def _google_complete(provider: ProviderConfig, request: LlmRequest) -> str:
     return "\n".join(part.get("text", "") for part in parts).strip()
 
 
+_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
 def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
-    request = Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=int(os.getenv("WIRELESS_TAXONOMY_LLM_TIMEOUT_SECONDS", "120"))) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:1000]
-        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-    except URLError as exc:
-        raise RuntimeError(str(exc)) from exc
+    timeout = int(os.getenv("WIRELESS_TAXONOMY_LLM_TIMEOUT_SECONDS", "120"))
+    attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_LLM_MAX_RETRIES", "4")))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        request = Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
+            if exc.code not in _RETRYABLE_STATUS:
+                raise last_error from exc
+        except URLError as exc:
+            last_error = RuntimeError(str(exc))
+        if attempt + 1 < attempts:
+            time.sleep(min(2.0 * (2**attempt), 30.0))
+    assert last_error is not None
+    raise last_error
 
 
 def _parse_json_content(content: str) -> dict[str, Any] | list[Any] | None:
