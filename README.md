@@ -168,6 +168,23 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli eval-overlap --classifier keywor
 `eval-overlap` reports per-conference and overall `jaccard / precision / recall /
 f1` (`--pass low` counts `yes|maybe`; `--classifier llm` scores the LLM labels).
 
+Two reporting flags:
+
+- `--drop-workshops` — drop curated papers that are absent from the ingested main
+  proceedings (i.e. co-located workshop papers) from the calculation, so they
+  don't count as misses. They're still listed separately under "dropped workshop
+  papers" so you can see exactly what was excluded. Default is `--keep-workshops`.
+- `--md results.md` — write a readable Markdown report (overall table, per
+  conference-year + per-venue tables, and the per-conference discrepancy lists:
+  false positives, classifier misses, and dropped/missing papers). Pair with
+  `--out results.json` for the machine-readable version.
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli eval-overlap \
+  --classifier llm --pass high --drop-workshops \
+  --out results.json --md results.md --db taxonomy.sqlite
+```
+
 ### Full taxonomy pipeline
 
 The original end-to-end pipeline (text enrichment → analysis → dataset
