@@ -131,6 +131,7 @@ class Pipeline:
         rows = self.conn.execute(
             "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
         ).fetchall()
+        source_urls = self._paper_source_urls(conference_instance_id)
         filled = 0
         attempted = 0
         dois_resolved = 0
@@ -158,7 +159,7 @@ class Pipeline:
                 if existing and not overwrite:
                     continue
                 attempted += 1
-                result = enricher.fetch(paper["title"], doi or None)
+                result = enricher.fetch(paper["title"], doi or None, source_urls.get(paper["id"]))
                 if result is None:
                     continue
                 self.conn.execute("UPDATE papers SET abstract = ? WHERE id = ?", (result.abstract, paper["id"]))
@@ -537,6 +538,33 @@ class Pipeline:
         if row is None:
             raise ValueError(f"Run {run_id} not found")
         return row
+
+    def _paper_source_urls(self, conference_instance_id: int) -> dict[str, str]:
+        """Map each paper to a source URL for page-scrape abstract fallbacks.
+
+        Prefers a publisher landing page (e.g. the USENIX paper page DBLP links
+        via ``ee``) over the generic DBLP TOC URL, so the USENIX abstract
+        provider gets the per-paper page it needs.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT ps.paper_id AS paper_id, ps.source_url AS source_url
+            FROM paper_sources ps
+            JOIN papers p ON p.id = ps.paper_id
+            WHERE p.conference_instance_id = ?
+            ORDER BY ps.id
+            """,
+            (conference_instance_id,),
+        ).fetchall()
+        urls: dict[str, str] = {}
+        for row in rows:
+            url = (row["source_url"] or "").strip()
+            if not url:
+                continue
+            current = urls.get(row["paper_id"])
+            if current is None or ("usenix.org" in url and "usenix.org" not in current):
+                urls[row["paper_id"]] = url
+        return urls
 
 
     def _upsert_paper(self, conference_instance_id: int, seed: PaperSeed) -> int:

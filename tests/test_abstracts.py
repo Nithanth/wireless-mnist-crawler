@@ -6,6 +6,7 @@ from wireless_taxonomy.analyze.abstracts import (
     _normalize_doi_url,
     _openalex_abstract,
     _strip_jats,
+    _usenix_abstract,
 )
 from wireless_taxonomy.config import load_settings
 from wireless_taxonomy.pipeline import Pipeline
@@ -42,6 +43,65 @@ def test_enricher_tries_providers_in_order() -> None:
 def test_enricher_returns_none_when_no_provider_has_abstract() -> None:
     enricher = AbstractEnricher(fetch_json=lambda url: {})
     assert enricher.fetch("Title", "10.1/x") is None
+
+
+_USENIX_HTML = """
+<html><head><title>Flow Scheduling | USENIX</title></head><body>
+<h1 class="title">Flow Scheduling with Imprecise Knowledge</h1>
+<div class="field field-name-field-paper-person">Wenxin Li, Tianjin University</div>
+<div class="field field-name-field-paper-description field-type-text-long field-label-hidden">
+<div class="field-items"><div class="field-item odd"><p>We present QCLIMB, a new flow
+scheduling solution designed to minimize FCT by utilizing imprecise flow information
+from machine learning techniques.</p></div></div></div>
+<div class="bibtex-accordion">BibTeX @inproceedings{li, title={...}} NSDI '24 Open Access</div>
+</body></html>
+"""
+
+
+def test_usenix_abstract_extraction_strips_tags_and_trailers() -> None:
+    abstract = _usenix_abstract(_USENIX_HTML)
+    assert abstract.startswith("We present QCLIMB")
+    assert abstract.endswith("machine learning techniques.")
+    assert "BibTeX" not in abstract
+    assert "Open Access" not in abstract
+    assert "field-name" not in abstract
+
+
+def test_enricher_usenix_fallback_used_when_apis_empty() -> None:
+    enricher = AbstractEnricher(
+        fetch_json=lambda url: {},  # OpenAlex/Crossref/S2 all empty
+        fetch_text=lambda url: _USENIX_HTML,
+    )
+    result = enricher.fetch(
+        "Flow Scheduling with Imprecise Knowledge",
+        None,
+        "https://www.usenix.org/conference/nsdi24/presentation/li-wenxin",
+    )
+    assert result is not None
+    assert result.provider == "usenix"
+    assert "QCLIMB" in result.abstract
+
+
+def test_enricher_usenix_skipped_for_non_usenix_url() -> None:
+    calls: list[str] = []
+
+    def fetch_text(url: str) -> str:
+        calls.append(url)
+        return _USENIX_HTML
+
+    enricher = AbstractEnricher(fetch_json=lambda url: {}, fetch_text=fetch_text)
+    assert enricher.fetch("Title", None, "https://dblp.org/db/conf/nsdi/nsdi2024.html") is None
+    assert calls == []  # never fetched the page for a non-USENIX URL
+
+
+def test_enricher_usenix_rejects_title_mismatch() -> None:
+    enricher = AbstractEnricher(fetch_json=lambda url: {}, fetch_text=lambda url: _USENIX_HTML)
+    result = enricher.fetch(
+        "A Totally Unrelated Antenna Paper",
+        None,
+        "https://www.usenix.org/conference/nsdi24/presentation/li-wenxin",
+    )
+    assert result is None
 
 
 def test_doi_resolver_crossref_first_then_openalex() -> None:
@@ -90,7 +150,7 @@ def test_enrich_abstracts_pipeline_fills_missing(tmp_path: Path) -> None:
     db = tmp_path / "taxonomy.sqlite"
 
     class FakeEnricher:
-        def fetch(self, title, doi):
+        def fetch(self, title, doi, url=None):
             from wireless_taxonomy.analyze.abstracts import AbstractResult
 
             return AbstractResult("Backfilled wireless abstract about CSI.", "openalex", "http://x")
@@ -111,7 +171,7 @@ def test_enrich_abstracts_pipeline_backfills_missing_dois(tmp_path: Path) -> Non
     db = tmp_path / "taxonomy.sqlite"
 
     class FakeEnricher:
-        def fetch(self, title, doi):
+        def fetch(self, title, doi, url=None):
             return None
 
     class FakeResolver:
