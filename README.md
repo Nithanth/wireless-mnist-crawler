@@ -136,15 +136,23 @@ separate DBs or runs), then:
 PYTHONPATH=src python3 -m wireless_taxonomy.cli diff-sets \
   --a url_llm.csv --b dblp_openalex.csv \
   --label-a "URL+LLM" --label-b "DBLP+OpenAlex" \
-  --out diff.json --csv diff.csv
+  --reference b --out diff.json --csv diff.csv
 ```
 
 It prints the **Jaccard (IoU)** of the two sets, the papers unique to each side,
 and **abstract coverage per side** (how many abstracts each source actually
 supplies). `--csv` writes one row per paper with `status`
-(`shared`/`only_in_a`/`only_in_b`), match type, title similarity, and
-abstract-present flags. Matching is the same exact→fuzzy (author-boosted) logic as
-`jaccard`; `--exact` disables fuzzy. No database needed — it reads the files.
+(`shared`/`only_in_a`/`only_in_b`), `match_type`, title similarity, and
+abstract-present flags.
+
+Matching is **DOI-first** (exact normalized DOI) → exact title → fuzzy
+(author-boosted), so a shared DOI matches papers even when titles drift; `--exact`
+disables fuzzy. Pass **`--reference a|b`** to treat that side as ground truth and
+also report **precision / recall / F1** — e.g. with `--reference b` and B=DBLP,
+recall = fraction of real papers the other source caught, precision = fraction of
+its papers that are real. This is the recommended way to measure how well a
+URL+LLM ingest fetches papers: export the *full* lists (`--all-papers`) and use the
+complete DBLP list as the reference. No database needed — it reads the files.
 
 #### Gold-set evaluation (precision / recall / F1)
 
