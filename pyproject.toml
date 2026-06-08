@@ -5,18 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wireless-taxonomy"
 version = "0.1.0"
-description = "Accuracy-first CLI for building wireless paper and dataset taxonomy records."
+description = "Accuracy-first CLI for evaluating automated wireless-paper classification against a curated gold set."
 requires-python = ">=3.11"
 dependencies = [
   "typer>=0.12",
   "click>=8.1",
-  "openpyxl>=3.1",
-  "pandas>=2.0",
 ]
 
 [project.optional-dependencies]
-browser = [
-  "playwright>=1.45",
+# Only needed to import gold sheets saved as .xlsx; CSV needs nothing extra.
+xlsx = [
+  "openpyxl>=3.1",
 ]
 
 [project.scripts]

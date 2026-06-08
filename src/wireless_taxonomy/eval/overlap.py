@@ -133,23 +133,28 @@ def aggregate(instance_rows: list[dict[str, Any]], *, scope_to_universe: bool = 
     fn_missing_from_universe. When ``scope_to_universe`` is set, gold papers that
     are not in the ingested main-proceedings universe (``fn_missing_from_universe``
     — i.e. co-located workshop papers) are dropped from the denominator, so the
-    effective FN is ``fn_missed`` only. Uses pandas for the grouping.
+    effective FN is ``fn_missed`` only.
     """
-    import pandas as pd
+    count_cols = ["tp", "fp", "fn", "fn_missed", "fn_missing_from_universe"]
 
     if not instance_rows:
         empty = _row_with_metrics({"tp": 0, "fp": 0, "fn": 0}, scope_to_universe=scope_to_universe)
         return {"per_conference_year": [], "per_conference": [], "overall": empty}
 
-    df = pd.DataFrame(instance_rows)
-    count_cols = ["tp", "fp", "fn", "fn_missed", "fn_missing_from_universe"]
-
     per_year = [_row_with_metrics(row, scope_to_universe=scope_to_universe) for row in instance_rows]
 
-    per_conf_df = df.groupby("venue", as_index=False)[count_cols].sum()
-    per_conf = [_row_with_metrics(row, scope_to_universe=scope_to_universe) for row in per_conf_df.to_dict("records")]
+    grouped: dict[str, dict[str, int]] = {}
+    for row in instance_rows:
+        venue = row["venue"]
+        bucket = grouped.setdefault(venue, {"venue": venue, **{c: 0 for c in count_cols}})
+        for col in count_cols:
+            bucket[col] += int(row.get(col, 0) or 0)
+    per_conf = [
+        _row_with_metrics(grouped[venue], scope_to_universe=scope_to_universe)
+        for venue in sorted(grouped)
+    ]
 
-    totals = df[count_cols].sum().to_dict()
+    totals = {col: sum(int(row.get(col, 0) or 0) for row in instance_rows) for col in count_cols}
     overall = _row_with_metrics(totals, scope_to_universe=scope_to_universe)
 
     return {
