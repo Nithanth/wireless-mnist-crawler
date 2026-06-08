@@ -136,7 +136,35 @@ def _str(value: Any) -> str:
     return str(value).strip() if value is not None else ""
 
 
-def _default_fetch_json(url: str) -> dict[str, Any]:
-    from wireless_taxonomy.analyze import full_text
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
-    return full_text._fetch_json(url)
+
+def _default_fetch_json(url: str) -> dict[str, Any]:
+    import json as _json
+    import time
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    headers = {"User-Agent": "wireless-taxonomy/0.1"}
+    if "api.semanticscholar.org" in url:
+        api_key = (os.getenv("SEMANTIC_SCHOLAR_API_KEY") or os.getenv("S2_API_KEY") or "").strip()
+        if api_key:
+            headers["x-api-key"] = api_key
+    attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "3")))
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with urlopen(Request(url, headers=headers), timeout=30) as response:
+                payload = _json.loads(response.read().decode("utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except HTTPError as exc:
+            last_error = exc
+            if exc.code not in _RETRYABLE_STATUS:
+                raise
+        except URLError as exc:
+            last_error = exc
+        if attempt + 1 < attempts:
+            time.sleep(min(1.5 * (2**attempt), 20.0))
+    if last_error is not None:
+        raise last_error
+    return {}

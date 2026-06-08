@@ -27,10 +27,11 @@ _TRUE_VALUES = {"1", "yes", "y", "true", "t", "wireless", "x"}
 
 
 class GoldSheetReader:
-    """Reads a manually curated gold sheet (csv/xlsx) into GoldRecords via pandas.
+    """Reads a manually curated gold sheet (csv/xlsx) into GoldRecords.
 
-    Column names are matched case-insensitively against common variants so the
-    user's own sheet layout does not need to be reshaped first.
+    CSV is parsed with the stdlib; xlsx is parsed lazily via ``openpyxl`` (an
+    optional dependency). Column names are matched case-insensitively against
+    common variants so the user's own sheet layout need not be reshaped first.
     """
 
     def __init__(
@@ -46,20 +47,15 @@ class GoldSheetReader:
         self.wireless_only = wireless_only
 
     def read(self) -> list[GoldRecord]:
-        import pandas as pd
-
-        if self.path.suffix.lower() in {".xlsx", ".xls"}:
-            df = pd.read_excel(self.path)
-        else:
-            df = pd.read_csv(self.path)
-        df.columns = [str(c).strip() for c in df.columns]
-        lower_map = {c.lower(): c for c in df.columns}
+        columns, raw_rows = self._load_rows()
+        columns = [str(c).strip() for c in columns]
+        lower_map = {c.lower(): c for c in columns}
 
         title_col = _find(lower_map, _TITLE_KEYS)
         if title_col is None:
             raise ValueError(
                 f"Could not find a title column in {self.path.name}. "
-                f"Columns seen: {list(df.columns)}"
+                f"Columns seen: {columns}"
             )
         doi_col = _find(lower_map, _DOI_KEYS)
         venue_col = _find(lower_map, _VENUE_KEYS)
@@ -67,7 +63,7 @@ class GoldSheetReader:
         wireless_col = _find(lower_map, _WIRELESS_KEYS)
 
         records: list[GoldRecord] = []
-        for raw_row in df.to_dict("records"):
+        for raw_row in raw_rows:
             title = _clean(raw_row.get(title_col))
             if not title:
                 continue
@@ -95,6 +91,45 @@ class GoldSheetReader:
                 )
             )
         return records
+
+    def _load_rows(self) -> tuple[list[str], list[dict[str, Any]]]:
+        if self.path.suffix.lower() in {".xlsx", ".xls"}:
+            return self._load_xlsx()
+        return self._load_csv()
+
+    def _load_csv(self) -> tuple[list[str], list[dict[str, Any]]]:
+        import csv as _csv
+
+        with self.path.open(newline="", encoding="utf-8-sig") as fh:
+            reader = _csv.DictReader(fh)
+            columns = [str(c).strip() for c in (reader.fieldnames or [])]
+            rows: list[dict[str, Any]] = []
+            for row in reader:
+                rows.append({str(k).strip(): v for k, v in row.items() if k is not None})
+        return columns, rows
+
+    def _load_xlsx(self) -> tuple[list[str], list[dict[str, Any]]]:
+        try:
+            from openpyxl import load_workbook
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "Reading .xlsx gold sheets requires openpyxl. Install it with "
+                "`pip install openpyxl`, or export the sheet to CSV."
+            ) from exc
+
+        workbook = load_workbook(self.path, read_only=True, data_only=True)
+        worksheet = workbook.active
+        rows_iter = worksheet.iter_rows(values_only=True)
+        try:
+            header = next(rows_iter)
+        except StopIteration:
+            return [], []
+        columns = [str(c).strip() if c is not None else "" for c in header]
+        rows: list[dict[str, Any]] = []
+        for values in rows_iter:
+            rows.append({columns[i]: values[i] for i in range(min(len(columns), len(values)))})
+        workbook.close()
+        return columns, rows
 
 
 def _find(lower_map: dict[str, str], keys: tuple[str, ...]) -> str | None:
