@@ -180,6 +180,11 @@ beamforming, RF/spectrum, antennas, channel/CSI/RSSI/SINR measurements, RAN/base
 backscatter, LoRa/LPWAN, Bluetooth, satellite/non-terrestrial links, and wireless sensing.
 Wired-only networking, pure systems, ML, or theory papers are NOT wireless.
 
+Judge by the paper's *central* contribution, not by incidental mentions. Label "yes"
+only when the wireless link/medium is core to the work. If the contribution is really
+about wired/datacenter networking, general distributed systems, or media/streaming and
+a radio is merely the access link or an aside, it is NOT wireless.
+
 Return JSON only:
 {{
   "label": "yes|no|maybe",
