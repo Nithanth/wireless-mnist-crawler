@@ -242,6 +242,40 @@ def to_markdown(report: dict[str, Any]) -> str:
         lines.append("")
         _table(report["per_conference"], year=False)
 
+    under = report.get("under_curated_instances") or []
+    if under:
+        lines.append("## Under-curated / excluded venue-years (not in headline)")
+        lines.append("")
+        lines.append(
+            "These venue-years are reported separately and excluded from the overall "
+            "metrics (e.g. thinly- or stale-curated rows whose gold set is too small "
+            "to score fairly). Their would-be metrics are shown for reference."
+        )
+        lines.append("")
+        lines.append("| venue | year | gold | reason | precision | recall | f1 | tp | fp | fn |")
+        lines.append("| " + " | ".join(["---"] * 10) + " |")
+        for r in under:
+            lines.append(
+                "| "
+                + " | ".join(
+                    str(x)
+                    for x in (
+                        r.get("venue", ""),
+                        r.get("year", ""),
+                        r.get("gold_papers", ""),
+                        r.get("reason", ""),
+                        r.get("precision"),
+                        r.get("recall"),
+                        r.get("f1"),
+                        r.get("tp"),
+                        r.get("fp"),
+                        r.get("fn"),
+                    )
+                )
+                + " |"
+            )
+        lines.append("")
+
     mismatches = report.get("mismatches") or []
     if mismatches:
         lines.append("## Discrepancies")

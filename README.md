@@ -118,6 +118,11 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli eval \
 - Repeat `--classified` / `--gold` to union multiple files. Only conferences
   present in the classified CSV(s) are scored — unrun venue-years in the sheet
   are ignored, not penalised.
+- `--exclude VENUE:YEAR` (repeatable) and `--min-gold N` pull thinly- or
+  stale-curated venue-years out of the **overall** metrics and report them
+  separately (with their would-be numbers), so a conference curated before its
+  papers were released doesn't drag the headline. Example:
+  `--exclude IMC:2025` or `--min-gold 3`.
 
 ### Abstract caching & providers
 

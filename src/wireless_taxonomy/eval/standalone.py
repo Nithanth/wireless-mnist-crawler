@@ -29,7 +29,7 @@ import csv as _csv
 from pathlib import Path
 from typing import Any
 
-from wireless_taxonomy.eval.overlap import PaperRef, aggregate, match, to_markdown
+from wireless_taxonomy.eval.overlap import PaperRef, _row_with_metrics, aggregate, match, to_markdown
 from wireless_taxonomy.ingest.gold import GoldSheetReader
 
 _PRED_TITLE_KEYS = ("title", "paper title", "name", "paper")
@@ -123,6 +123,8 @@ def eval_files(
     fuzzy_threshold: float = 0.92,
     gold_default_venue: str | None = None,
     gold_default_year: int | None = None,
+    exclude: list[tuple[str, Any]] | None = None,
+    min_gold: int = 0,
 ) -> dict[str, Any]:
     """Score classified CSV(s) against gold sheet(s) with no DB or network.
 
@@ -132,10 +134,21 @@ def eval_files(
     denominator. Returns a report dict shaped like the old ``eval-overlap``
     output so it renders with the shared
     :func:`~wireless_taxonomy.eval.overlap.to_markdown`.
+
+    ``exclude`` is a list of ``(venue, year)`` pairs to pull out of the headline,
+    and ``min_gold`` pulls out any venue-year whose curated gold set is smaller
+    than ``min_gold`` papers. Both go to a separate ``under_curated`` bucket
+    (with their would-be metrics, for visibility) instead of dragging the
+    aggregate — the intended use is thinly- or stale-curated venue-years (e.g. a
+    conference recorded before its papers were released) that punish precision
+    despite the classifier being correct.
     """
     if pass_mode not in _PASS_LABELS:
         raise ValueError("pass_mode must be 'high' or 'low'")
+    if min_gold < 0:
+        raise ValueError("min_gold must be >= 0")
     positive_labels = _PASS_LABELS[pass_mode]
+    exclude_set = {_vy_key(v, y) for v, y in (exclude or [])}
 
     universe: dict[tuple[str, str], list[PaperRef]] = {}
     predicted: dict[tuple[str, str], list[PaperRef]] = {}
@@ -167,6 +180,7 @@ def eval_files(
     instance_rows: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
     ignored_gold_instances: list[dict[str, Any]] = []
+    under_curated_instances: list[dict[str, Any]] = []
 
     for key in sorted(universe, key=lambda k: (k[0], k[1])):
         venue, year = display.get(key, (key[0], key[1]))
@@ -180,17 +194,17 @@ def eval_files(
         fn_missed = len(in_universe.matched)
         fn_missing_from_universe = len(in_universe.unmatched_a)
 
-        instance_rows.append(
-            {
-                "venue": venue,
-                "year": year,
-                "tp": len(result.matched),
-                "fp": len(result.unmatched_a),
-                "fn": len(result.unmatched_b),
-                "fn_missed": fn_missed,
-                "fn_missing_from_universe": fn_missing_from_universe,
-            }
-        )
+        counts = {
+            "venue": venue,
+            "year": year,
+            "tp": len(result.matched),
+            "fp": len(result.unmatched_a),
+            "fn": len(result.unmatched_b),
+            "fn_missed": fn_missed,
+            "fn_missing_from_universe": fn_missing_from_universe,
+        }
+        # Discrepancy detail is always kept (even for excluded venue-years) so
+        # the per-conference FP/FN lists stay visible for inspection.
         mismatches.append(
             {
                 "venue": venue,
@@ -200,6 +214,15 @@ def eval_files(
                 "false_negatives_missing_from_universe": [r.title for r in in_universe.unmatched_a],
             }
         )
+
+        reason = _under_curated_reason(key, len(gold_refs), exclude_set, min_gold)
+        if reason is not None:
+            scored = _row_with_metrics(counts, scope_to_universe=drop_workshops)
+            scored["gold_papers"] = len(gold_refs)
+            scored["reason"] = reason
+            under_curated_instances.append(scored)
+            continue
+        instance_rows.append(counts)
 
     # Gold venue-years that were never classified: report, don't penalise.
     for key in sorted(gold):
@@ -220,8 +243,24 @@ def eval_files(
         "instances": agg["per_conference_year"],
         "mismatches": mismatches,
         "ignored_gold_instances": ignored_gold_instances,
+        "under_curated_instances": under_curated_instances,
+        "min_gold": min_gold,
     }
     return report
+
+
+def _under_curated_reason(
+    key: tuple[str, str],
+    gold_count: int,
+    exclude_set: set[tuple[str, str]],
+    min_gold: int,
+) -> str | None:
+    """Why a classified venue-year is pulled from the headline, or None to keep it."""
+    if key in exclude_set:
+        return "excluded"
+    if min_gold > 0 and gold_count < min_gold:
+        return f"under-curated (<{min_gold} gold papers)"
+    return None
 
 
 def eval_files_to_outputs(
@@ -235,6 +274,8 @@ def eval_files_to_outputs(
     fuzzy_threshold: float = 0.92,
     gold_default_venue: str | None = None,
     gold_default_year: int | None = None,
+    exclude: list[tuple[str, Any]] | None = None,
+    min_gold: int = 0,
 ) -> dict[str, Any]:
     """Run :func:`eval_files` and optionally write JSON and/or Markdown reports."""
     import json as _json
@@ -247,6 +288,8 @@ def eval_files_to_outputs(
         fuzzy_threshold=fuzzy_threshold,
         gold_default_venue=gold_default_venue,
         gold_default_year=gold_default_year,
+        exclude=exclude,
+        min_gold=min_gold,
     )
     if json_out:
         path = Path(json_out)
