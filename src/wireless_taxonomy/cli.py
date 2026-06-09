@@ -102,6 +102,17 @@ def _parse_years(years: str) -> list[int]:
         raise typer.BadParameter("--years must be a year (2024) or range (2023:2025).") from exc
 
 
+def _parse_venue_years(entries: list[str]) -> list[tuple[str, str]]:
+    """Parse ``VENUE:YEAR`` exclude entries into ``(venue, year)`` pairs."""
+    parsed: list[tuple[str, str]] = []
+    for raw in entries:
+        venue, sep, year = raw.partition(":")
+        if not sep or not venue.strip() or not year.strip():
+            raise typer.BadParameter(f"--exclude must look like VENUE:YEAR (got {raw!r}).")
+        parsed.append((venue.strip(), year.strip()))
+    return parsed
+
+
 def _pct(count: int, total: int) -> float:
     return round(100.0 * count / total, 1) if total else 0.0
 
@@ -152,8 +163,14 @@ def classify(
     labelled set (every paper, not just the wireless ones), which is exactly what
     ``eval`` consumes.
     """
-    if source != "dblp" and not source_value:
-        raise typer.BadParameter("--source-value is required when --source is not 'dblp'.")
+    valid_sources = {"dblp", "bibtex", "csv", "url"}
+    if source not in valid_sources:
+        raise typer.BadParameter(f"--source must be one of {', '.join(sorted(valid_sources))} (got {source!r}).")
+    if source != "dblp":
+        if not source_value:
+            raise typer.BadParameter("--source-value is required when --source is not 'dblp'.")
+        if source in {"bibtex", "csv"} and not Path(source_value).exists():
+            raise typer.BadParameter(f"--source-value file not found: {source_value}")
     year_list = _parse_years(years)
 
     metadata_cache = None
@@ -245,6 +262,12 @@ def eval(
         help="Drop curated papers absent from the classified universe (co-located workshops) from the calculation.",
     ),
     fuzzy_threshold: float = typer.Option(0.92, "--fuzzy-threshold", help="Title fuzzy-match ratio; 1.0 disables fuzzy."),
+    exclude: List[str] = typer.Option(
+        [], "--exclude", help="Venue-year to drop from the headline (VENUE:YEAR, e.g. IMC:2025); repeatable."
+    ),
+    min_gold: int = typer.Option(
+        0, "--min-gold", help="Report venue-years with fewer than N curated gold papers separately (0 = off)."
+    ),
     out: Optional[str] = typer.Option(None, "--out", help="Write the JSON report here."),
     md: Optional[str] = typer.Option(None, "--md", help="Write the Markdown report here."),
 ) -> None:
@@ -255,9 +278,21 @@ def eval(
     present in the classified CSV(s). ``--drop-workshops`` excludes curated
     papers absent from the classified universe (the full set written by
     ``classify --csv``) instead of counting them as misses.
+
+    ``--exclude VENUE:YEAR`` and ``--min-gold N`` pull thinly- or stale-curated
+    venue-years out of the overall metrics (reported separately) so they don't
+    drag the headline — useful when a conference was curated before its papers
+    were released.
     """
     if pass_mode not in {"high", "low"}:
         raise typer.BadParameter("--pass must be 'high' or 'low'.")
+    if min_gold < 0:
+        raise typer.BadParameter("--min-gold must be >= 0.")
+    for label, paths in (("--classified", classified), ("--gold", gold)):
+        for path in paths:
+            if not Path(path).exists():
+                raise typer.BadParameter(f"{label} file not found: {path}")
+    exclude_pairs = _parse_venue_years(list(exclude))
     from wireless_taxonomy.eval.standalone import eval_files_to_outputs
 
     try:
@@ -269,12 +304,20 @@ def eval(
             pass_mode=pass_mode,
             drop_workshops=drop_workshops,
             fuzzy_threshold=fuzzy_threshold,
+            exclude=exclude_pairs,
+            min_gold=min_gold,
         )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
     scope_note = "main-proceedings only" if drop_workshops else "workshops included"
     typer.echo(f"snapshot eval: pass={pass_mode} fuzzy={fuzzy_threshold} scope={scope_note}")
+    if not report["instances"] and not (report.get("under_curated_instances")):
+        typer.echo(
+            "no venue-years scored — the classified CSV(s) and gold sheet share no "
+            "(venue, year). Check the venue/year columns match.",
+            err=True,
+        )
     for row in report["instances"]:
         typer.echo(
             f"- {row['venue']} {row['year']}: jaccard={row['jaccard']} "
@@ -287,6 +330,15 @@ def eval(
         f"recall={overall['recall']} f1={overall['f1']} "
         f"(TP {overall['tp']} / FP {overall['fp']} / FN {overall['fn']})"
     )
+    under = report.get("under_curated_instances") or []
+    if under:
+        typer.echo("under-curated / excluded (not in headline):")
+        for r in under:
+            typer.echo(
+                f"- {r['venue']} {r['year']}: gold={r.get('gold_papers')} [{r.get('reason')}] "
+                f"would be precision={r['precision']} recall={r['recall']} f1={r['f1']} "
+                f"(tp={r['tp']} fp={r['fp']} fn={r['fn']})"
+            )
     ignored = report.get("ignored_gold_instances") or []
     if ignored:
         pairs = ", ".join(f"{r['venue']}:{r['year']}({r['gold_papers']})" for r in ignored)

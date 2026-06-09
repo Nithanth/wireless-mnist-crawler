@@ -66,6 +66,61 @@ def test_eval_files_ignores_gold_venue_years_not_classified(tmp_path) -> None:
     ]
 
 
+def _two_venue_year_files(tmp_path):
+    """SIGCOMM 2024 well-curated (2 gold) + IMC 2025 thin (1 gold, 1 extra FP)."""
+    classified = _write(
+        tmp_path / "pred.csv",
+        "title,doi,venue,year,label\n"
+        "Wireless A,10.1/a,SIGCOMM,2024,yes\n"
+        "Wireless B,10.1/b,SIGCOMM,2024,yes\n"
+        "Curated IMC Paper,10.1/c,IMC,2025,yes\n"
+        "Uncurated Wireless Paper,10.1/d,IMC,2025,yes\n",  # IMC FP (not in gold)
+    )
+    gold = _write(
+        tmp_path / "gold.csv",
+        "Paper Title,Conference,Year,DOI\n"
+        "Wireless A,SIGCOMM,2024,10.1/a\n"
+        "Wireless B,SIGCOMM,2024,10.1/b\n"
+        "Curated IMC Paper,IMC,2025,10.1/c\n",
+    )
+    return classified, gold
+
+
+def test_eval_files_exclude_pulls_venue_year_from_headline(tmp_path) -> None:
+    classified, gold = _two_venue_year_files(tmp_path)
+    base = eval_files([classified], [gold])
+    assert base["overall"]["fp"] == 1  # IMC FP drags the headline
+
+    report = eval_files([classified], [gold], exclude=[("IMC", "2025")])
+    # IMC 2025 removed from headline -> only the clean SIGCOMM row remains.
+    assert report["overall"]["fp"] == 0
+    assert report["overall"]["tp"] == 2
+    assert [i["venue"] for i in report["instances"]] == ["SIGCOMM"]
+    under = report["under_curated_instances"]
+    assert len(under) == 1
+    assert under[0]["venue"] == "IMC" and under[0]["reason"] == "excluded"
+    assert under[0]["gold_papers"] == 1 and under[0]["fp"] == 1
+    # Discrepancy detail is still kept for the excluded venue-year.
+    assert any(m["venue"] == "IMC" for m in report["mismatches"])
+
+
+def test_eval_files_min_gold_pulls_thin_venue_years(tmp_path) -> None:
+    classified, gold = _two_venue_year_files(tmp_path)
+    report = eval_files([classified], [gold], min_gold=2)
+    assert [i["venue"] for i in report["instances"]] == ["SIGCOMM"]
+    under = report["under_curated_instances"]
+    assert len(under) == 1
+    assert under[0]["venue"] == "IMC"
+    assert "under-curated" in under[0]["reason"]
+
+
+def test_eval_files_min_gold_zero_is_noop(tmp_path) -> None:
+    classified, gold = _two_venue_year_files(tmp_path)
+    report = eval_files([classified], [gold], min_gold=0)
+    assert report["under_curated_instances"] == []
+    assert len(report["instances"]) == 2
+
+
 def test_eval_files_to_outputs_writes_json_and_md(tmp_path) -> None:
     classified = _write(
         tmp_path / "pred.csv",
