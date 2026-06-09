@@ -17,6 +17,19 @@ from wireless_taxonomy.models import EvidenceClaim, PaperSeed, new_id, utc_now
 from wireless_taxonomy.review.queue import insert_review_item
 
 
+def _cache_has_abstract(cache, title: str | None, doi: str | None) -> bool:
+    """True if the disk cache already holds a real abstract for this paper.
+
+    A cached *miss* (provider == "miss" or empty abstract) returns False so the
+    batch lookup still gets a chance to fill it; only a genuine cached abstract
+    lets a warm re-run skip the network batch call.
+    """
+    entry = cache.get_abstract(title, doi)
+    if not entry:
+        return False
+    return bool(entry.get("abstract")) and entry.get("provider") != "miss"
+
+
 class Pipeline:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -96,10 +109,15 @@ class Pipeline:
         # request. One batched call per conference is dramatically more reliable
         # than one GET per paper, which gets 429-throttled on a shared IP and
         # silently drops most abstracts (notably ACM venues like IMC/SIGCOMM).
+        # Papers already served by the disk cache are excluded so a warm re-run
+        # (fresh DB, but cached abstracts) skips the network batch call entirely
+        # instead of re-paying its 429-throttled retries.
         batch_items = [
             (paper["title"], (paper["doi"] or "").strip())
             for paper in rows
-            if (paper["doi"] or "").strip() and (overwrite or not (paper["abstract"] or "").strip())
+            if (paper["doi"] or "").strip()
+            and (overwrite or not (paper["abstract"] or "").strip())
+            and not (cache is not None and not overwrite and _cache_has_abstract(cache, paper["title"], paper["doi"]))
         ]
         if batch_items and hasattr(enricher, "prefetch_semantic_scholar"):
             enricher.prefetch_semantic_scholar(batch_items)
