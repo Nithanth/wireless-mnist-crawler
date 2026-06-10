@@ -176,8 +176,8 @@ def test_end_to_end_classify_full_set_and_file_eval(tmp_path: Path, monkeypatch)
     # classify_conference returns the FULL labelled set (every paper), not just wireless.
     assert result["total_papers"] == 2
     assert result["counts"]["yes"] == 1  # the RF/SINR paper
-    assert result["counts"]["maybe"] == 1  # the wired datacenter paper
-    assert result["counts"]["no"] == 0
+    assert result["counts"]["maybe"] == 0
+    assert result["counts"]["no"] == 1  # the wired datacenter paper (networking terms)
 
     classified = tmp_path / "classified.csv"
     _write_classified_csv(result, classified)
@@ -196,11 +196,12 @@ def test_end_to_end_classify_full_set_and_file_eval(tmp_path: Path, monkeypatch)
     high_drop = eval_files([str(classified)], [str(gold)], pass_mode="high", drop_workshops=True)
     assert high_drop["overall"]["fn"] == 0 and high_drop["overall"]["jaccard"] == 1.0
 
-    # Low pass also flags the "maybe" datacenter paper -> one false positive.
+    # The datacenter paper is now classified "no" (networking, not wireless), so
+    # low pass (yes OR maybe) no longer keeps it -> no false positive, same as high pass.
     low = eval_files([str(classified)], [str(gold)], pass_mode="low")
     lo = low["instances"][0]
-    assert lo["tp"] == 1 and lo["fp"] == 1 and lo["fn"] == 1
-    assert lo["jaccard"] == round(1 / 3, 4)
+    assert lo["tp"] == 1 and lo["fp"] == 0 and lo["fn"] == 1
+    assert lo["jaccard"] == 0.5
 
 
 def test_eval_drop_workshops_requires_label_column(tmp_path: Path) -> None:
