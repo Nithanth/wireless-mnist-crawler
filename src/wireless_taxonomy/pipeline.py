@@ -15,7 +15,7 @@ from wireless_taxonomy.analyze.paper_text import PaperTextFetcher
 from wireless_taxonomy.analyze.readiness import PaperInputReadinessAssessor
 from wireless_taxonomy.analyze.reflection import DeterministicAnalysisReflector
 from wireless_taxonomy.analyze.scope import ScopeAssessor
-from wireless_taxonomy.analyze.wireless import WirelessClassifier
+from wireless_taxonomy.analyze.wireless import WirelessClassifier, category_from_evidence
 from wireless_taxonomy.config import Settings
 from wireless_taxonomy.db import connect, migrate, transaction
 from wireless_taxonomy.evidence import EvidenceLogger
@@ -118,7 +118,13 @@ class Pipeline:
         with transaction(self.conn):
             for paper in rows:
                 result = classifier.classify(paper["id"], paper["title"], paper["abstract"])
-                is_wireless = 1 if result.label == "yes" and result.confidence >= self.settings.thresholds.wireless_inclusion else 0 if result.label == "no" else None
+                is_wireless = (
+                    1
+                    if result.label == "yes" and result.confidence >= self.settings.thresholds.wireless_inclusion
+                    else 0
+                    if result.label == "no" and result.confidence >= 0.70
+                    else None
+                )
                 self.conn.execute(
                     """
                     INSERT INTO paper_classifications
@@ -128,11 +134,22 @@ class Pipeline:
                     (paper["id"], stage_run_id, is_wireless, result.label, result.confidence, result.evidence, result.model_version),
                 )
                 self._insert_evidence(stage_run_id, paper["id"], None, "wireless_classification", result.label, result.evidence, None, result.confidence)
-                if result.confidence < self.settings.thresholds.wireless_inclusion:
+                if is_wireless is None:
+                    category = category_from_evidence(result.evidence, result.label)
                     insert_review_item(
                         self.conn,
                         stage_run_id,
-                        _review("paper", paper["title"], None, "Wireless Classification", result.label, result.confidence, "Wireless confidence below threshold", result.evidence, None),
+                        _review(
+                            "paper",
+                            paper["title"],
+                            None,
+                            "Wireless Classification",
+                            category,
+                            result.confidence,
+                            "Wireless relevance is uncertain from title/abstract",
+                            result.evidence,
+                            None,
+                        ),
                     )
                     review_count += 1
             self._complete_run(stage_run_id, f"Classified {len(rows)} papers; {review_count} review items.")
@@ -1030,6 +1047,12 @@ class Pipeline:
         if fmt == "json":
             return JsonExporter(self.conn).export(run_id, out, scope)
         return SpreadsheetExporter(self.conn).export(run_id, out, fmt)
+
+    def export_classification_cache(self, source_run_id: int, classification_run_id: int, out: str | Path) -> Path:
+        return JsonExporter(self.conn).export_classification_cache(source_run_id, classification_run_id, out)
+
+    def classification_cache_payload(self, source_run_id: int, classification_run_id: int) -> dict:
+        return JsonExporter(self.conn).classification_cache_payload(source_run_id, classification_run_id)
 
     def status(self, run_id: int | None = None) -> list[sqlite3.Row]:
         if run_id is None:

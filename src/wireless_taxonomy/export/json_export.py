@@ -5,6 +5,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from wireless_taxonomy.analyze.wireless import category_from_evidence
+
 
 class JsonExporter:
     def __init__(self, conn: sqlite3.Connection):
@@ -39,6 +41,82 @@ class JsonExporter:
         }
         output.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         return output
+
+    def export_classification_cache(
+        self,
+        source_run_id: int,
+        classification_run_id: int,
+        output: str | Path,
+    ) -> Path:
+        output = Path(output)
+        if output.suffix.lower() != ".json":
+            output = output.with_suffix(".json")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.classification_cache_payload(source_run_id, classification_run_id)
+        output.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        return output
+
+    def classification_cache_payload(self, source_run_id: int, classification_run_id: int) -> dict[str, Any]:
+        source_run = self.conn.execute("SELECT * FROM pipeline_runs WHERE id = ?", (source_run_id,)).fetchone()
+        classification_run = self.conn.execute("SELECT * FROM pipeline_runs WHERE id = ?", (classification_run_id,)).fetchone()
+        if source_run is None:
+            raise ValueError(f"Run {source_run_id} not found")
+        if classification_run is None:
+            raise ValueError(f"Classification run {classification_run_id} not found")
+
+        papers = self._classification_cache_papers(source_run["conference_instance_id"], classification_run_id)
+        return {
+            "schema": "wireless-taxonomy.paper-classification-cache.v1",
+            "source_run": dict(source_run),
+            "classification_run": dict(classification_run),
+            "paper_count": len(papers),
+            "summary": _classification_summary(papers),
+            "papers": papers,
+        }
+
+    def _classification_cache_papers(self, conference_instance_id: int, classification_run_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """
+            SELECT
+              p.id,
+              p.title,
+              p.authors,
+              p.doi,
+              p.abstract,
+              p.paper_url,
+              p.pdf_url,
+              p.session,
+              p.source_confidence,
+              pc.run_id AS classification_run_id,
+              pc.is_wireless,
+              pc.label,
+              pc.confidence,
+              pc.evidence,
+              pc.model_version
+            FROM papers p
+            LEFT JOIN paper_classifications pc ON pc.paper_id = p.id AND pc.run_id = ?
+            WHERE p.conference_instance_id = ?
+            ORDER BY p.id
+            """,
+            (classification_run_id, conference_instance_id),
+        )
+        papers: list[dict[str, Any]] = []
+        for row in rows:
+            paper = dict(row)
+            category = category_from_evidence(paper.get("evidence"), paper.get("label"))
+            review_needed = paper.get("is_wireless") is None
+            paper["classification"] = {
+                "label": paper.pop("label"),
+                "category": category,
+                "is_wireless": paper.pop("is_wireless"),
+                "confidence": paper.pop("confidence"),
+                "evidence": paper.pop("evidence"),
+                "model_version": paper.pop("model_version"),
+                "run_id": paper.pop("classification_run_id"),
+                "review_needed": review_needed,
+            }
+            papers.append(paper)
+        return papers
 
     def _runs(self, run_ids: list[int] | None) -> list[dict[str, Any]]:
         params: tuple[Any, ...] = ()
@@ -268,3 +346,31 @@ def _paper_params(paper_id: int, run_ids: list[int] | None) -> tuple[Any, ...]:
     if run_ids is None:
         return (paper_id,)
     return (paper_id, *run_ids)
+
+
+def _classification_summary(papers: list[dict[str, Any]]) -> dict[str, Any]:
+    categories: dict[str, int] = {}
+    labels: dict[str, int] = {}
+    review_needed_count = 0
+    has_abstract_count = 0
+    wireless_count = 0
+    for paper in papers:
+        if paper.get("abstract"):
+            has_abstract_count += 1
+        classification = paper.get("classification") or {}
+        category = classification.get("category") or "uncertain"
+        label = classification.get("label") or "missing"
+        categories[category] = categories.get(category, 0) + 1
+        labels[label] = labels.get(label, 0) + 1
+        if classification.get("review_needed"):
+            review_needed_count += 1
+        if classification.get("is_wireless") == 1:
+            wireless_count += 1
+    return {
+        "category_counts": categories,
+        "label_counts": labels,
+        "wireless_count": wireless_count,
+        "review_needed_count": review_needed_count,
+        "has_abstract_count": has_abstract_count,
+        "missing_abstract_count": len(papers) - has_abstract_count,
+    }

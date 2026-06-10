@@ -148,11 +148,54 @@ def run(
 
 
 @app.command("classify-wireless")
-def classify_wireless(run_id: int = typer.Option(..., "--run-id"), db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
+def classify_wireless(
+    run_id: int = typer.Option(..., "--run-id"),
+    out: Optional[str] = typer.Option(None, "--out", help="Write a focused per-paper classification JSON cache."),
+    show_wireless: bool = typer.Option(True, "--show-wireless/--no-show-wireless", help="Print the captured wireless papers after classification."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
     pipeline = _pipeline(db)
     try:
         stage_run = pipeline.classify_wireless(run_id)
-        typer.echo(f"Wireless classification completed. run_id={stage_run}")
+        payload = pipeline.classification_cache_payload(run_id, stage_run)
+        if out:
+            path = pipeline.export_classification_cache(run_id, stage_run, out)
+            typer.echo(f"Wireless classification completed. run_id={stage_run} cache={path}")
+        else:
+            typer.echo(f"Wireless classification completed. run_id={stage_run}")
+        if show_wireless:
+            _print_wireless_papers(payload)
+    finally:
+        pipeline.close()
+
+
+@app.command("classify-paper-list")
+def classify_paper_list(
+    venue: str = typer.Option(..., "--venue"),
+    year: int = typer.Option(..., "--year"),
+    url: Optional[str] = typer.Option(None, "--url"),
+    bibtex: Optional[str] = typer.Option(None, "--bibtex"),
+    csv_path: Optional[str] = typer.Option(None, "--csv"),
+    out: str = typer.Option(..., "--out", help="Per-paper classification JSON cache path."),
+    verify: bool = typer.Option(True, "--verify/--no-verify", help="Run deterministic paper-list verification before classification."),
+    show_wireless: bool = typer.Option(True, "--show-wireless/--no-show-wireless", help="Print the captured wireless papers after classification."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    source_type, source_value = _source(url, bibtex, csv_path)
+    pipeline = _pipeline(db)
+    try:
+        source_run = pipeline.ingest(venue, year, source_type, source_value)
+        if verify:
+            pipeline.verify_paper_list(source_run, run_external=False, run_llm=False)
+        classification_run = pipeline.classify_wireless(source_run)
+        path = pipeline.export_classification_cache(source_run, classification_run, out)
+        payload = pipeline.classification_cache_payload(source_run, classification_run)
+        typer.echo(
+            "Paper-list classification completed. "
+            f"source_run_id={source_run} classification_run_id={classification_run} cache={path}"
+        )
+        if show_wireless:
+            _print_wireless_papers(payload)
     finally:
         pipeline.close()
 
@@ -418,6 +461,45 @@ def _verification_issue_count(report) -> int:
         )
     issues = payload.get("issues")
     return len(issues) if isinstance(issues, list) else 0
+
+
+def _print_wireless_papers(payload: dict) -> None:
+    papers = [
+        paper
+        for paper in payload.get("papers", [])
+        if (paper.get("classification") or {}).get("category") == "wireless"
+    ]
+    summary = payload.get("summary", {})
+    typer.echo("")
+    typer.secho("Wireless Papers From Title/Abstract", bold=True)
+    typer.echo(
+        f"Captured {len(papers)} wireless paper(s) out of {payload.get('paper_count', len(payload.get('papers', [])))}. "
+        f"Review needed: {summary.get('review_needed_count', 0)}."
+    )
+    if not papers:
+        typer.echo("No wireless papers classified with the current title/abstract rules.")
+        return
+    for index, paper in enumerate(papers, start=1):
+        classification = paper.get("classification") or {}
+        confidence = classification.get("confidence")
+        confidence_text = f"{float(confidence):.2f}" if isinstance(confidence, (int, float)) else "n/a"
+        typer.echo(f"{index:>2}. [{confidence_text}] {paper.get('title') or '(untitled)'}")
+        authors = _truncate(paper.get("authors"), 150)
+        if authors:
+            typer.echo(f"    Authors: {authors}")
+        details = [value for value in [paper.get("session"), paper.get("doi")] if value]
+        if details:
+            typer.echo(f"    {' | '.join(str(value) for value in details)}")
+        evidence = classification.get("evidence")
+        if evidence:
+            typer.echo(f"    Evidence: {evidence}")
+
+
+def _truncate(value: object, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
 
 
 if __name__ == "__main__":

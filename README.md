@@ -30,6 +30,7 @@ The tested pipeline can currently:
 - use an LLM fallback for heterogeneous URL extraction
 - verify paper-list quality
 - assess whether a source appears relevant to networking/wireless research
+- classify each paper's wireless relevance from title/abstract only
 - enrich papers with abstracts, links, landing-page text, and snippets
 - discover full text through open resolvers
 - ingest local PDFs as a fallback
@@ -184,7 +185,59 @@ This stage checks whether the source looks like a networking/wireless-relevant r
 
 The `run` command can prompt before continuing when scope looks questionable. Use `--yes` to proceed without prompting.
 
-### 4. Enrich Paper Text
+### 4. Classify Paper List From Title/Abstract
+
+Command:
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli classify-paper-list \
+  --venue SIGCOMM \
+  --year 2025 \
+  --url https://conferences.sigcomm.org/sigcomm/2025/program/papers-info/ \
+  --out sigcomm-2025-classifications.json \
+  --db taxonomy.sqlite
+```
+
+This is the current TOS-safe paper relevance path. It ingests the proceeding/source, optionally runs deterministic paper-list verification, classifies each paper from title/abstract metadata only, and writes a focused JSON cache.
+
+The JSON cache includes:
+
+- source run metadata
+- classification run metadata
+- summary counts
+- one record per paper
+- title, authors, DOI, abstract, URLs, session, source confidence
+- classification label
+- classification category
+- confidence
+- evidence
+- review-needed flag
+
+Classification categories:
+
+- `wireless`
+- `networking_non_wireless`
+- `not_relevant`
+- `uncertain`
+
+The DB-compatible label remains:
+
+- `yes`
+- `no`
+- `maybe`
+
+You can also classify an already-ingested run and dump the focused cache:
+
+```bash
+PYTHONPATH=src python3 -m wireless_taxonomy.cli classify-wireless \
+  --run-id 1 \
+  --out classifications.json \
+  --db taxonomy.sqlite
+```
+
+This stage intentionally does not fetch ACM PDFs or perform dataset synthesis.
+
+### 5. Enrich Paper Text
 
 Command:
 
@@ -203,7 +256,7 @@ This gathers lower-cost paper context:
 
 This stage is useful even when full PDFs are not yet available.
 
-### 5. Discover Full Text
+### 6. Discover Full Text
 
 Command:
 
@@ -238,7 +291,7 @@ Semantic Scholar title/author matching is used because DOI-only matching can mis
 
 Rate limits are enforced for Semantic Scholar and OpenReview.
 
-### 6. Add Local PDFs
+### 7. Add Local PDFs
 
 Command:
 
@@ -251,7 +304,7 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli add-pdfs \
 
 This is the fallback when PDFs cannot be retrieved programmatically. The importer matches local PDFs back to the paper list and extracts text/snippets from them.
 
-### 7. Authenticated ACM Browser Fallback
+### 8. Authenticated ACM Browser Fallback
 
 Command for login:
 
@@ -285,7 +338,7 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli fetch-acm-browser \
 
 This fallback is opt-in. It exists for legitimate ACM/institutional access and should not be used as a default bulk scraper. CDP lets the CLI connect to a real logged-in browser session and reuse the user's authenticated access, but it does not hide automation from ACM. Large automated downloads may violate publisher or institutional usage policies.
 
-### 8. Assess Paper Inputs
+### 9. Assess Paper Inputs
 
 Command:
 
@@ -306,7 +359,7 @@ Readiness levels include:
 
 The goal is to know which papers are ready for the intelligent taxonomy portion and which ones need review or manual PDF upload.
 
-### 9. Agentic Paper Analysis
+### 10. Agentic Paper Analysis
 
 Command:
 
@@ -342,7 +395,7 @@ This stage is the bridge into taxonomy synthesis. It analyzes paper text and sni
 
 The current implementation supports a deterministic analyzer and an LLM-backed analyzer. The deterministic analyzer is useful for tests and regression safety. The LLM analyzer is intended for higher-fidelity synthesis.
 
-### 10. Reflect Paper Analysis
+### 11. Reflect Paper Analysis
 
 Command:
 
@@ -354,7 +407,7 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli reflect-paper-analysis \
 
 This stage reviews prior analysis outputs and flags weak or unsupported claims. It is currently deterministic and is meant to reduce hallucination risk by checking whether claims are grounded in available text/evidence.
 
-### 11. Extract Datasets
+### 12. Extract Datasets
 
 Command:
 
@@ -366,7 +419,7 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli extract-datasets \
 
 This is an older deterministic extraction path. It still remains useful as a fallback/regression path while the agentic taxonomy synthesis matures.
 
-### 12. Check Availability
+### 13. Check Availability
 
 Command:
 
@@ -378,7 +431,7 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli check-availability \
 
 This checks whether dataset URLs appear open, closed, missing, or uncertain.
 
-### 13. Resolve Reuse
+### 14. Resolve Reuse
 
 Command:
 
@@ -390,7 +443,7 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli resolve-reuse \
 
 This computes reuse counts and identity relationships across datasets.
 
-### 14. Export
+### 15. Export
 
 Command:
 

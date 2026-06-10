@@ -21,3 +21,6 @@ evidence/
 *.pdf
 !tests/fixtures/*.html
 !tests/fixtures/*.pdf
+
+# macOS
+.DS_Store

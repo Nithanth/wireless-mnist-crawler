@@ -30,6 +30,36 @@ def test_tiny_end_to_end_fixture_pipeline(tmp_path: Path) -> None:
     assert (out / "list_of_papers.csv").exists()
 
 
+def test_classify_wireless_exports_title_abstract_json_cache(tmp_path: Path) -> None:
+    db = tmp_path / "taxonomy.sqlite"
+    out = tmp_path / "classification-cache.json"
+    pipeline = Pipeline(load_settings(db))
+    try:
+        run_id = pipeline.ingest("SIGCOMM", 2025, "url", str(FIXTURES / "sigcomm_2025_papers_info.html"))
+        classification_run_id = pipeline.classify_wireless(run_id)
+        path = pipeline.export_classification_cache(run_id, classification_run_id, out)
+        review_count = pipeline.conn.execute(
+            "SELECT COUNT(*) AS count FROM review_items WHERE run_id = ?",
+            (classification_run_id,),
+        ).fetchone()["count"]
+    finally:
+        pipeline.close()
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    papers = {paper["title"]: paper for paper in payload["papers"]}
+
+    assert payload["schema"] == "wireless-taxonomy.paper-classification-cache.v1"
+    assert payload["paper_count"] == 2
+    assert payload["summary"]["category_counts"]["wireless"] == 1
+    assert payload["summary"]["category_counts"]["networking_non_wireless"] == 1
+    assert payload["summary"]["wireless_count"] == 1
+    assert review_count == 0
+    assert papers["Example Wireless Dataset Paper"]["classification"]["is_wireless"] == 1
+    assert papers["Example Wireless Dataset Paper"]["classification"]["category"] == "wireless"
+    assert papers["Example Datacenter Congestion Paper"]["classification"]["is_wireless"] == 0
+    assert papers["Example Datacenter Congestion Paper"]["classification"]["category"] == "networking_non_wireless"
+
+
 def test_enrich_paper_text_persists_artifacts_links_and_snippets(tmp_path: Path) -> None:
     db = tmp_path / "taxonomy.sqlite"
     paper_page = FIXTURES / "example_paper_page.html"
