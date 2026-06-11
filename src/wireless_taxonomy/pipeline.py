@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from pathlib import Path
 
 from wireless_taxonomy.analyze.candidates import KeywordCandidateClassifier, LlmCandidateClassifier
 from wireless_taxonomy.config import Settings
@@ -325,6 +324,60 @@ class Pipeline:
             "classify_run_id": classify_run,
             "papers": papers,
         }
+
+    def text_availability_conference(
+        self,
+        venue: str,
+        year: int,
+        source_type: str = "dblp",
+        source_value: str | None = None,
+        resolve_dois: bool = True,
+        cache=None,
+        resolver=None,
+    ) -> dict:
+        """Report which papers in a venue/year have a legally fetchable full text.
+
+        Ingests the accepted-paper list, backfills missing DOIs (so the
+        open-access lookups are reliable), then asks the open metadata APIs
+        (Unpaywall/OpenAlex/Semantic Scholar/arXiv) whether each paper has a
+        legally hosted OA copy. Returns the full per-paper set plus coverage
+        counts. It reads OA *status* only — it never downloads or scrapes
+        paywalled full text.
+        """
+        from wireless_taxonomy.analyze.oa_availability import OpenAccessResolver, summarize
+
+        ingest_run = self.ingest(venue, year, source_type, source_value or "")
+        if resolve_dois:
+            self.enrich_abstracts(ingest_run, resolve_dois=True, cache=cache)
+        conference_instance_id = self._require_run(ingest_run)["conference_instance_id"]
+        source_urls = self._paper_source_urls(conference_instance_id)
+        rows = self.conn.execute(
+            "SELECT id, title, doi, paper_url FROM papers WHERE conference_instance_id = ? ORDER BY id",
+            (conference_instance_id,),
+        ).fetchall()
+        resolver = resolver or OpenAccessResolver(cache=cache)
+        papers: list[dict] = []
+        for row in rows:
+            title = row["title"]
+            doi = (row["doi"] or "").strip()
+            url = source_urls.get(row["id"]) or (row["paper_url"] or "").strip()
+            result = resolver.resolve(title, doi or None, url or None)
+            papers.append(
+                {
+                    "title": title,
+                    "doi": doi,
+                    "venue": venue,
+                    "year": year,
+                    "fetchable": result.fetchable,
+                    "oa_status": result.oa_status,
+                    "license": result.license,
+                    "pdf_url": result.pdf_url,
+                    "provider": result.provider,
+                    "source_url": result.source_url,
+                }
+            )
+        summary = summarize(papers)
+        return {"venue": venue, "year": year, **summary, "papers": papers}
 
     def _adapter(self, venue: str, year: int, source_type: str, source_value: str):
         if source_type == "url":

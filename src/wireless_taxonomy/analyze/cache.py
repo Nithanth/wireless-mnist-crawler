@@ -49,6 +49,7 @@ class MetadataCache:
         self.abstracts: dict[str, dict[str, str]] = {}
         self.dois: dict[str, dict[str, str]] = {}
         self.llm: dict[str, dict[str, Any]] = {}
+        self.oa: dict[str, dict[str, Any]] = {}
         self.dirty = False
         if self.path is not None and self.path.exists():
             self._load()
@@ -63,12 +64,15 @@ class MetadataCache:
             abstracts = data.get("abstracts")
             dois = data.get("dois")
             llm = data.get("llm")
+            oa = data.get("oa")
             if isinstance(abstracts, dict):
                 self.abstracts = {k: v for k, v in abstracts.items() if isinstance(v, dict)}
             if isinstance(dois, dict):
                 self.dois = {k: v for k, v in dois.items() if isinstance(v, dict)}
             if isinstance(llm, dict):
                 self.llm = {k: v for k, v in llm.items() if isinstance(v, dict)}
+            if isinstance(oa, dict):
+                self.oa = {k: v for k, v in oa.items() if isinstance(v, dict)}
 
     # -- abstracts -----------------------------------------------------------
 
@@ -99,6 +103,23 @@ class MetadataCache:
             self.dois[key] = value
             self.dirty = True
 
+    # -- open-access availability --------------------------------------------
+
+    def get_oa(self, title: str | None, doi: str | None) -> dict[str, Any] | None:
+        for key in (_doi_key(doi), _title_key(title)):
+            if key and key in self.oa:
+                return self.oa[key]
+        return None
+
+    def set_oa(self, title: str | None, doi: str | None, value: dict[str, Any]) -> None:
+        wrote = False
+        for key in (_doi_key(doi), _title_key(title)):
+            if key:
+                self.oa[key] = value
+                wrote = True
+        if wrote:
+            self.dirty = True
+
     # -- LLM labels ----------------------------------------------------------
 
     def get_llm(self, key: str) -> dict[str, Any] | None:
@@ -116,7 +137,7 @@ class MetadataCache:
         if self.path is None or not self.dirty:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload: dict[str, Any] = {"abstracts": self.abstracts, "dois": self.dois, "llm": self.llm}
+        payload: dict[str, Any] = {"abstracts": self.abstracts, "dois": self.dois, "llm": self.llm, "oa": self.oa}
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -128,4 +149,4 @@ class MetadataCache:
         self.dirty = False
 
     def stats(self) -> dict[str, int]:
-        return {"abstracts": len(self.abstracts), "dois": len(self.dois), "llm": len(self.llm)}
+        return {"abstracts": len(self.abstracts), "dois": len(self.dois), "llm": len(self.llm), "oa": len(self.oa)}
