@@ -66,9 +66,12 @@ class OpenAccessResolver:
         self.cache = cache
         self._mailto = (os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip()
         if providers is None:
-            # Unpaywall is the canonical legal-OA resolver but requires an email;
-            # without one it is skipped and the others carry the load.
-            providers = ["unpaywall", "openalex", "semantic_scholar", "arxiv"]
+            # "usenix" is authoritative-and-free for NSDI/OSDI/ATC/Security
+            # (USENIX hosts every paper open-access), so it runs first and only
+            # fires for usenix.org URLs. Unpaywall is the canonical legal-OA
+            # resolver but requires an email; without one it is skipped and the
+            # others carry the load.
+            providers = ["usenix", "unpaywall", "openalex", "semantic_scholar", "arxiv"]
         self.providers = providers
 
     def resolve(self, title: str | None, doi: str | None, url: str | None = None) -> OaResult:
@@ -109,6 +112,14 @@ class OpenAccessResolver:
                 },
             )
         return result
+
+    def _usenix(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
+        # USENIX (NSDI/OSDI/ATC/Security) publishes every paper open-access on
+        # its own site, so a usenix.org landing page is itself the free full
+        # text. No network call needed — DBLP already linked the page.
+        if not url or "usenix.org" not in url:
+            return None
+        return OaResult(True, "gold", "usenix-open-access", url, "usenix", url)
 
     def _unpaywall(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
         if not doi or not self._mailto:

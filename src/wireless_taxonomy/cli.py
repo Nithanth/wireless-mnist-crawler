@@ -400,6 +400,9 @@ def fetch_coverage(
 
     import os as _os
 
+    from wireless_taxonomy.config import load_dotenv
+
+    load_dotenv()  # so a .env-provided contact email enables Unpaywall (and the note below is accurate)
     if not (_os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip():
         typer.echo(
             "note: WIRELESS_TAXONOMY_CONTACT_EMAIL not set — skipping Unpaywall "

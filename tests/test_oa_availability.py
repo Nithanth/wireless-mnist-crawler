@@ -56,6 +56,20 @@ def test_arxiv_url_is_fetchable_without_network() -> None:
     assert res.pdf_url == "https://arxiv.org/pdf/2401.00001"
 
 
+def test_usenix_url_is_open_access_without_network() -> None:
+    page = "https://www.usenix.org/conference/nsdi24/presentation/author"
+    resolver = OpenAccessResolver(
+        fetch_json=_fetch_json([]),  # must not need the network
+        fetch_text=lambda u: "",
+        providers=["usenix", "openalex"],
+    )
+    res = resolver.resolve("A USENIX Paper", None, url=page)
+    assert res.fetchable
+    assert res.provider == "usenix"
+    assert res.oa_status == "gold"
+    assert res.pdf_url == page
+
+
 def test_closed_paper_is_not_fetchable() -> None:
     resolver = OpenAccessResolver(
         fetch_json=_fetch_json([]),
