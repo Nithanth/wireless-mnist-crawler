@@ -495,6 +495,7 @@ def _s2_headers() -> dict[str, str]:
 
 
 def _default_fetch_json(url: str) -> dict[str, Any]:
+    import http.client
     import json as _json
     import time
     from urllib.error import HTTPError, URLError
@@ -516,7 +517,10 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
             if exc.code not in _RETRYABLE_STATUS:
                 raise
             wait = _retry_wait_seconds(exc, attempt)
-        except URLError as exc:
+        except (URLError, http.client.HTTPException, ConnectionError) as exc:
+            # Transient connection drops (e.g. RemoteDisconnected from
+            # getresponse(), which urllib leaves unwrapped) are retried instead
+            # of crashing a long multi-conference run.
             last_error = exc
         if attempt + 1 < attempts:
             time.sleep(wait)
@@ -526,6 +530,7 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
 
 
 def _default_fetch_json_post(url: str, body: dict[str, Any]) -> Any:
+    import http.client
     import json as _json
     import time
     from urllib.error import HTTPError, URLError
@@ -546,7 +551,7 @@ def _default_fetch_json_post(url: str, body: dict[str, Any]) -> Any:
             if exc.code not in _RETRYABLE_STATUS:
                 raise
             wait = _retry_wait_seconds(exc, attempt)
-        except URLError as exc:
+        except (URLError, http.client.HTTPException, ConnectionError) as exc:
             last_error = exc
         if attempt + 1 < attempts:
             time.sleep(wait)
@@ -566,6 +571,7 @@ _USENIX_VENUE_TAIL_RE = re.compile(r"\s+[A-Z]{2,6}\s*['\u2019]?\s*\d{2}\s*$")
 
 
 def _default_fetch_text(url: str) -> str:
+    import http.client
     import time
     from urllib.error import HTTPError, URLError
     from urllib.request import Request, urlopen
@@ -585,7 +591,7 @@ def _default_fetch_text(url: str) -> str:
             last_error = exc
             if exc.code not in _RETRYABLE_STATUS:
                 return ""
-        except URLError as exc:
+        except (URLError, http.client.HTTPException, ConnectionError) as exc:
             last_error = exc
         if attempt + 1 < attempts:
             time.sleep(min(1.5 * (2**attempt), 20.0))
