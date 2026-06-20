@@ -67,15 +67,15 @@ _patch_typer_click_compat()
 
 app = typer.Typer(
     help=(
-        "Measure automated wireless-paper classification coverage per conference-year.\n\n"
-        "Three commands:\n"
-        "  classify   loop a venue over a year (or year range), fetch the paper "
-        "list, backfill abstracts, label each paper, and print/export the "
-        "yes/maybe/no breakdown.\n"
-        "  eval       DB-free snapshot scoring of a labelled CSV vs a gold sheet.\n"
-        "  fetch-coverage  report the %/list of papers with a legally fetchable "
-        "open-access full text (no paywalled scraping).\n"
-        "  llm-config show which LLM providers are configured."
+        "Wireless paper classification + dataset extraction CLI.\n\n"
+        "Commands:\n"
+        "  classify          Classify papers as wireless (yes/maybe/no) for a venue/year.\n"
+        "  eval              DB-free snapshot eval of classified CSV vs gold sheet.\n"
+        "  fetch-coverage    Report OA full-text availability per venue/year.\n"
+        "  extract-datasets  Full pipeline: classify → fetch PDF → extract datasets → CSV.\n"
+        "  merge-results     Combine per-venue/year CSVs into master files.\n"
+        "  cache             Inspect or clear the LLM/API cache.\n"
+        "  llm-config        Show configured LLM providers and models."
     )
 )
 
@@ -467,6 +467,330 @@ def _echo_coverage(result: dict) -> None:
         typer.echo("  by OA status: " + ", ".join(f"{k} {v}" for k, v in by_status.items()))
     if by_source:
         typer.echo("  by source: " + ", ".join(f"{k} {v}" for k, v in by_source.items()))
+
+
+@app.command("extract-datasets")
+def extract_datasets(
+    venue: str = typer.Option(..., "--venue", help="Conference venue, e.g. NSDI, SIGCOMM, IMC."),
+    years: str = typer.Option(..., "--years", help="A year (2024) or inclusive range (2022:2025)."),
+    out: str = typer.Option(".", "--out", help="Output directory for the 3 CSV sheets + raw JSON."),
+    oa_json: Optional[str] = typer.Option(None, "--oa-json", help="Glob path to cov_*.json files from fetch-coverage to reuse known PDF URLs."),
+    fresh: bool = typer.Option(False, "--fresh", help="Ignore LLM cache and re-extract all papers. PDF text cache in the DB is still reused."),
+    wireless_only: bool = typer.Option(True, "--wireless-only/--all-papers", help="Only extract datasets from papers classified as wireless (yes+maybe for max recall). Use --all-papers to process every paper."),
+    db: str = typer.Option("taxonomy.sqlite", "--db"),
+) -> None:
+    """Run the full dataset-extraction loop for a venue and year range.
+
+    For each paper in the corpus:
+      1. Fetch the PDF (or fall back to abstract) and send to the LLM natively.
+      2. Extract datasets: name, relationship, modalities, OSI layers,
+         availability (verified via live URL check), collection environment.
+      3. Search Semantic Scholar + GitHub + web for other papers using each dataset.
+
+    Writes three CSV sheets to --out matching the manual spreadsheet schema:
+      <venue>_<years>_papers.csv   — Paper Title, Authors, Conference, Year, Datasets, BibTeX Key
+      <venue>_<years>_bibtex.csv   — BibTeX Key, DOI Key, Full BibTeX
+      <venue>_<years>_datasets.csv — Dataset Name, OSI Layers, Modalities, Availability, ...
+
+    All LLM and search results are cached in .wt_cache.json for fast re-runs.
+    """
+    import glob as _glob
+
+    year_list = _parse_years(years)
+    year_tag = years.replace(":", "-")
+
+    from wireless_taxonomy.analyze.cache import MetadataCache
+    metadata_cache = MetadataCache(".wt_cache.json")
+
+    oa_pdf_urls: dict[str, str] = {}
+    if oa_json:
+        oa_paths = sorted(_glob.glob(oa_json)) if "*" in oa_json else [oa_json]
+        for p in oa_paths:
+            try:
+                data = json.loads(Path(p).read_text(encoding="utf-8"))
+                for run in data.get("runs", []):
+                    for paper in run.get("papers", []):
+                        url = paper.get("pdf_url") or ""
+                        if url and "dl.acm.org" not in url:
+                            oa_pdf_urls[paper["title"]] = url
+            except Exception as exc:
+                typer.echo(f"Warning: could not load OA JSON {p}: {exc}", err=True)
+    if oa_pdf_urls:
+        typer.echo(f"Loaded {len(oa_pdf_urls)} PDF URLs from fetch-coverage output.")
+
+    all_results: list[dict] = []
+    pipeline = _pipeline(db)
+    try:
+        for year in year_list:
+            typer.echo(f"\n[{venue} {year}] Extracting datasets...")
+            result = pipeline.extract_datasets_conference(
+                venue=venue,
+                year=year,
+                source_type="dblp",
+                resolve_dois=True,
+                oa_pdf_urls=oa_pdf_urls,
+                cache=metadata_cache,
+                fresh=fresh,
+                wireless_only=wireless_only,
+            )
+            all_results.append(result)
+            typer.echo(
+                f"  {result['papers_with_datasets']}/{result['total_papers']} papers "
+                f"with datasets — {result['total_dataset_records']} records"
+            )
+    finally:
+        pipeline.close()
+        metadata_cache.save()
+
+    out_dir = Path(out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    slug = f"{venue.lower()}_{year_tag}"
+
+    # Raw JSON for debugging / re-processing
+    json_path = out_dir / f"{slug}_raw.json"
+    json_path.write_text(
+        json.dumps({"venue": venue, "years": year_list, "runs": all_results}, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    all_papers = [p for r in all_results for p in r["papers"]]
+
+    # Sheet 1: Papers  — matches manual "List of Papers" sheet
+    papers_path = out_dir / f"{slug}_papers.csv"
+    with papers_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=[
+            "Paper Title", "Authors", "Conference", "Year",
+            "Datasets", "Bibtex Citation Key",
+        ])
+        writer.writeheader()
+        for p in all_papers:
+            writer.writerow({
+                "Paper Title": p["title"],
+                "Authors": p["authors"],
+                "Conference": p["venue"],
+                "Year": p["year"],
+                "Datasets": "; ".join(d["name"] for d in p["datasets"]),
+                "Bibtex Citation Key": p["bibtex_key"],
+            })
+
+    # Sheet 2: BibTeX — matches manual "BibTeX" sheet
+    bibtex_path = out_dir / f"{slug}_bibtex.csv"
+    with bibtex_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=[
+            "Bibtex Citation Key", "DOI Version of Key", "Bibtex Citation",
+        ])
+        writer.writeheader()
+        for p in all_papers:
+            doi_key = f"doi:{p['doi']}" if p["doi"] else ""
+            writer.writerow({
+                "Bibtex Citation Key": p["bibtex_key"],
+                "DOI Version of Key": doi_key,
+                "Bibtex Citation": p["bibtex"],
+            })
+
+    # Sheet 3: Datasets — matches manual "List of Datasets" sheet
+    seen_datasets: dict[str, dict] = {}
+    for p in all_papers:
+        for d in p["datasets"]:
+            name = d["name"]
+            if name not in seen_datasets:
+                seen_datasets[name] = d.copy()
+                seen_datasets[name]["_paper_count"] = 1
+                seen_datasets[name]["_first_key"] = p["bibtex_key"]
+                seen_datasets[name]["_introducing_key"] = p["bibtex_key"] if d.get("relationship_type") == "introduced" else ""
+            else:
+                seen_datasets[name]["_paper_count"] += 1
+                if d.get("relationship_type") == "introduced" and not seen_datasets[name]["_introducing_key"]:
+                    seen_datasets[name]["_introducing_key"] = p["bibtex_key"]
+
+    datasets_path = out_dir / f"{slug}_datasets.csv"
+    with datasets_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = _csv.DictWriter(fh, fieldnames=[
+            "Dataset Name", "Bibtex Citation Key",
+            "OSI Layer (L1-L7)", "Modality(ies)",
+            "Availability (Open? Y/N)", "Availability URL", "Annotations on Availability",
+            "Collection Environment", "Number of Papers using Dataset",
+        ])
+        writer.writeheader()
+        for name, d in sorted(seen_datasets.items()):
+            avail = "Y" if d["availability"] else ("N" if d["availability"] is False else "")
+            writer.writerow({
+                "Dataset Name": name,
+                "Bibtex Citation Key": d.get("_introducing_key") or d.get("_first_key", ""),
+                "OSI Layer (L1-L7)": "; ".join(d["osi_layers"]),
+                "Modality(ies)": "; ".join(d["modalities"]),
+                "Availability (Open? Y/N)": avail,
+                "Availability URL": d.get("availability_url", ""),
+                "Annotations on Availability": d.get("availability_notes") or "",
+                "Collection Environment": d.get("collection_environment") or "",
+                "Number of Papers using Dataset": d.get("usage_count") or d["_paper_count"],
+            })
+
+    typer.echo(f"\nOutput written to {out_dir}/")
+    typer.echo(f"  {papers_path.name}")
+    typer.echo(f"  {bibtex_path.name}")
+    typer.echo(f"  {datasets_path.name}")
+    typer.echo(f"  {json_path.name} (raw)")
+
+
+@app.command("merge-results")
+def merge_results(
+    results_dir: str = typer.Option("./src/results", "--dir", help="Directory containing per-venue/year CSV + JSON files."),
+    out: str = typer.Option("./src/results", "--out", help="Output directory for merged master files."),
+) -> None:
+    """Merge all per-venue/year CSVs and JSONs into master files.
+
+    Reads all *_papers.csv, *_bibtex.csv, *_datasets.csv, and *_raw.json files
+    from --dir and produces:
+      master_papers.csv, master_bibtex.csv, master_datasets.csv, master_raw.json
+    """
+    import glob as _glob
+
+    src = Path(results_dir)
+    dst = Path(out)
+    dst.mkdir(parents=True, exist_ok=True)
+
+    # --- Papers ---
+    papers_files = sorted(_glob.glob(str(src / "*_papers.csv")))
+    all_paper_rows: list[dict] = []
+    paper_fields: list[str] = []
+    for f in papers_files:
+        with open(f, newline="", encoding="utf-8") as fh:
+            reader = _csv.DictReader(fh)
+            if not paper_fields and reader.fieldnames:
+                paper_fields = list(reader.fieldnames)
+            all_paper_rows.extend(reader)
+    if all_paper_rows:
+        p = dst / "master_papers.csv"
+        with p.open("w", newline="", encoding="utf-8") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=paper_fields)
+            writer.writeheader()
+            writer.writerows(all_paper_rows)
+        typer.echo(f"  {p.name}: {len(all_paper_rows)} papers from {len(papers_files)} files")
+
+    # --- BibTeX ---
+    bibtex_files = sorted(_glob.glob(str(src / "*_bibtex.csv")))
+    all_bib_rows: list[dict] = []
+    seen_bib_keys: set[str] = set()
+    bib_fields: list[str] = []
+    for f in bibtex_files:
+        with open(f, newline="", encoding="utf-8") as fh:
+            reader = _csv.DictReader(fh)
+            if not bib_fields and reader.fieldnames:
+                bib_fields = list(reader.fieldnames)
+            for row in reader:
+                key = row.get("Bibtex Citation Key", "")
+                if key not in seen_bib_keys:
+                    seen_bib_keys.add(key)
+                    all_bib_rows.append(row)
+    if all_bib_rows:
+        p = dst / "master_bibtex.csv"
+        with p.open("w", newline="", encoding="utf-8") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=bib_fields)
+            writer.writeheader()
+            writer.writerows(all_bib_rows)
+        typer.echo(f"  {p.name}: {len(all_bib_rows)} entries from {len(bibtex_files)} files")
+
+    # --- Datasets (deduplicated, merge paper counts) ---
+    datasets_files = sorted(_glob.glob(str(src / "*_datasets.csv")))
+    merged_ds: dict[str, dict] = {}
+    ds_fields: list[str] = []
+    for f in datasets_files:
+        with open(f, newline="", encoding="utf-8") as fh:
+            reader = _csv.DictReader(fh)
+            if not ds_fields and reader.fieldnames:
+                ds_fields = list(reader.fieldnames)
+            for row in reader:
+                name = row.get("Dataset Name", "")
+                if name not in merged_ds:
+                    merged_ds[name] = row
+                else:
+                    existing = merged_ds[name]
+                    try:
+                        old_count = int(existing.get("Number of Papers using Dataset") or 0)
+                        new_count = int(row.get("Number of Papers using Dataset") or 0)
+                        existing["Number of Papers using Dataset"] = str(max(old_count, new_count))
+                    except ValueError:
+                        pass
+                    if not existing.get("Bibtex Citation Key") and row.get("Bibtex Citation Key"):
+                        existing["Bibtex Citation Key"] = row["Bibtex Citation Key"]
+    if merged_ds:
+        p = dst / "master_datasets.csv"
+        with p.open("w", newline="", encoding="utf-8") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=ds_fields)
+            writer.writeheader()
+            for name in sorted(merged_ds):
+                writer.writerow(merged_ds[name])
+        typer.echo(f"  {p.name}: {len(merged_ds)} datasets from {len(datasets_files)} files")
+
+    # --- Raw JSON ---
+    json_files = sorted(_glob.glob(str(src / "*_raw.json")))
+    all_runs: list[dict] = []
+    for f in json_files:
+        try:
+            data = json.loads(Path(f).read_text(encoding="utf-8"))
+            all_runs.append(data)
+        except Exception:
+            pass
+    if all_runs:
+        p = dst / "master_raw.json"
+        p.write_text(json.dumps(all_runs, indent=2, ensure_ascii=False), encoding="utf-8")
+        typer.echo(f"  {p.name}: {len(all_runs)} venue/year runs from {len(json_files)} files")
+
+    typer.echo(f"\nMerged output in {dst}/")
+
+
+@app.command("cache")
+def cache_cmd(
+    action: str = typer.Argument("status", help="Action: status | clear | clear-section"),
+    section: Optional[str] = typer.Argument(None, help="Section name for clear-section (abstracts, dois, llm, oa, dataset_usage)"),
+    cache_path: str = typer.Option(".wt_cache.json", "--cache-path"),
+) -> None:
+    """Inspect or manage the .wt_cache.json LLM/API response cache.
+
+    \b
+    Actions:
+      status         Show entry counts per section and file size
+      clear          Wipe the entire cache (prompts for confirmation)
+      clear-section  Clear one section: abstracts | dois | llm | oa | dataset_usage
+    """
+    from wireless_taxonomy.analyze.cache import MetadataCache
+
+    p = Path(cache_path)
+    if not p.exists():
+        typer.echo(f"Cache file not found: {p}")
+        raise typer.Exit()
+
+    c = MetadataCache(p)
+
+    if action == "status":
+        stats = c.stats()
+        size_kb = p.stat().st_size / 1024
+        typer.echo(f"Cache: {p}  ({size_kb:.1f} KB)")
+        for section_name, count in stats.items():
+            typer.echo(f"  {section_name:<20} {count} entries")
+
+    elif action == "clear":
+        typer.confirm(f"Wipe ALL entries in {p}?", abort=True)
+        c.clear()
+        c.save()
+        typer.echo("Cache cleared.")
+
+    elif action == "clear-section":
+        if not section:
+            typer.echo("Provide a section name: abstracts | dois | llm | oa | dataset_usage", err=True)
+            raise typer.Exit(1)
+        try:
+            removed = c.clear_section(section)
+            c.save()
+            typer.echo(f"Cleared {removed} entries from '{section}'.")
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1)
+
+    else:
+        typer.echo(f"Unknown action '{action}'. Use: status | clear | clear-section", err=True)
+        raise typer.Exit(1)
 
 
 @app.command("llm-config")

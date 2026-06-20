@@ -178,15 +178,167 @@ single `eval` over all those CSVs, writing `build/results/report.md` +
 `report.json`. The CLI is the single source of truth; the script just
 orchestrates it.
 
+---
+
+## Dataset Extraction Pipeline
+
+The pipeline finds all papers from a conference year, classifies which are
+wireless, fetches their PDFs, extracts structured dataset records via LLM, and
+outputs CSV spreadsheets. Here's how to use it from scratch.
+
+### Quick start (single venue/year)
+
+```bash
+# 0. Install
+pip install -e .
+
+# 1. Set up your .env (copy from .env.example, fill in API keys)
+cp .env.example .env
+# Required: at least one of OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY
+# Recommended: SEMANTIC_SCHOLAR_API_KEY for better abstract/DOI resolution
+
+# 2. Run for one conference + year
+export PYTHONPATH=src
+
+# Step 1: Find which papers have open-access PDFs
+python -m wireless_taxonomy.cli fetch-coverage \
+  --venue NSDI --years 2024 \
+  --json cov_NSDI_2024.json
+
+# Step 2: Classify + extract datasets (uses PDF URLs from step 1)
+python -m wireless_taxonomy.cli extract-datasets \
+  --venue NSDI --years 2024 \
+  --oa-json cov_NSDI_2024.json \
+  --out ./src/results
+
+# Output: src/results/nsdi_2024_papers.csv
+#         src/results/nsdi_2024_datasets.csv
+#         src/results/nsdi_2024_bibtex.csv
+#         src/results/nsdi_2024_raw.json
+```
+
+### What happens under the hood
+
+```text
+fetch-coverage                    extract-datasets
+┌─────────────┐                  ┌────────────────────────────────────────────┐
+│ DBLP ingest │─── paper list ──▶│ 1. Fetch PDFs (cached in SQLite)          │
+│ (title/DOI) │                  │ 2. Classify wireless? (LLM, yes/maybe/no) │
+└─────────────┘                  │ 3. Filter to wireless (yes + maybe)       │
+       │                         │ 4. Extract datasets from each paper (LLM) │
+       ▼                         │ 5. Verify availability URLs (live check)  │
+  cov_*.json                     │ 6. Search for usage (S2 + GitHub + web)   │
+  (PDF URLs)                     └──────────────┬─────────────────────────────┘
+                                                │
+                                                ▼
+                                     3 CSVs + raw JSON
+```
+
+### Batch run (multiple venues × years)
+
+The `run_batch.sh` script loops over all venue/year combos:
+
+```bash
+# Normal run — reuses all caches from previous runs
+./run_batch.sh
+
+# Full fresh run — archives old results, clears LLM cache, re-classifies everything
+./run_batch.sh --fresh
+
+# Other options:
+./run_batch.sh --fresh-results   # archive old CSVs only, keep LLM cache
+./run_batch.sh --fresh-llm       # clear LLM cache only, keep old CSVs as archive
+```
+
+Edit the VENUES and YEARS arrays at the top of the script to change what runs:
+
+```bash
+VENUES=("NSDI" "SIGCOMM" "IMC" "MobiCom")
+YEARS=("2022" "2023" "2024" "2025")
+```
+
+The script shows live progress:
+
+```text
+┌──────────────────────────────────────────────
+│ [3/16] IMC 2022
+│ 14:32:01 Starting...
+└──────────────────────────────────────────────
+  [12/87] [+] yes(0.95): 5G Performance Measurement with mmWave...
+  [13/87] [-] no(0.92): Scalable Zero-Knowledge Proofs for Non-Li...
+  [14/87] [~] maybe(0.60): Mobile Edge Computing for Autonomous...
+  ...
+  Wireless filter: 23/87 papers pass low_pass (yes+maybe)
+  [1/23] Extracting: 5G Performance Measurement with mmWave...
+  ...
+  ✓ IMC 2022 complete in 142s
+  ─ Progress: 3/16 done | 13 remaining | ETA ~10min
+```
+
+If a venue/year fails (network drop, API error), it **skips** to the next one
+instead of stopping. Failed loops are reported at the end.
+
+### Merging results
+
+After all runs, merge per-venue/year CSVs into master files:
+
+```bash
+# Automatically runs at the end of run_batch.sh, or run manually:
+python -m wireless_taxonomy.cli merge-results --dir ./src/results --out ./src/results
+```
+
+Produces:
+
+- `master_papers.csv` — all papers across all venues/years
+- `master_datasets.csv` — deduplicated datasets with merged counts
+- `master_bibtex.csv` — deduplicated BibTeX entries
+- `master_raw.json` — all raw JSON combined
+
+### Caching layers
+
+| Layer | File | What it stores | How to clear |
+|-------|------|---------------|--------------|
+| **LLM cache** | `.wt_cache.json` | Classification labels, dataset extractions, abstracts, DOIs | `python -m wireless_taxonomy.cli cache clear-section llm` |
+| **PDF cache** | `taxonomy.sqlite` | Raw PDF bytes (expensive to re-download) | Almost never — prompt-independent |
+| **Results** | `src/results/*.csv` | Output spreadsheets | `./run_batch.sh --fresh-results` (archives, doesn't delete) |
+
+LLM classifications are **keyed by prompt + model hash**, so changing the
+classification prompt automatically invalidates old cached results. You don't
+need to manually clear the cache after editing the prompt.
+
+Inspect cache status anytime:
+
+```bash
+python -m wireless_taxonomy.cli cache status
+```
+
 ### Command reference
 
 | Command | Purpose |
 | --- | --- |
-| `classify` | Loop a venue over a year (or `--years A:B` range): DBLP ingest → DOI/abstract backfill → classify; prints the yes/maybe/no breakdown and exports the full labelled set. |
-| `eval` | DB-free snapshot eval: score a classified CSV vs a gold sheet (DOI→title→fuzzy), with optional `--drop-workshops`. No DB/network. |
-| `llm-config` | Show which LLM providers are configured. |
+| `classify` | Loop a venue over a year range: DBLP ingest → DOI/abstract backfill → classify; prints yes/maybe/no breakdown. |
+| `eval` | DB-free snapshot eval: score a classified CSV vs a gold sheet (DOI→title→fuzzy). No DB/network. |
+| `fetch-coverage` | Report which papers have legally fetchable open-access full text. Outputs `cov_*.json`. |
+| `extract-datasets` | Full extraction: classify wireless → fetch PDF → LLM extract → output 3 CSVs. |
+| `merge-results` | Combine all per-venue/year CSVs into master files. |
+| `cache` | Inspect or clear `.wt_cache.json` sections (`status`, `clear`, `clear-section llm`). |
+| `llm-config` | Show which LLM providers are configured and their models. |
 
 Run any command with `--help` for its full flags.
+
+### Environment variables
+
+Copy `.env.example` to `.env` and fill in:
+
+| Variable | Required? | Purpose |
+|----------|-----------|---------|
+| `ANTHROPIC_API_KEY` | At least one LLM key | Anthropic Claude API key |
+| `OPENAI_API_KEY` | At least one LLM key | OpenAI API key |
+| `GEMINI_API_KEY` | At least one LLM key | Google Gemini API key |
+| `WIRELESS_TAXONOMY_LLM_PROVIDER` | Yes | Primary LLM: `anthropic`, `openai`, or `google` |
+| `WIRELESS_TAXONOMY_LLM_FALLBACKS` | No | Comma-separated fallback providers |
+| `SEMANTIC_SCHOLAR_API_KEY` | Recommended | Better DOI resolution & abstract fetching |
+| `WIRELESS_TAXONOMY_UNPAYWALL_EMAIL` | No | Email for Unpaywall OA lookups |
 
 ### Tests
 

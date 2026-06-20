@@ -4,8 +4,11 @@ import json
 import os
 import re
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+DATASET_USAGE_TTL_DAYS = 30
 
 _WS_RE = re.compile(r"[^a-z0-9]+")
 
@@ -50,6 +53,7 @@ class MetadataCache:
         self.dois: dict[str, dict[str, str]] = {}
         self.llm: dict[str, dict[str, Any]] = {}
         self.oa: dict[str, dict[str, Any]] = {}
+        self.dataset_usage: dict[str, dict[str, Any]] = {}
         self.dirty = False
         if self.path is not None and self.path.exists():
             self._load()
@@ -65,6 +69,7 @@ class MetadataCache:
             dois = data.get("dois")
             llm = data.get("llm")
             oa = data.get("oa")
+            du = data.get("dataset_usage")
             if isinstance(abstracts, dict):
                 self.abstracts = {k: v for k, v in abstracts.items() if isinstance(v, dict)}
             if isinstance(dois, dict):
@@ -73,6 +78,8 @@ class MetadataCache:
                 self.llm = {k: v for k, v in llm.items() if isinstance(v, dict)}
             if isinstance(oa, dict):
                 self.oa = {k: v for k, v in oa.items() if isinstance(v, dict)}
+            if isinstance(du, dict):
+                self.dataset_usage = {k: v for k, v in du.items() if isinstance(v, dict)}
 
     # -- abstracts -----------------------------------------------------------
 
@@ -120,9 +127,35 @@ class MetadataCache:
         if wrote:
             self.dirty = True
 
+    # -- dataset usage search ------------------------------------------------
+
+    def get_dataset_usage(self, name: str) -> dict[str, Any] | None:
+        key = name.strip().lower()
+        entry = self.dataset_usage.get(key) if key else None
+        if entry is None:
+            return None
+        stored_at = entry.get("_stored_at")
+        if stored_at:
+            try:
+                age = datetime.now(timezone.utc) - datetime.fromisoformat(stored_at)
+                if age > timedelta(days=DATASET_USAGE_TTL_DAYS):
+                    del self.dataset_usage[key]
+                    self.dirty = True
+                    return None
+            except Exception:
+                pass
+        return entry
+
+    def set_dataset_usage(self, name: str, value: dict[str, Any]) -> None:
+        key = name.strip().lower()
+        if key:
+            value["_stored_at"] = datetime.now(timezone.utc).isoformat()
+            self.dataset_usage[key] = value
+            self.dirty = True
+
     # -- LLM labels ----------------------------------------------------------
 
-    def get_llm(self, key: str) -> dict[str, Any] | None:
+    def get_llm(self, key: str) -> dict[str, Any] | None:  # noqa: D401
         return self.llm.get(key) if key else None
 
     def set_llm(self, key: str, value: dict[str, Any]) -> None:
@@ -137,7 +170,7 @@ class MetadataCache:
         if self.path is None or not self.dirty:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload: dict[str, Any] = {"abstracts": self.abstracts, "dois": self.dois, "llm": self.llm, "oa": self.oa}
+        payload: dict[str, Any] = {"abstracts": self.abstracts, "dois": self.dois, "llm": self.llm, "oa": self.oa, "dataset_usage": self.dataset_usage}
         fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -148,5 +181,30 @@ class MetadataCache:
                 os.unlink(tmp)
         self.dirty = False
 
+    def clear(self) -> None:
+        """Wipe all sections and mark dirty so save() persists the empty state."""
+        self.abstracts.clear()
+        self.dois.clear()
+        self.llm.clear()
+        self.oa.clear()
+        self.dataset_usage.clear()
+        self.dirty = True
+
+    def clear_section(self, section: str) -> int:
+        """Clear one named section. Returns number of entries removed."""
+        mapping = {
+            "abstracts": self.abstracts,
+            "dois": self.dois,
+            "llm": self.llm,
+            "oa": self.oa,
+            "dataset_usage": self.dataset_usage,
+        }
+        if section not in mapping:
+            raise ValueError(f"Unknown section '{section}'. Valid: {list(mapping)}.")
+        count = len(mapping[section])
+        mapping[section].clear()
+        self.dirty = True
+        return count
+
     def stats(self) -> dict[str, int]:
-        return {"abstracts": len(self.abstracts), "dois": len(self.dois), "llm": len(self.llm), "oa": len(self.oa)}
+        return {"abstracts": len(self.abstracts), "dois": len(self.dois), "llm": len(self.llm), "oa": len(self.oa), "dataset_usage": len(self.dataset_usage)}

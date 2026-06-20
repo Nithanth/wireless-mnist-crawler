@@ -136,7 +136,7 @@ class KeywordCandidateClassifier:
 
 
 class LlmCandidateClassifier:
-    """LLM classifier restricted to title + abstract (no full text)."""
+    """LLM classifier using title + abstract, or full PDF when available."""
 
     classifier = "llm"
     provider_name = "llm_candidate_v0"
@@ -165,11 +165,11 @@ class LlmCandidateClassifier:
             providers = ()
         return ",".join(f"{p.provider}/{p.model}" for p in providers)
 
-    def classify(self, paper: dict[str, Any]) -> CandidatePrediction:
+    def classify(self, paper: dict[str, Any], pdf_bytes: bytes | None = None) -> CandidatePrediction:
         paper_id = int(paper["id"])
         abstract = paper.get("abstract")
         used_abstract = bool(abstract and str(abstract).strip())
-        prompt = _prompt(paper)
+        prompt = _prompt(paper, has_pdf=pdf_bytes is not None)
         cache_key = _llm_cache_key(self.provider_name, self._model_identity(), prompt)
         if self.cache is not None and not self.refresh:
             cached = self.cache.get_llm(cache_key)
@@ -189,6 +189,7 @@ class LlmCandidateClassifier:
                 schema_name="WirelessCandidate",
                 prompt=prompt,
                 metadata={"paper_id": paper_id, "title": paper.get("title")},
+                pdf_bytes=pdf_bytes,
             )
         )
         if not isinstance(response.parsed, dict):
@@ -227,7 +228,7 @@ def _llm_cache_key(provider_name: str, model_identity: str, prompt: str) -> str:
     return f"v1:{digest}"
 
 
-def _prompt(paper: dict[str, Any]) -> str:
+def _prompt(paper: dict[str, Any], has_pdf: bool = False) -> str:
     paper_json = json.dumps(
         {
             "title": paper.get("title"),
@@ -235,31 +236,64 @@ def _prompt(paper: dict[str, Any]) -> str:
         },
         ensure_ascii=False,
     )
+    context_note = (
+        "You have the full paper PDF attached. Use ALL available content to judge."
+        if has_pdf
+        else (
+            "You only see the title and abstract. When information is limited, "
+            "lean toward \"maybe\" rather than \"no\" — we prefer to include "
+            "borderline papers rather than miss wireless papers."
+        )
+    )
     return f"""
 You screen one research paper to decide if it is a WIRELESS / wireless-networking paper.
-You only see the title and abstract. Do not assume facts beyond them.
+{context_note}
 
-Wireless covers topics such as: cellular (4G/5G/6G/LTE), Wi-Fi/802.11, mmWave, MIMO,
-beamforming, RF/spectrum, antennas, channel/CSI/RSSI/SINR measurements, RAN/base stations,
-backscatter, LoRa/LPWAN, Bluetooth, satellite/non-terrestrial links, and wireless sensing.
-Wired-only networking, pure systems, ML, or theory papers are NOT wireless.
+Wireless covers (non-exhaustive):
+- Cellular: 4G/LTE, 5G/NR, 6G, RAN, base stations, O-RAN, small cells, HetNets
+- Wi-Fi / 802.11: any variant (ax, be, ad, ay), WLAN, access points
+- Millimeter-wave (mmWave), sub-THz, terahertz communications
+- MIMO, massive MIMO, beamforming, antenna design, phased arrays
+- RF / spectrum: channel modeling, CSI, RSSI, SINR, propagation, spectrum sharing,
+  cognitive radio, dynamic spectrum access
+- IoT wireless: LoRa, LPWAN, Zigbee, Bluetooth/BLE, UWB, RFID, NFC, backscatter
+- Satellite / non-terrestrial networks: LEO, GEO, direct-to-cell, satellite IoT
+- Wireless sensing: radar, WiFi sensing, RF sensing, localization, positioning
+- Vehicular: V2X, V2V, DSRC, C-V2X
+- Device-to-device (D2D), mesh, ad-hoc networks
+- Mobile edge / MEC when the wireless link is central
+- ML/AI *applied to* wireless problems (e.g., deep learning for channel estimation,
+  RL for spectrum management) — these ARE wireless papers
 
-Judge by the paper's *central* contribution, not by incidental mentions. Label "yes"
-only when the wireless link/medium is core to the work. If the contribution is really
-about wired/datacenter networking, general distributed systems, or media/streaming and
-a radio is merely the access link or an aside, it is NOT wireless.
+NOT wireless (label "no"):
+- Wired/datacenter networking (switches, RDMA, flow scheduling, optical fiber)
+- Pure distributed systems, storage, OS, or databases
+- Video/streaming/CDN where the radio link is merely the last-hop access
+- Pure ML/theory with no wireless application
+
+Judge by the paper's *central* contribution. Label "yes" when the wireless
+link/medium is core to the work, not just incidentally mentioned.
+
+Examples:
+- Title: "EdgeRIC: Empowering Real-time Intelligent Optimization and Control in NextG Cellular Networks"
+  → {{"label": "yes", "confidence": 0.95, "evidence": "Core contribution is a RAN intelligent controller for 5G cellular."}}
+- Title: "DINT: Fast In-Kernel Distributed Transactions with eBPF"
+  → {{"label": "no", "confidence": 0.95, "evidence": "In-kernel datacenter transactions, no wireless component."}}
+- Title: "Habitus: Boosting Mobile Immersive Content Delivery through Full-body Pose Tracking and Multipath Networking"
+  → {{"label": "maybe", "confidence": 0.60, "evidence": "Uses mmWave multipath but main focus is immersive content delivery."}}
 
 Return JSON only:
 {{
-  "label": "yes|no|maybe",
-  "confidence": 0.0,
-  "evidence": "short reason grounded in the title/abstract"
+  "label": "yes" or "no" or "maybe",
+  "confidence": 0.85,
+  "evidence": "short reason grounded in the paper content"
 }}
 
 Rules:
-- "yes": clearly a wireless paper.
-- "no": clearly not wireless.
-- "maybe": ambiguous, or the abstract is missing/too thin to be sure.
+- "yes": wireless link/medium is clearly central to the paper.
+- "no": clearly not about wireless.
+- "maybe": ambiguous, mixed, or not enough information to be sure.
+- confidence: 0.9+ means very certain, 0.5-0.7 means uncertain.
 - Keep evidence to one short sentence.
 
 Paper:

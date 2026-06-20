@@ -23,6 +23,7 @@ _DBLP_STREAMS = {
     "conext": "conf/conext/conext",
     "co-next": "conf/conext/conext",
     "hotnets": "conf/hotnets/hotnets",
+    "globecom": "conf/globecom/globecom",
 }
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/\S+")

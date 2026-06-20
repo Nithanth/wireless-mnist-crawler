@@ -24,5 +24,10 @@ evidence/
 !tests/fixtures/*.html
 !tests/fixtures/*.pdf
 
+# Results & batch outputs
+src/results/
+cov_*.json
+batch_output.log
+
 # macOS
 .DS_Store

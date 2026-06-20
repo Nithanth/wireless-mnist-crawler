@@ -18,6 +18,8 @@ class LlmRequest:
     prompt: str
     schema_name: str | None = None
     metadata: dict[str, Any] | None = None
+    pdf_bytes: bytes | None = None
+    use_web_search: bool = False
 
 
 @dataclass(frozen=True)
@@ -74,10 +76,30 @@ class LlmRouter:
         raise ValueError(f"Unsupported provider: {provider.provider}")
 
 
+def _pdf_bytes_to_text(pdf_bytes: bytes, max_chars: int = 120_000) -> str:
+    """Extract plain text from PDF bytes using pypdf. Truncates to max_chars."""
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            pages.append(text)
+        return "\n".join(pages).strip()[:max_chars]
+    except Exception:
+        return ""
+
+
 def _openai_complete(provider: ProviderConfig, request: LlmRequest) -> str:
+    prompt = request.prompt
+    if request.pdf_bytes:
+        pdf_text = _pdf_bytes_to_text(request.pdf_bytes)
+        if pdf_text:
+            prompt = f"[Full paper text extracted from PDF]\n---\n{pdf_text}\n---\n\n{request.prompt}"
     body = {
         "model": provider.model,
-        "input": request.prompt,
+        "input": prompt,
         "temperature": 0,
     }
     data = _post_json(
@@ -100,11 +122,27 @@ def _openai_complete(provider: ProviderConfig, request: LlmRequest) -> str:
 
 
 def _anthropic_complete(provider: ProviderConfig, request: LlmRequest) -> str:
+    import base64
+
+    if request.pdf_bytes:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.standard_b64encode(request.pdf_bytes).decode(),
+                },
+            },
+            {"type": "text", "text": request.prompt},
+        ]
+    else:
+        content = request.prompt  # type: ignore[assignment]
     body = {
         "model": provider.model,
         "max_tokens": int(os.getenv("WIRELESS_TAXONOMY_LLM_MAX_TOKENS", "16000")),
         "temperature": 0,
-        "messages": [{"role": "user", "content": request.prompt}],
+        "messages": [{"role": "user", "content": content}],
     }
     data = _post_json(
         "https://api.anthropic.com/v1/messages",
@@ -119,23 +157,37 @@ def _anthropic_complete(provider: ProviderConfig, request: LlmRequest) -> str:
 
 
 def _google_complete(provider: ProviderConfig, request: LlmRequest) -> str:
+    import base64
+
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
         raise RuntimeError("Missing GEMINI_API_KEY or GOOGLE_API_KEY")
-    body = {
-        "contents": [{"role": "user", "parts": [{"text": request.prompt}]}],
+    parts: list[dict[str, Any]] = []
+    if request.pdf_bytes:
+        parts.append({
+            "inline_data": {
+                "mime_type": "application/pdf",
+                "data": base64.standard_b64encode(request.pdf_bytes).decode(),
+            }
+        })
+    parts.append({"text": request.prompt})
+    body: dict[str, Any] = {
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "temperature": 0,
             "responseMimeType": "application/json",
         },
     }
+    if request.use_web_search:
+        body["tools"] = [{"google_search": {}}]
+        body["generationConfig"].pop("responseMimeType", None)
     data = _post_json(
         f"https://generativelanguage.googleapis.com/v1beta/models/{quote(provider.model)}:generateContent?key={api_key}",
         body,
         {"Content-Type": "application/json"},
     )
-    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-    return "\n".join(part.get("text", "") for part in parts).strip()
+    parts_out = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    return "\n".join(part.get("text", "") for part in parts_out).strip()
 
 
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -161,6 +213,8 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[
             if exc.code not in _RETRYABLE_STATUS:
                 raise last_error from exc
         except URLError as exc:
+            last_error = RuntimeError(str(exc))
+        except ConnectionError as exc:
             last_error = RuntimeError(str(exc))
         if attempt + 1 < attempts:
             time.sleep(min(2.0 * (2**attempt), 30.0))

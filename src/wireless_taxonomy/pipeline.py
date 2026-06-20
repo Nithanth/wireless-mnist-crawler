@@ -40,6 +40,18 @@ class Pipeline:
 
     def ingest(self, venue: str, year: int, source_type: str, source_value: str) -> int:
         ci_id = self._conference_instance_id(venue, year, source_value if source_type == "url" else None)
+        # Skip network fetch if we already have papers for this conference instance.
+        existing_count = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM papers WHERE conference_instance_id = ?", (ci_id,)
+        ).fetchone()["n"]
+        if existing_count > 0:
+            # Return a synthetic run_id pointing to the existing data.
+            last_run = self.conn.execute(
+                "SELECT id FROM pipeline_runs WHERE conference_instance_id = ? AND stage = 'ingest' "
+                "ORDER BY id DESC LIMIT 1", (ci_id,)
+            ).fetchone()
+            if last_run:
+                return last_run["id"]
         run_id = self._create_run(ci_id, "ingest", source_type, source_value)
         logger = EvidenceLogger(self.settings.evidence_dir, run_id)
         adapter = self._adapter(venue, year, source_type, source_value)
@@ -378,6 +390,304 @@ class Pipeline:
             )
         summary = summarize(papers)
         return {"venue": venue, "year": year, **summary, "papers": papers}
+
+    def extract_datasets_conference(
+        self,
+        venue: str,
+        year: int,
+        source_type: str = "dblp",
+        source_value: str | None = None,
+        resolve_dois: bool = True,
+        oa_pdf_urls: dict[str, str] | None = None,
+        cache=None,
+        extractor=None,
+        fresh: bool = False,
+        wireless_only: bool = True,
+    ) -> dict:
+        """Extract dataset records from every fetchable paper in a venue/year.
+
+        Ingests the paper list (reusing any existing DB records), backfills
+        DOIs, then for each paper fetches its PDF (if a non-ACM URL is known)
+        or falls back to the abstract and asks the LLM to extract structured
+        dataset records. Writes results to ``paper_analysis_dataset_claims`` and
+        ``datasets``, and returns a summary dict suitable for JSON/CSV export.
+
+        ``oa_pdf_urls`` is an optional {title: pdf_url} mapping produced by a
+        prior ``text_availability_conference`` run so we skip re-fetching OA
+        status.
+        """
+        import sys
+
+        from wireless_taxonomy.analyze.dataset_extractor import DatasetExtractor
+        from wireless_taxonomy.llm import LlmRouter
+
+        ingest_run = self.ingest(venue, year, source_type, source_value or "")
+
+        # Always resolve DOIs (needed for CrossRef BibTeX lookup).
+        # Only fetch abstracts for papers that have no PDF URL and no abstract
+        # already — papers with a fetchable PDF don't need it.
+        if resolve_dois:
+            pdf_url_map = oa_pdf_urls or {}
+            self._enrich_for_extraction(ingest_run, pdf_url_map, cache=cache)
+
+        conference_instance_id = self._require_run(ingest_run)["conference_instance_id"]
+        rows = self.conn.execute(
+            "SELECT id, title, authors, doi, abstract FROM papers WHERE conference_instance_id = ? ORDER BY id",
+            (conference_instance_id,),
+        ).fetchall()
+
+        # Optionally filter to wireless-only papers using low_pass classifier
+        # (yes + maybe) for maximum recall. Fetch PDFs for ALL papers first
+        # (cached in SQLite) so the classifier sees full text.
+        if wireless_only:
+            from wireless_taxonomy.analyze.candidates import LlmCandidateClassifier
+            from wireless_taxonomy.analyze.dataset_extractor import _fetch_pdf_bytes, load_cached_pdf, store_cached_pdf
+            from wireless_taxonomy.llm import LlmRouter as _LlmRouter
+
+            classifier = LlmCandidateClassifier(
+                self.settings.llm, router=_LlmRouter(self.settings.llm), cache=cache
+            )
+            # Pre-fetch and cache all PDFs so both classification and extraction
+            # can reuse them without re-downloading.
+            n_total = len(rows)
+            pdf_cache: dict[int, bytes | None] = {}
+            for i, row in enumerate(rows, 1):
+                title = row["title"]
+                pdf_url = (oa_pdf_urls or {}).get(title)
+                pdf_bytes = None
+                if pdf_url:
+                    cached_pdf = load_cached_pdf(self.conn, row["id"], pdf_url)
+                    if cached_pdf is not None:
+                        pdf_bytes = cached_pdf
+                        print(f"  [{i}/{n_total}] PDF cached: {title[:60]}", file=sys.stderr)
+                    else:
+                        pdf_bytes = _fetch_pdf_bytes(pdf_url)
+                        if pdf_bytes:
+                            store_cached_pdf(self.conn, row["id"], pdf_url, pdf_bytes)
+                            print(f"  [{i}/{n_total}] PDF fetched: {title[:60]}", file=sys.stderr)
+                        else:
+                            print(f"  [{i}/{n_total}] PDF failed: {title[:60]}", file=sys.stderr)
+                else:
+                    print(f"  [{i}/{n_total}] No PDF URL: {title[:60]}", file=sys.stderr)
+                pdf_cache[row["id"]] = pdf_bytes
+
+            wireless_ids: set[int] = set()
+            for i, row in enumerate(rows, 1):
+                pdf_bytes = pdf_cache.get(row["id"])
+                try:
+                    pred = classifier.classify(dict(row), pdf_bytes=pdf_bytes)
+                except Exception as exc:
+                    # On LLM failure, default to "maybe" for max recall rather
+                    # than silently dropping the paper.
+                    print(f"  [{i}/{n_total}] [!] error: {row['title'][:55]} — {exc}", file=sys.stderr)
+                    wireless_ids.add(row["id"])
+                    continue
+                label_icon = {"yes": "+", "maybe": "~", "no": "-"}.get(pred.label, "?")
+                print(f"  [{i}/{n_total}] [{label_icon}] {pred.label}({pred.confidence:.2f}): {row['title'][:55]}", file=sys.stderr)
+                if pred.low_pass:
+                    wireless_ids.add(row["id"])
+                # Save cache periodically so progress isn't lost on crash.
+                if cache is not None and i % 20 == 0:
+                    cache.save()
+            if cache is not None:
+                cache.save()
+            total_before = len(rows)
+            rows = [r for r in rows if r["id"] in wireless_ids]
+            print(f"  Wireless filter: {len(rows)}/{total_before} papers pass low_pass (yes+maybe)", file=sys.stderr)
+
+        effective_cache = None if fresh else cache
+        extractor = extractor or DatasetExtractor(
+            router=LlmRouter(self.settings.llm),
+            cache=effective_cache,
+            conn=self.conn,
+        )
+
+        run_id = self._create_run(conference_instance_id, "extract-datasets", source_type, source_value)
+        n_extract = len(rows)
+        results: list[dict] = []
+        for idx, row in enumerate(rows, 1):
+            title = row["title"]
+            doi = (row["doi"] or "").strip()
+            pdf_url = (oa_pdf_urls or {}).get(title)
+            abstract = (row["abstract"] or "").strip() or None
+
+            print(f"  [{idx}/{n_extract}] Extracting: {title[:60]}...", file=sys.stderr)
+            result = extractor.extract(
+                paper_id=row["id"],
+                title=title,
+                authors=row["authors"] or "",
+                venue=venue,
+                year=year,
+                doi=doi,
+                pdf_url=pdf_url,
+                abstract=abstract,
+            )
+
+            with transaction(self.conn):
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO bibtex_entries(paper_id, citation_key, doi, bibtex)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (row["id"], result.bibtex_key, doi or None, result.bibtex),
+                )
+                for ds in result.datasets:
+                    self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO datasets
+                        (canonical_name, normalized_name, source_paper_id,
+                         availability_status, modalities_json, osi_layers_json,
+                         collection_environment, known_users_json, availability_notes, availability_url)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ds.name,
+                            ds.name.lower().strip(),
+                            row["id"] if ds.relationship_type == "introduced" else None,
+                            "open" if ds.availability else ("closed" if ds.availability is False else "unknown"),
+                            json.dumps(ds.modalities),
+                            json.dumps(ds.osi_layers),
+                            ds.collection_environment,
+                            json.dumps(ds.known_users),
+                            ds.availability_notes or None,
+                            ds.availability_url or None,
+                        ),
+                    )
+                    dataset_row = self.conn.execute(
+                        "SELECT id FROM datasets WHERE canonical_name = ?", (ds.name,)
+                    ).fetchone()
+                    dataset_id = dataset_row["id"] if dataset_row else None
+                    self.conn.execute(
+                        """
+                        INSERT OR IGNORE INTO paper_analysis_dataset_claims
+                        (paper_id, dataset_id, run_id, dataset_name, relationship_type,
+                         confidence, modalities_json, osi_layers_json, evidence_text,
+                         availability_status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            row["id"], dataset_id, run_id, ds.name, ds.relationship_type,
+                            ds.confidence, json.dumps(ds.modalities), json.dumps(ds.osi_layers),
+                            ds.evidence_text,
+                            "open" if ds.availability else ("closed" if ds.availability is False else "unknown"),
+                        ),
+                    )
+
+            results.append({
+                "paper_id": result.paper_id,
+                "title": result.title,
+                "authors": result.authors,
+                "venue": venue,
+                "year": year,
+                "doi": result.doi,
+                "bibtex_key": result.bibtex_key,
+                "bibtex": result.bibtex,
+                "extraction_source": result.extraction_source,
+                "error": result.error,
+                "datasets": [
+                    {
+                        "name": ds.name,
+                        "relationship_type": ds.relationship_type,
+                        "modalities": ds.modalities,
+                        "osi_layers": ds.osi_layers,
+                        "availability": ds.availability,
+                        "availability_notes": ds.availability_notes,
+                        "collection_environment": ds.collection_environment,
+                        "known_users": ds.known_users,
+                        "confidence": ds.confidence,
+                        "evidence_text": ds.evidence_text,
+                    }
+                    for ds in result.datasets
+                ],
+            })
+
+        # -- dataset usage search (one call per unique name, cached) ----------
+        from wireless_taxonomy.analyze.dataset_usage import DatasetUsageSearcher
+
+        searcher = DatasetUsageSearcher(cache=cache, router=LlmRouter(self.settings.llm))
+        unique_names: dict[str, dict] = {}
+        for r in results:
+            for d in r["datasets"]:
+                if d["name"] not in unique_names:
+                    unique_names[d["name"]] = d
+
+        usage_map: dict[str, dict] = {}
+        for name in unique_names:
+            usage_map[name] = searcher.search(name)
+
+        # Merge usage search results back into per-paper dataset records
+        for r in results:
+            for d in r["datasets"]:
+                usage = usage_map.get(d["name"], {})
+                search_users = usage.get("known_users") or []
+                existing = d.get("known_users") or []
+                merged = existing + [u for u in search_users if u not in existing]
+                d["known_users"] = merged[:10]
+                d["usage_count"] = usage.get("count", 0)
+                d["usage_sources"] = usage.get("sources", {})
+
+        # Persist usage counts back to the datasets table
+        with transaction(self.conn):
+            for name, usage in usage_map.items():
+                self.conn.execute(
+                    "UPDATE datasets SET known_users_json = ? WHERE canonical_name = ?",
+                    (json.dumps(usage.get("known_users") or []), name),
+                )
+
+        self._complete_run(run_id, f"Extracted datasets for {len(results)} papers in {venue} {year}.")
+        total_datasets = sum(len(r["datasets"]) for r in results)
+        return {
+            "venue": venue,
+            "year": year,
+            "total_papers": len(results),
+            "papers_with_datasets": sum(1 for r in results if r["datasets"]),
+            "total_dataset_records": total_datasets,
+            "run_id": run_id,
+            "papers": results,
+        }
+
+    def _enrich_for_extraction(self, ingest_run: int, pdf_url_map: dict[str, str], cache=None) -> None:
+        """DOI-resolve all papers; only fetch abstracts for those without a PDF URL.
+
+        Papers that already have a fetchable PDF don't need an abstract — the
+        extractor will use the full text directly. This avoids wasting Semantic
+        Scholar / OpenAlex quota on papers we'll never use the abstract for.
+        """
+        from wireless_taxonomy.analyze.abstracts import DoiResolver
+
+        source_run = self._require_run(ingest_run)
+        conference_instance_id = source_run["conference_instance_id"]
+        stage_run_id = self._create_run(conference_instance_id, "enrich-for-extraction", "run", str(ingest_run))
+        doi_resolver = DoiResolver(cache=cache)
+        rows = self.conn.execute(
+            "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id",
+            (conference_instance_id,),
+        ).fetchall()
+        from wireless_taxonomy.analyze.abstracts import AbstractEnricher
+
+        source_urls = self._paper_source_urls(conference_instance_id)
+        enricher = AbstractEnricher(cache=cache)
+        with transaction(self.conn):
+            for paper in rows:
+                doi = (paper["doi"] or "").strip()
+                if not doi and (paper["title"] or "").strip():
+                    doi_result = doi_resolver.resolve(paper["title"])
+                    if doi_result is not None:
+                        doi = doi_result.doi
+                        self.conn.execute("UPDATE papers SET doi = ? WHERE id = ?", (doi, paper["id"]))
+                        self._insert_evidence(
+                            stage_run_id, paper["id"], None, "doi_backfill",
+                            doi_result.provider, doi, doi_result.source_url, 0.8,
+                            {"provider": doi_result.provider},
+                        )
+                has_pdf = bool(pdf_url_map.get(paper["title"]))
+                has_abstract = bool((paper["abstract"] or "").strip())
+                if has_pdf or has_abstract:
+                    continue
+                result = enricher.fetch(paper["title"], doi or None, source_urls.get(paper["id"]))
+                if result is not None:
+                    self.conn.execute("UPDATE papers SET abstract = ? WHERE id = ?", (result.abstract, paper["id"]))
+            self._complete_run(stage_run_id, f"DOI resolution + selective abstract enrichment for {len(rows)} papers.")
 
     def _adapter(self, venue: str, year: int, source_type: str, source_value: str):
         if source_type == "url":

@@ -504,7 +504,7 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
     headers = {"User-Agent": "wireless-taxonomy/0.1"}
     if "api.semanticscholar.org" in url:
         headers = _s2_headers()
-    attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "3")))
+    attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "5")))
     last_error: Exception | None = None
     for attempt in range(attempts):
         wait = min(1.5 * (2**attempt), 20.0)
@@ -539,7 +539,7 @@ def _default_fetch_json_post(url: str, body: dict[str, Any]) -> Any:
     headers = _s2_headers() if "api.semanticscholar.org" in url else {"User-Agent": "wireless-taxonomy/0.1"}
     headers["Content-Type"] = "application/json"
     data = _json.dumps(body).encode("utf-8")
-    attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "3")))
+    attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "5")))
     last_error: Exception | None = None
     for attempt in range(attempts):
         wait = min(1.5 * (2**attempt), 20.0)
