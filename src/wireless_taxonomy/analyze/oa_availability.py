@@ -115,11 +115,15 @@ class OpenAccessResolver:
 
     def _usenix(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
         # USENIX (NSDI/OSDI/ATC/Security) publishes every paper open-access on
-        # its own site, so a usenix.org landing page is itself the free full
-        # text. No network call needed — DBLP already linked the page.
+        # its own site. DBLP links the presentation page; we scrape the actual
+        # PDF download link from it (pattern: /system/files/<conf>-paper-*.pdf).
         if not url or "usenix.org" not in url:
             return None
-        return OaResult(True, "gold", "usenix-open-access", url, "usenix", url)
+        pdf_url = _usenix_pdf_url(url, self.fetch_text)
+        if not pdf_url:
+            # Fallback: the page itself is still legally fetchable (full text in HTML)
+            pdf_url = url
+        return OaResult(True, "gold", "usenix-open-access", pdf_url, "usenix", url)
 
     def _unpaywall(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
         if not doi or not self._mailto:
@@ -241,6 +245,40 @@ class OpenAccessResolver:
             return url
         sep = "&" if "?" in url else "?"
         return f"{url}{sep}mailto={quote(self._mailto)}"
+
+
+_USENIX_PDF_RE = re.compile(r'href=["\']([^"\']*?/system/files/[^"\']*?\.pdf)', re.IGNORECASE)
+
+
+def _usenix_pdf_url(page_url: str, fetch_text: Callable[[str], str]) -> str:
+    """Scrape the direct PDF download link from a USENIX paper page.
+
+    USENIX hosts PDFs at /system/files/<conf>-paper-<author>.pdf. The
+    presentation page links to it. We grab the first .pdf href matching
+    /system/files/ and skip slide PDFs (which contain 'slides' in the filename).
+    """
+    try:
+        html = fetch_text(page_url)
+    except Exception:
+        return ""
+    if not html:
+        return ""
+    matches = _USENIX_PDF_RE.findall(html)
+    for href in matches:
+        # Skip slides PDFs — we want the paper
+        if "slide" in href.lower():
+            continue
+        # Make absolute if relative
+        if href.startswith("/"):
+            href = "https://www.usenix.org" + href
+        return href
+    # If all matches were slides, return the first one anyway (still a valid PDF)
+    if matches:
+        href = matches[0]
+        if href.startswith("/"):
+            href = "https://www.usenix.org" + href
+        return href
+    return ""
 
 
 def _arxiv_pdf_url(value: str) -> str:

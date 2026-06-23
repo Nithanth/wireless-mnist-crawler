@@ -18,7 +18,9 @@ if [[ "$(uname)" == "Darwin" ]] && command -v caffeinate &>/dev/null; then
   caffeinate -dims -w $$ &
 fi
 
-export PYTHONPATH=src
+# Activate the project venv (package is pip-installed in editable mode).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/.venv/bin/activate"
 
 # Defaults
 VENUES_STR="NSDI,SIGCOMM,IMC,MobiCom"
