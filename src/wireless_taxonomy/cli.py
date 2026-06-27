@@ -726,7 +726,18 @@ def merge_results(
 
     # Cross-corpus reuse: count distinct papers mentioning each dataset
     # across ALL raw JSON runs for an accurate corpus-wide count.
-    corpus_paper_counts: dict[str, int] = {}
+    # Uses normalized names so "Michel2022-starlink-performance" and
+    # "Michel2022-starlink-performance-dataset" count as the same dataset.
+    import re as _re
+
+    def _norm_ds(name: str) -> str:
+        n = name.strip().lower()
+        n = _re.sub(r"[- ]+(dataset|traces|measurements|data|evaluation)s?$", "", n)
+        return _re.sub(r"\s+", " ", n)
+
+    # Map normalized name -> canonical (first-seen) raw name
+    norm_to_canonical: dict[str, str] = {}
+    corpus_paper_counts: dict[str, int] = {}  # keyed by normalized name
     for f in sorted(_glob.glob(str(src / "*_raw.json"))):
         try:
             run_data = json.loads(Path(f).read_text(encoding="utf-8"))
@@ -736,16 +747,43 @@ def merge_results(
                     seen_in_paper: set[str] = set()
                     for ds in paper.get("datasets") or []:
                         ds_name = ds.get("name", "")
-                        if ds_name and ds_name not in seen_in_paper:
-                            seen_in_paper.add(ds_name)
-                            corpus_paper_counts[ds_name] = corpus_paper_counts.get(ds_name, 0) + 1
+                        if not ds_name:
+                            continue
+                        norm = _norm_ds(ds_name)
+                        if norm not in norm_to_canonical:
+                            norm_to_canonical[norm] = ds_name
+                        if norm not in seen_in_paper:
+                            seen_in_paper.add(norm)
+                            corpus_paper_counts[norm] = corpus_paper_counts.get(norm, 0) + 1
         except Exception:
             pass
+
+    # Merge rows whose names normalize to the same thing
+    for name in list(merged_ds):
+        norm = _norm_ds(name)
+        canonical = norm_to_canonical.get(norm, name)
+        if canonical != name and canonical in merged_ds:
+            # Merge into the canonical entry
+            existing = merged_ds[canonical]
+            try:
+                old_count = int(existing.get("Number of Papers using Dataset") or 0)
+                new_count = int(merged_ds[name].get("Number of Papers using Dataset") or 0)
+                existing["Number of Papers using Dataset"] = str(old_count + new_count)
+            except ValueError:
+                pass
+            if not existing.get("Bibtex Citation Key") and merged_ds[name].get("Bibtex Citation Key"):
+                existing["Bibtex Citation Key"] = merged_ds[name]["Bibtex Citation Key"]
+            del merged_ds[name]
+        elif canonical != name and canonical not in merged_ds:
+            # Rename to canonical
+            merged_ds[canonical] = merged_ds.pop(name)
+            merged_ds[canonical]["Dataset Name"] = canonical
 
     # Update paper counts from corpus-wide scan and apply reuse filter
     total_before_filter = len(merged_ds)
     for name in list(merged_ds):
-        corpus_count = corpus_paper_counts.get(name, 1)
+        norm = _norm_ds(name)
+        corpus_count = corpus_paper_counts.get(norm, 1)
         merged_ds[name]["Number of Papers using Dataset"] = str(corpus_count)
         if corpus_count < min_corpus_reuse:
             del merged_ds[name]
