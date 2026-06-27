@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Batch 1: NSDI, SIGCOMM, IMC, MobiCom × 2022–2025 (16 loops)
-# Each loop: fetch-coverage → extract-datasets (wireless-only)
+# Batch extraction: fetch-coverage → extract-datasets (wireless-only) per venue/year
 #
 # Usage:
-#   ./run_batch.sh                                    # defaults: NSDI,SIGCOMM,IMC,MobiCom × 2022-2025
+#   ./run_batch.sh                                    # defaults: SIGCOMM,IMC,NSDI × 2022-2024
 #   ./run_batch.sh --venues "NSDI,IMC" --years "2024,2025"
 #   ./run_batch.sh --venues "MobiCom" --years "2022:2025"
 #   ./run_batch.sh --fresh                            # clear old results + LLM cache
 #   ./run_batch.sh --fresh-results                    # archive old results only
 #   ./run_batch.sh --fresh-llm                        # clear LLM cache only
+#
+# The corpus is INCREMENTAL: run once for your initial set, then run again
+# with new --venues/--years to grow it. Re-run `merge-results` afterward to
+# recompute cross-corpus dataset reuse across the full union.
 
 # Prevent macOS from sleeping while this script runs (display + idle + disk + system).
 # caffeinate is killed automatically when this script exits.
@@ -23,8 +26,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.venv/bin/activate"
 
 # Defaults
-VENUES_STR="NSDI,SIGCOMM,IMC,MobiCom"
-YEARS_STR="2022,2023,2024,2025"
+VENUES_STR="SIGCOMM,IMC,NSDI"
+YEARS_STR="2022,2023,2024"
 FRESH_RESULTS=false
 FRESH_LLM=false
 EXTRACT_FRESH_FLAG=""

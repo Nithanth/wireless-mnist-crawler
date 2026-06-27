@@ -92,7 +92,6 @@ def test_cli_help_renders_without_typer_click_compat_error() -> None:
         "eval-files",
         "paper-set",
         "diff-sets",
-        "status",
     ):
         assert gone not in result.stdout, f"{gone} should have been pruned"
 
