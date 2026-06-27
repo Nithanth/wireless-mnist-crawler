@@ -639,9 +639,9 @@ def merge_results(
     results_dir: str = typer.Option("./src/results", "--dir", help="Directory containing per-venue/year CSV + JSON files."),
     out: str = typer.Option("./src/results", "--out", help="Output directory for merged master files."),
     min_corpus_reuse: int = typer.Option(
-        2, "--min-corpus-reuse",
+        1, "--min-corpus-reuse",
         help="Only include datasets mentioned in at least this many papers across the entire corpus. "
-             "Set to 1 to keep all datasets.",
+             "Set to 2+ to filter to cross-paper reuse only.",
     ),
 ) -> None:
     """Merge all per-venue/year CSVs and JSONs into master files.
@@ -730,13 +730,15 @@ def merge_results(
     for f in sorted(_glob.glob(str(src / "*_raw.json"))):
         try:
             run_data = json.loads(Path(f).read_text(encoding="utf-8"))
-            for paper in run_data.get("papers") or []:
-                seen_in_paper: set[str] = set()
-                for ds in paper.get("datasets") or []:
-                    ds_name = ds.get("name", "")
-                    if ds_name and ds_name not in seen_in_paper:
-                        seen_in_paper.add(ds_name)
-                        corpus_paper_counts[ds_name] = corpus_paper_counts.get(ds_name, 0) + 1
+            # Structure: {"venue": ..., "years": [...], "runs": [{"papers": [...]}]}
+            for run in run_data.get("runs") or []:
+                for paper in run.get("papers") or []:
+                    seen_in_paper: set[str] = set()
+                    for ds in paper.get("datasets") or []:
+                        ds_name = ds.get("name", "")
+                        if ds_name and ds_name not in seen_in_paper:
+                            seen_in_paper.add(ds_name)
+                            corpus_paper_counts[ds_name] = corpus_paper_counts.get(ds_name, 0) + 1
         except Exception:
             pass
 
