@@ -12,6 +12,14 @@ from urllib.request import Request, urlopen
 from wireless_taxonomy.config import LlmSettings, ProviderConfig
 
 
+class CreditExhaustedError(RuntimeError):
+    """Raised when the LLM provider reports exhausted credits / quota.
+
+    Callers should save any cache/checkpoint state before propagating so the
+    pipeline can resume where it left off after the user reloads credits.
+    """
+
+
 @dataclass(frozen=True)
 class LlmRequest:
     task: str
@@ -191,6 +199,7 @@ def _google_complete(provider: ProviderConfig, request: LlmRequest) -> str:
 
 
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+_CREDIT_EXHAUSTED_STATUS = {402, 403}
 
 
 def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
@@ -209,6 +218,11 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            if exc.code in _CREDIT_EXHAUSTED_STATUS and _looks_like_quota(detail):
+                raise CreditExhaustedError(
+                    f"Credits/quota exhausted (HTTP {exc.code}). "
+                    "Top up your account and re-run; the cache will resume where you left off."
+                ) from exc
             last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
             if exc.code not in _RETRYABLE_STATUS:
                 raise last_error from exc
@@ -220,6 +234,15 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[
             time.sleep(min(2.0 * (2**attempt), 30.0))
     assert last_error is not None
     raise last_error
+
+
+def _looks_like_quota(detail: str) -> bool:
+    """Heuristic check whether an error body indicates quota/credit exhaustion."""
+    lower = detail.lower()
+    return any(term in lower for term in (
+        "quota", "billing", "exceeded", "insufficient", "payment",
+        "resource_exhausted", "rate_limit", "limit exceeded",
+    ))
 
 
 def _parse_json_content(content: str) -> dict[str, Any] | list[Any] | None:

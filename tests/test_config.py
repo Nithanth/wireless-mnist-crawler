@@ -37,7 +37,7 @@ def test_default_model_names_are_current_requested_defaults(monkeypatch, tmp_pat
 
     assert settings.llm.providers["openai"].model == "gpt-5.4-mini"
     assert settings.llm.providers["anthropic"].model == "claude-sonnet-4-6"
-    assert settings.llm.providers["google"].model == "gemini-3-flash-preview"
+    assert settings.llm.providers["google"].model == "gemini-3.5-flash"
 
 
 def test_google_provider_accepts_gemini_api_key(monkeypatch, tmp_path: Path) -> None:

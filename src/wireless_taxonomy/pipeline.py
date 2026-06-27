@@ -5,6 +5,7 @@ import sqlite3
 
 from wireless_taxonomy.analyze.candidates import KeywordCandidateClassifier, LlmCandidateClassifier
 from wireless_taxonomy.config import Settings
+from wireless_taxonomy.llm import CreditExhaustedError
 from wireless_taxonomy.db import connect, migrate, transaction
 from wireless_taxonomy.evidence import EvidenceLogger
 from wireless_taxonomy.ingest.base import validate_paper_seeds
@@ -226,35 +227,42 @@ class Pipeline:
             "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
         ).fetchall()
         counts = {"yes": 0, "no": 0, "maybe": 0}
-        with transaction(self.conn):
-            for paper in rows:
-                prediction = classifier.classify(dict(paper))
-                counts[prediction.label] = counts.get(prediction.label, 0) + 1
-                self.conn.execute(
-                    """
-                    INSERT OR REPLACE INTO wireless_candidate_predictions
-                    (paper_id, run_id, classifier, model_version, label, confidence,
-                     evidence, high_pass, low_pass, used_abstract)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        prediction.paper_id,
-                        stage_run_id,
-                        prediction.classifier,
-                        prediction.model_version,
-                        prediction.label,
-                        prediction.confidence,
-                        prediction.evidence,
-                        int(prediction.high_pass),
-                        int(prediction.low_pass),
-                        int(prediction.used_abstract),
-                    ),
+        try:
+            with transaction(self.conn):
+                for i, paper in enumerate(rows, 1):
+                    prediction = classifier.classify(dict(paper))
+                    counts[prediction.label] = counts.get(prediction.label, 0) + 1
+                    self.conn.execute(
+                        """
+                        INSERT OR REPLACE INTO wireless_candidate_predictions
+                        (paper_id, run_id, classifier, model_version, label, confidence,
+                         evidence, high_pass, low_pass, used_abstract)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            prediction.paper_id,
+                            stage_run_id,
+                            prediction.classifier,
+                            prediction.model_version,
+                            prediction.label,
+                            prediction.confidence,
+                            prediction.evidence,
+                            int(prediction.high_pass),
+                            int(prediction.low_pass),
+                            int(prediction.used_abstract),
+                        ),
+                    )
+                    if cache is not None and i % 20 == 0:
+                        cache.save()
+                self._complete_run(
+                    stage_run_id,
+                    f"Classified {len(rows)} papers via {classifier.classifier}; "
+                    f"yes={counts['yes']} maybe={counts['maybe']} no={counts['no']}.",
                 )
-            self._complete_run(
-                stage_run_id,
-                f"Classified {len(rows)} papers via {classifier.classifier}; "
-                f"yes={counts['yes']} maybe={counts['maybe']} no={counts['no']}.",
-            )
+        except Exception:
+            if cache is not None:
+                cache.save()
+            raise
         if cache is not None:
             cache.save()
         logger.event(
@@ -476,6 +484,15 @@ class Pipeline:
                 pdf_bytes = pdf_cache.get(row["id"])
                 try:
                     pred = classifier.classify(dict(row), pdf_bytes=pdf_bytes)
+                except CreditExhaustedError:
+                    if cache is not None:
+                        cache.save()
+                    print(
+                        f"\n  Checkpoint saved after {i - 1}/{n_total} papers. "
+                        "Re-run after reloading credits to resume.",
+                        file=sys.stderr,
+                    )
+                    raise
                 except Exception as exc:
                     # On LLM failure, default to "maybe" for max recall rather
                     # than silently dropping the paper.
@@ -512,16 +529,26 @@ class Pipeline:
             abstract = (row["abstract"] or "").strip() or None
 
             print(f"  [{idx}/{n_extract}] Extracting: {title[:60]}...", file=sys.stderr)
-            result = extractor.extract(
-                paper_id=row["id"],
-                title=title,
-                authors=row["authors"] or "",
-                venue=venue,
-                year=year,
-                doi=doi,
-                pdf_url=pdf_url,
-                abstract=abstract,
-            )
+            try:
+                result = extractor.extract(
+                    paper_id=row["id"],
+                    title=title,
+                    authors=row["authors"] or "",
+                    venue=venue,
+                    year=year,
+                    doi=doi,
+                    pdf_url=pdf_url,
+                    abstract=abstract,
+                )
+            except CreditExhaustedError:
+                if cache is not None:
+                    cache.save()
+                print(
+                    f"\n  Checkpoint saved after {idx - 1}/{n_extract} papers. "
+                    "Re-run after reloading credits to resume.",
+                    file=sys.stderr,
+                )
+                raise
 
             with transaction(self.conn):
                 self.conn.execute(
@@ -601,38 +628,15 @@ class Pipeline:
                 ],
             })
 
-        # -- dataset usage search (one call per unique name, cached) ----------
-        from wireless_taxonomy.analyze.dataset_usage import DatasetUsageSearcher
-
-        searcher = DatasetUsageSearcher(cache=cache, router=LlmRouter(self.settings.llm))
-        unique_names: dict[str, dict] = {}
+        # -- in-corpus usage counts (cross-paper within this venue/year) ------
+        corpus_counts: dict[str, int] = {}
         for r in results:
             for d in r["datasets"]:
-                if d["name"] not in unique_names:
-                    unique_names[d["name"]] = d
-
-        usage_map: dict[str, dict] = {}
-        for name in unique_names:
-            usage_map[name] = searcher.search(name)
-
-        # Merge usage search results back into per-paper dataset records
+                corpus_counts[d["name"]] = corpus_counts.get(d["name"], 0) + 1
         for r in results:
             for d in r["datasets"]:
-                usage = usage_map.get(d["name"], {})
-                search_users = usage.get("known_users") or []
-                existing = d.get("known_users") or []
-                merged = existing + [u for u in search_users if u not in existing]
-                d["known_users"] = merged[:10]
-                d["usage_count"] = usage.get("count", 0)
-                d["usage_sources"] = usage.get("sources", {})
-
-        # Persist usage counts back to the datasets table
-        with transaction(self.conn):
-            for name, usage in usage_map.items():
-                self.conn.execute(
-                    "UPDATE datasets SET known_users_json = ? WHERE canonical_name = ?",
-                    (json.dumps(usage.get("known_users") or []), name),
-                )
+                d["usage_count"] = corpus_counts.get(d["name"], 1)
+                d["usage_sources"] = {"corpus": corpus_counts.get(d["name"], 1)}
 
         self._complete_run(run_id, f"Extracted datasets for {len(results)} papers in {venue} {year}.")
         total_datasets = sum(len(r["datasets"]) for r in results)

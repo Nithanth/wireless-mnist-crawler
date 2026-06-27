@@ -90,7 +90,7 @@ def load_llm_settings() -> LlmSettings:
         ),
         "google": ProviderConfig(
             provider="google",
-            model=os.getenv("WIRELESS_TAXONOMY_GOOGLE_MODEL", "gemini-3-flash-preview"),
+            model=os.getenv("WIRELESS_TAXONOMY_GOOGLE_MODEL", "gemini-3.5-flash"),
             api_key_env="GEMINI_API_KEY",
             api_key_configured=bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")),
         ),

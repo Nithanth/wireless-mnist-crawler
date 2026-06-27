@@ -637,12 +637,20 @@ def extract_datasets(
 def merge_results(
     results_dir: str = typer.Option("./src/results", "--dir", help="Directory containing per-venue/year CSV + JSON files."),
     out: str = typer.Option("./src/results", "--out", help="Output directory for merged master files."),
+    min_corpus_reuse: int = typer.Option(
+        2, "--min-corpus-reuse",
+        help="Only include datasets mentioned in at least this many papers across the entire corpus. "
+             "Set to 1 to keep all datasets.",
+    ),
 ) -> None:
     """Merge all per-venue/year CSVs and JSONs into master files.
 
     Reads all *_papers.csv, *_bibtex.csv, *_datasets.csv, and *_raw.json files
     from --dir and produces:
       master_papers.csv, master_bibtex.csv, master_datasets.csv, master_raw.json
+
+    With --min-corpus-reuse=2 (the default), only datasets referenced by at
+    least 2 papers in the merged corpus survive into master_datasets.csv.
     """
     import glob as _glob
 
@@ -691,7 +699,7 @@ def merge_results(
             writer.writerows(all_bib_rows)
         typer.echo(f"  {p.name}: {len(all_bib_rows)} entries from {len(bibtex_files)} files")
 
-    # --- Datasets (deduplicated, merge paper counts) ---
+    # --- Datasets (deduplicated, cross-corpus paper counts, reuse filter) ---
     datasets_files = sorted(_glob.glob(str(src / "*_datasets.csv")))
     merged_ds: dict[str, dict] = {}
     ds_fields: list[str] = []
@@ -709,11 +717,36 @@ def merge_results(
                     try:
                         old_count = int(existing.get("Number of Papers using Dataset") or 0)
                         new_count = int(row.get("Number of Papers using Dataset") or 0)
-                        existing["Number of Papers using Dataset"] = str(max(old_count, new_count))
+                        existing["Number of Papers using Dataset"] = str(old_count + new_count)
                     except ValueError:
                         pass
                     if not existing.get("Bibtex Citation Key") and row.get("Bibtex Citation Key"):
                         existing["Bibtex Citation Key"] = row["Bibtex Citation Key"]
+
+    # Cross-corpus reuse: count distinct papers mentioning each dataset
+    # across ALL raw JSON runs for an accurate corpus-wide count.
+    corpus_paper_counts: dict[str, int] = {}
+    for f in sorted(_glob.glob(str(src / "*_raw.json"))):
+        try:
+            run_data = json.loads(Path(f).read_text(encoding="utf-8"))
+            for paper in run_data.get("papers") or []:
+                seen_in_paper: set[str] = set()
+                for ds in paper.get("datasets") or []:
+                    ds_name = ds.get("name", "")
+                    if ds_name and ds_name not in seen_in_paper:
+                        seen_in_paper.add(ds_name)
+                        corpus_paper_counts[ds_name] = corpus_paper_counts.get(ds_name, 0) + 1
+        except Exception:
+            pass
+
+    # Update paper counts from corpus-wide scan and apply reuse filter
+    total_before_filter = len(merged_ds)
+    for name in list(merged_ds):
+        corpus_count = corpus_paper_counts.get(name, 1)
+        merged_ds[name]["Number of Papers using Dataset"] = str(corpus_count)
+        if corpus_count < min_corpus_reuse:
+            del merged_ds[name]
+
     if merged_ds:
         p = dst / "master_datasets.csv"
         with p.open("w", newline="", encoding="utf-8") as fh:
@@ -721,7 +754,10 @@ def merge_results(
             writer.writeheader()
             for name in sorted(merged_ds):
                 writer.writerow(merged_ds[name])
-        typer.echo(f"  {p.name}: {len(merged_ds)} datasets from {len(datasets_files)} files")
+        typer.echo(
+            f"  {p.name}: {len(merged_ds)} datasets from {len(datasets_files)} files"
+            f" (filtered from {total_before_filter} with --min-corpus-reuse={min_corpus_reuse})"
+        )
 
     # --- Raw JSON ---
     json_files = sorted(_glob.glob(str(src / "*_raw.json")))
