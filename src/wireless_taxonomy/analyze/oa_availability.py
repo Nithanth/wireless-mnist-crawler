@@ -97,7 +97,11 @@ class OpenAccessResolver:
                 found = None
             if found is not None and found.fetchable:
                 result = found
-                break
+                # If the URL points to dl.acm.org, keep trying other providers
+                # for a non-ACM mirror (arxiv, institutional repo, etc.) since
+                # ACM blocks programmatic PDF downloads.
+                if "dl.acm.org" not in (found.pdf_url or ""):
+                    break
         if self.cache is not None:
             self.cache.set_oa(
                 title,
