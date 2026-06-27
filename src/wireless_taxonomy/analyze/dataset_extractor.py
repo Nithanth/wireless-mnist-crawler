@@ -190,34 +190,38 @@ Paper metadata:
   Venue: {venue} {year}
   DOI: {doi}
 {text_section}
-A "dataset" is a NAMED, REUSABLE collection of measurement data, traces, or recordings
-that other researchers could find, download, or request. It must have a PROPER NAME — a
-distinctive identifier that someone could search for and recognise (e.g. "CRAWDAD
-dartmouth/campus", "5G-Trace-NYC", "Widar 3.0", "FCC MBA dataset").
+Extract TWO kinds of datasets:
 
-INCLUDE: wireless traces, spectrum measurements, channel recordings, network logs,
-mobility traces, signal datasets with proper names.
+(A) REUSED datasets — data the paper uses from someone else.
+    These MUST have a proper, searchable name (e.g. "CRAWDAD dartmouth/campus",
+    "Widar 3.0", "FCC MBA dataset", "Ookla Speedtest Intelligence").
+    If the paper references a dataset only by citation (e.g. "the traces from [54]"),
+    look up that reference in the paper's bibliography and use the ACTUAL dataset
+    name or the cited paper's title as the name.
 
-DO NOT INCLUDE:
+(B) INTRODUCED datasets — data the paper itself collected/curated/released.
+    Even if the paper does NOT give it a branded name, extract it IF:
+    - The paper collected real measurements, traces, or recordings
+    - The data has enough detail to be reproducible (description of what was
+      measured, duration, scale, environment)
+    - It's wireless/networking data (not generic compute benchmarks)
+    For the name field: use the paper's own name if it has one. Otherwise,
+    construct a descriptive identifier in the format:
+      "[FirstAuthor][Year]-[short-description]"
+    Example: "Baltaci2022-cellular-drone-video" for a paper by Baltaci et al.
+    (2022) that collected cellular video traces from drone flights.
+
+DO NOT extract:
 - Generic ML benchmarks (ImageNet, MNIST, CIFAR) unless applied to wireless data
 - Software tools, simulators, or libraries (ns-3, MATLAB, PyTorch)
 - Synthetic data generated on-the-fly without a persistent shareable artifact
 - Figure or table references ("Figure 10", "Table 2")
-- Generic pronoun references ("our dataset", "the data collected", "this dataset",
-  "the same dataset", "the data", "collected traces")
-- Descriptive phrases that are NOT proper names ("500,000 User Equipment",
-  "2 Starlink flights", "25 flights operated by 7 airlines")
-- Bare technical terms ("testbed", "pcap", "pings", "speed test", "traces",
-  "logs", "artifact", "training set", "recorded signals")
-- Vague time-based descriptions ("data collected during Feb-Apr 2022")
-
-The litmus test: could another researcher Google this name and find the dataset?
-If NOT, do not extract it.
+- Bare technical terms without context ("testbed", "pcap", "pings", "traces")
+- Data that is only mentioned in passing without detail
 
 For each dataset extract:
-- name: the EXACT PROPER NAME from the paper. Must be a distinctive, searchable
-  identifier — NOT a generic description. If the paper does not give data a
-  specific proper name, skip it.
+- name: For REUSED: the exact proper name (searchable, distinctive). For
+  INTRODUCED: the paper's own name, or "[FirstAuthor][Year]-[description]" if unnamed.
 - relationship_type: "introduced" (paper creates/releases), "reused" (uses existing),
   "extended" (augments existing), "compared_against", "unclear"
 - modalities: list of data types (e.g. ["5G NR traces", "RSRP measurements", "PCAP"])
@@ -228,11 +232,11 @@ For each dataset extract:
 - collection_environment: one of "Physical Lab Testbed", "Real World Deployment",
   "Simulation", "Crowdsourced", "Unknown"
 - known_users: up to 5 OTHER papers that also use this dataset ([] if unsure — do not hallucinate)
-- confidence: 0.0–1.0 how sure this is a real, named, reusable dataset (0.9+ = clear
-  proper name with evidence; 0.5–0.7 = ambiguous; below 0.5 = probably not a dataset)
+- confidence: 0.0–1.0 (0.9+ = clear named dataset with strong evidence;
+  0.6–0.8 = reasonable but less certain; below 0.5 = weak/speculative)
 - evidence_text: one sentence quoting or closely paraphrasing the paper
 
-Example:
+Examples:
 {{
   "datasets": [
     {{
@@ -247,6 +251,19 @@ Example:
       "known_users": [],
       "confidence": 0.95,
       "evidence_text": "We collected 5G NR traces across 12 routes in NYC over 3 months."
+    }},
+    {{
+      "name": "Baltaci2022-cellular-drone-video",
+      "relationship_type": "introduced",
+      "modalities": ["LTE/5G throughput logs", "video quality metrics", "GPS flight paths"],
+      "osi_layers": ["L3", "L7"],
+      "availability": null,
+      "availability_url": "",
+      "availability_notes": "",
+      "collection_environment": "Real World Deployment",
+      "known_users": [],
+      "confidence": 0.80,
+      "evidence_text": "We collected 47 drone flights with concurrent LTE and 5G measurements across 3 operators."
     }},
     {{
       "name": "CRAWDAD dartmouth/campus",
@@ -264,8 +281,8 @@ Example:
   ]
 }}
 
-If the paper uses NO named datasets and introduces none, return {{"datasets": []}}.
-Prefer returning fewer, high-confidence entries over many low-quality ones.
+If the paper uses NO datasets and introduces none, return {{"datasets": []}}.
+Prefer quality over quantity — only extract datasets you are reasonably sure about.
 
 Return ONLY valid JSON — no markdown, no explanation outside the JSON.
 """
@@ -411,6 +428,9 @@ _GARBAGE_EXACT = frozenset({
     "open-source code and data",
 })
 MIN_DATASET_CONFIDENCE = 0.50
+# Introduced datasets get a lower bar — the paper's own data matters even if
+# they didn't brand it; the LLM will mint an AuthorYear-description name.
+MIN_INTRODUCED_CONFIDENCE = 0.60
 
 
 def _is_garbage_name(name: str) -> bool:
@@ -429,6 +449,11 @@ def _is_garbage_name(name: str) -> bool:
     return False
 
 
+def _looks_like_authored_name(name: str) -> bool:
+    """True if the name follows the AuthorYear-description convention we asked for."""
+    return bool(re.match(r"^[A-Z][a-z]+\d{4}-", name))
+
+
 def _parse_dataset_records(raw: list[Any]) -> list[DatasetRecord]:
     records: list[DatasetRecord] = []
     for item in raw:
@@ -438,13 +463,33 @@ def _parse_dataset_records(raw: list[Any]) -> list[DatasetRecord]:
         if not name:
             continue
         confidence = float(item.get("confidence") or 0.0)
-        if confidence < MIN_DATASET_CONFIDENCE:
-            continue
-        if _is_garbage_name(name):
-            continue
         rel = str(item.get("relationship_type") or "unclear").lower()
         if rel not in RELATIONSHIP_TYPES:
             rel = "unclear"
+
+        # Filtering logic depends on relationship type:
+        # - "introduced": lenient — paper's own data. Accept if confidence is
+        #   reasonable and the LLM minted an AuthorYear name or gave a proper name.
+        # - everything else ("reused", "extended", etc.): strict — must be a
+        #   proper searchable name that can be cross-referenced across papers.
+        if rel == "introduced":
+            if confidence < MIN_INTRODUCED_CONFIDENCE:
+                continue
+            # For introduced datasets, only reject the most egregious garbage
+            # (figure refs, table refs). AuthorYear-minted names always pass.
+            if not _looks_like_authored_name(name):
+                lower = name.lower().strip()
+                if lower.startswith(("figure ", "fig.", "fig ", "table ")):
+                    continue
+                if lower in _GARBAGE_EXACT:
+                    continue
+        else:
+            # Reused/extended/compared_against — must have a proper name
+            if confidence < MIN_DATASET_CONFIDENCE:
+                continue
+            if _is_garbage_name(name):
+                continue
+
         modalities = [str(m).strip() for m in (item.get("modalities") or []) if str(m).strip()]
         osi_raw = [str(o).strip().upper() for o in (item.get("osi_layers") or [])]
         osi = [o for o in osi_raw if o in OSI_LAYERS]
