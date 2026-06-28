@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html as _html
 import re
 import time
 from collections.abc import Callable
@@ -110,7 +111,8 @@ class DblpIngestAdapter(IngestAdapter):
                 continue
             if str(info.get("type", "")).lower().startswith("editor"):
                 continue  # proceedings/front-matter record, not a paper
-            title = (info.get("title") or "").rstrip(".").strip()
+            title = _html.unescape((info.get("title") or "").rstrip(".").strip())
+            title = re.sub(r"\s+", " ", title).strip()
             if not title:
                 continue
             if is_non_paper_title(title):

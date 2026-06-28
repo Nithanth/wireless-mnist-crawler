@@ -371,11 +371,52 @@ class DatasetExtractor:
             if not isinstance(parsed, dict):
                 raise ValueError(f"LLM returned non-dict: {response.content[:200]}")
         except Exception as exc:
-            return DatasetExtractionResult(
-                paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
-                doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
-                datasets=[], extraction_source=extraction_source, error=str(exc),
-            )
+            # When PDF-as-bytes fails (e.g. Gemini HTTP 400 content policy),
+            # fall back to pypdf text extraction and retry without the PDF
+            # attachment. Degraded but much better than returning nothing.
+            if pdf_bytes:
+                from wireless_taxonomy.llm import _pdf_bytes_to_text
+                pdf_text = _pdf_bytes_to_text(pdf_bytes)
+                if pdf_text and len(pdf_text) > 200:
+                    text_section = f"\nPaper text (extracted from PDF):\n---\n{pdf_text[:120_000]}\n---\n"
+                    text_prompt = _EXTRACTION_PROMPT_TMPL.format(
+                        title=title, authors=authors, venue=venue, year=year,
+                        doi=doi or "unknown", text_section=text_section,
+                    )
+                    try:
+                        response = self.router.complete(
+                            LlmRequest(
+                                task="dataset_extraction",
+                                schema_name="DatasetExtraction",
+                                prompt=text_prompt,
+                                metadata={"paper_id": paper_id, "title": title},
+                            )
+                        )
+                        parsed = response.parsed
+                        if isinstance(parsed, dict):
+                            extraction_source = "pdf_text_fallback"
+                        else:
+                            raise ValueError(f"LLM returned non-dict on text fallback: {response.content[:200]}")
+                    except Exception as text_exc:
+                        return DatasetExtractionResult(
+                            paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
+                            doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
+                            datasets=[], extraction_source=extraction_source,
+                            error=f"PDF failed: {exc} | text fallback failed: {text_exc}",
+                        )
+                else:
+                    return DatasetExtractionResult(
+                        paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
+                        doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
+                        datasets=[], extraction_source=extraction_source,
+                        error=f"PDF failed: {exc} | pypdf extraction too short ({len(pdf_text)} chars)",
+                    )
+            else:
+                return DatasetExtractionResult(
+                    paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
+                    doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
+                    datasets=[], extraction_source=extraction_source, error=str(exc),
+                )
 
         datasets = _parse_dataset_records(parsed.get("datasets") or [])
 
