@@ -205,11 +205,20 @@ Extract TWO kinds of datasets:
     - The data has enough detail to be reproducible (description of what was
       measured, duration, scale, environment)
     - It's wireless/networking data (not generic compute benchmarks)
-    For the name field: use the paper's own name if it has one. Otherwise,
-    construct a descriptive identifier in the format:
-      "[FirstAuthor][Year]-[short-description]"
-    Example: "Baltaci2022-cellular-drone-video" for a paper by Baltaci et al.
-    (2022) that collected cellular video traces from drone flights.
+    For the name field: use the paper's own branded name if it has one
+    (e.g. "Lumos5G", "5G-Trace-NYC", "OpenLoRa"). Otherwise, construct
+    a descriptive canonical name in the format:
+      "[Technology/Protocol] [What Was Measured] [Dataset|Traces|Measurements]"
+    The name should describe WHAT the data is, not WHO collected it.
+    Do NOT include author names, years, or citation keys in dataset names.
+    Examples of good unnamed-dataset names:
+      - "Cellular UAV Video Delivery Traces"
+      - "5G Mobility Drive-Test Dataset"
+      - "Indoor WiFi CSI Sensing Measurements"
+      - "LEO Satellite RF Link Measurements"
+      - "mmWave Backscatter Indoor Testbed Data"
+    The name should be generic enough that another paper referencing the same
+    data would plausibly use the same or very similar name.
 
 DO NOT extract:
 - Generic ML benchmarks (ImageNet, MNIST, CIFAR) unless applied to wireless data
@@ -221,7 +230,8 @@ DO NOT extract:
 
 For each dataset extract:
 - name: For REUSED: the exact proper name (searchable, distinctive). For
-  INTRODUCED: the paper's own name, or "[FirstAuthor][Year]-[description]" if unnamed.
+  INTRODUCED: the paper's own branded name, or a descriptive canonical name
+  (see naming rules above). NEVER use author names or years in dataset names.
 - relationship_type: "introduced" (paper creates/releases), "reused" (uses existing),
   "extended" (augments existing), "compared_against", "unclear"
 - modalities: list of data types (e.g. ["5G NR traces", "RSRP measurements", "PCAP"])
@@ -253,7 +263,7 @@ Examples:
       "evidence_text": "We collected 5G NR traces across 12 routes in NYC over 3 months."
     }},
     {{
-      "name": "Baltaci2022-cellular-drone-video",
+      "name": "Cellular UAV Video Delivery Traces",
       "relationship_type": "introduced",
       "modalities": ["LTE/5G throughput logs", "video quality metrics", "GPS flight paths"],
       "osi_layers": ["L3", "L7"],
