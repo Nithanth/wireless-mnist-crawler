@@ -23,7 +23,6 @@ workshop paper (absent from the main proceedings) and dropped from the
 denominator rather than counted as a classifier miss. This requires the full
 labelled universe, so it is only allowed when the CSV carries a ``label`` column.
 """
-from __future__ import annotations
 
 import csv as _csv
 from pathlib import Path

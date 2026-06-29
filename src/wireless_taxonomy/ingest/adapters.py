@@ -1,4 +1,3 @@
-from __future__ import annotations
 
 
 def detect_source_hint(source_url: str, page_text: str = "") -> str:

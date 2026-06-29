@@ -11,7 +11,6 @@ For each paper we:
 4. Return structured ``DatasetExtractionResult`` objects for DB and CSV export.
 """
 
-from __future__ import annotations
 
 import hashlib
 import json
