@@ -50,7 +50,6 @@ class Settings:
     db_path: Path
     evidence_dir: Path
     llm: LlmSettings
-    enable_web_search: bool
     thresholds: Thresholds
 
 
@@ -63,7 +62,6 @@ def load_settings(db_path: str | Path = "taxonomy.sqlite") -> Settings:
         db_path=db_path,
         evidence_dir=Path(evidence_dir) if evidence_dir else default_evidence_dir,
         llm=load_llm_settings(),
-        enable_web_search=os.getenv("WIRELESS_TAXONOMY_ENABLE_WEB_SEARCH", "0") == "1",
         thresholds=Thresholds(),
     )
 

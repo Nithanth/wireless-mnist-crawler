@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any
 from uuid import uuid4
 
 
@@ -57,70 +57,4 @@ class ReviewItem:
     source_url: str | None = None
 
 
-@dataclass(frozen=True)
-class DatasetClaim:
-    paper_id: int
-    dataset_name: str
-    relationship_type: Literal["introduced", "reused", "extended", "compared_against", "unclear"]
-    confidence: float
-    evidence_text: str
-    source_url: str | None = None
 
-
-@dataclass(frozen=True)
-class AvailabilityClaim:
-    dataset_id: int | None
-    url: str
-    availability_status: str
-    confidence: float
-    evidence_text: str
-    checked_at: str = field(default_factory=utc_now)
-
-
-@dataclass(frozen=True)
-class DatasetIdentityDecision:
-    dataset_name: str
-    canonical_dataset_id: int | None
-    decision: Literal["create", "merge", "review"]
-    confidence: float
-    evidence: str
-
-
-@dataclass(frozen=True)
-class PaperTextArtifact:
-    paper_id: int
-    source_type: str
-    source_url: str | None
-    fetch_status: str
-    content_text: str
-    content_sha256: str
-    error_message: str | None = None
-    fetched_at: str = field(default_factory=utc_now)
-
-
-@dataclass(frozen=True)
-class PaperTextLink:
-    paper_id: int
-    url: str
-    link_text: str | None
-    link_type: str
-    confidence: float
-
-
-@dataclass(frozen=True)
-class PaperTextSnippet:
-    paper_id: int
-    snippet_type: str
-    snippet_text: str
-    source_url: str | None
-    start_char: int | None
-    end_char: int | None
-    confidence: float
-
-
-@dataclass(frozen=True)
-class PaperTextEnrichment:
-    paper_id: int
-    artifacts: list[PaperTextArtifact]
-    links: list[PaperTextLink]
-    snippets: list[PaperTextSnippet]

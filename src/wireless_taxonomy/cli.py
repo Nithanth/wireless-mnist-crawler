@@ -5,7 +5,7 @@ import inspect
 import json
 import sqlite3
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 import click
 import typer
@@ -256,8 +256,8 @@ def classify(
 
 @app.command()
 def eval(
-    classified: List[str] = typer.Option(..., "--classified", help="Full labelled CSV from `classify --csv`; repeatable."),
-    gold: List[str] = typer.Option(..., "--gold", help="Curated gold sheet (csv/xlsx); repeatable."),
+    classified: list[str] = typer.Option(..., "--classified", help="Full labelled CSV from `classify --csv`; repeatable."),
+    gold: list[str] = typer.Option(..., "--gold", help="Curated gold sheet (csv/xlsx); repeatable."),
     pass_mode: str = typer.Option("high", "--pass", help="high = label 'yes' only; low = 'yes' or 'maybe'."),
     drop_workshops: bool = typer.Option(
         False,
@@ -265,7 +265,7 @@ def eval(
         help="Drop curated papers absent from the classified universe (co-located workshops) from the calculation.",
     ),
     fuzzy_threshold: float = typer.Option(0.92, "--fuzzy-threshold", help="Title fuzzy-match ratio; 1.0 disables fuzzy."),
-    exclude: List[str] = typer.Option(
+    exclude: list[str] = typer.Option(
         [], "--exclude", help="Venue-year to drop from the headline (VENUE:YEAR, e.g. IMC:2025); repeatable."
     ),
     min_gold: int = typer.Option(

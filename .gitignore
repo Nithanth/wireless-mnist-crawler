@@ -16,6 +16,7 @@ taxonomy.sqlite
 *.sqlite3
 *.db
 evidence/
+src/evidence/
 .browser/
 .env
 .env.*

@@ -227,9 +227,8 @@ fetch-coverage                    extract-datasets
 └─────────────┘                  │ 3. Filter to wireless (yes + maybe)       │
        │                         │ 4. Extract datasets from each paper (LLM) │
        ▼                         │ 5. Verify availability URLs (live check)  │
-  cov_*.json                     │ 6. Search for usage (S2 + GitHub + web)   │
-  (PDF URLs)                     └──────────────┬─────────────────────────────┘
-                                                │
+  cov_*.json                     └──────────────┬─────────────────────────────┘
+  (PDF URLs)                                    │
                                                 ▼
                                      3 CSVs + raw JSON
 ```
@@ -322,6 +321,8 @@ python -m wireless_taxonomy.cli cache status
 | `extract-datasets` | Full extraction: classify wireless → fetch PDF → LLM extract → output 3 CSVs. |
 | `merge-results` | Combine all per-venue/year CSVs into master files. |
 | `cache` | Inspect or clear `.wt_cache.json` sections (`status`, `clear`, `clear-section llm`). |
+| `corpus-status` | Show what's in the DB: venues, years, paper counts, extraction status. |
+| `prune` | Prune extraction/classification results by venue/year or run ID. |
 | `llm-config` | Show which LLM providers are configured and their models. |
 
 Run any command with `--help` for its full flags.

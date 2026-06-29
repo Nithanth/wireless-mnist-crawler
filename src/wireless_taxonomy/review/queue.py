@@ -28,7 +28,4 @@ def insert_review_item(conn: sqlite3.Connection, run_id: int | None, item: Revie
     )
 
 
-def list_pending_review(conn: sqlite3.Connection, run_id: int | None = None) -> list[sqlite3.Row]:
-    if run_id is None:
-        return list(conn.execute("SELECT * FROM review_items WHERE status = 'pending' ORDER BY id"))
-    return list(conn.execute("SELECT * FROM review_items WHERE status = 'pending' AND run_id = ? ORDER BY id", (run_id,)))
+

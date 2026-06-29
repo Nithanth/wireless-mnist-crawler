@@ -10,12 +10,12 @@ from typing import Any
 
 DATASET_USAGE_TTL_DAYS = 30
 
-_WS_RE = re.compile(r"[^a-z0-9]+")
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
-def normalize_title(title: str | None) -> str:
-    """Lowercase, strip punctuation/whitespace -> a stable lookup key."""
-    return _WS_RE.sub(" ", (title or "").lower()).strip()
+def _cache_key_title(title: str | None) -> str:
+    """Lowercase, strip punctuation/whitespace -> a stable cache lookup key."""
+    return _NON_ALNUM_RE.sub(" ", (title or "").lower()).strip()
 
 
 def _doi_key(doi: str | None) -> str:
@@ -23,7 +23,7 @@ def _doi_key(doi: str | None) -> str:
 
 
 def _title_key(title: str | None) -> str:
-    norm = normalize_title(title)
+    norm = _cache_key_title(title)
     return f"title:{norm}" if norm else ""
 
 
