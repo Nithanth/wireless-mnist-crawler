@@ -7,7 +7,12 @@ from typing import Optional
 
 import typer
 
-from wireless_taxonomy.postprocess.entity_resolution import DatasetRecord, reconcile
+from wireless_taxonomy.postprocess.entity_resolution import (
+    CanonicalDataset,
+    DatasetRecord,
+    consolidate,
+    reconcile,
+)
 
 
 def _load_datasets_from_csv(path: Path) -> list[DatasetRecord]:
@@ -84,6 +89,36 @@ def _load_datasets_from_json(path: Path) -> list[DatasetRecord]:
     return records
 
 
+def _write_consolidated_csv(canonical: list[CanonicalDataset], path: Path) -> None:
+    """Write the consolidated (deduplicated) dataset list to CSV."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = _csv.writer(fh)
+        writer.writerow([
+            "Canonical Name",
+            "All Name Variants",
+            "Bibtex Citation Keys",
+            "Reuse Count",
+            "Modality(ies)",
+            "OSI Layers",
+            "Collection Environment",
+            "Availability URL",
+            "Merge Reason",
+        ])
+        for ds in canonical:
+            writer.writerow([
+                ds.canonical_name,
+                "; ".join(ds.all_names) if len(ds.all_names) > 1 else "",
+                ", ".join(ds.bibtex_keys),
+                ds.reuse_count,
+                ds.modalities,
+                ds.osi_layers,
+                "; ".join(ds.environments),
+                ds.availability_url,
+                ds.merge_reason,
+            ])
+
+
 def register(app: typer.Typer) -> None:
     @app.command("reconcile-datasets")
     def reconcile_datasets(
@@ -105,25 +140,35 @@ def register(app: typer.Typer) -> None:
         no_similarity: bool = typer.Option(
             False, "--no-similarity", help="Disable similarity flagging (only run URL/DOI dedup)."
         ),
+        llm_confirm: bool = typer.Option(
+            False, "--llm-confirm", help="Use LLM to confirm/reject similarity candidates."
+        ),
         out: Optional[str] = typer.Option(
             None, "--out", help="Write JSON report here."
+        ),
+        consolidated: Optional[str] = typer.Option(
+            None, "--consolidated", help="Write consolidated (deduplicated) datasets CSV."
         ),
     ) -> None:
         """Post-merge entity resolution: flag datasets that are likely the same.
 
         \b
-        Two strategies:
+        Three strategies (in order):
           1. URL/DOI dedup — high confidence (0.95). Datasets sharing an
              availability URL or DOI are near-certainly the same artifact.
           2. Similarity flagging — medium confidence (≤0.80). Normalized name +
-             modality + OSI layer similarity surfaces candidates for human review.
+             modality + OSI layer similarity surfaces candidates.
+          3. LLM confirmation (--llm-confirm) — the LLM reviews similarity
+             candidates and returns yes/no/unsure verdicts. "no" pairs are
+             dropped, "yes" are auto-merged, "unsure" are flagged for review.
 
         \b
         Input: either --csv (merged datasets CSV) or --json (raw extraction JSON).
         If both are given, records are combined for broader coverage.
 
         \b
-        Future: LLM confirmation step for candidate pairs (not yet implemented).
+        Use --consolidated to write a deduplicated dataset list with proper
+        reuse counts (needed for downstream metrics/figures).
         """
         if not datasets_csv and not raw_json:
             typer.echo("Provide --csv and/or --json input.", err=True)
@@ -145,27 +190,53 @@ def register(app: typer.Typer) -> None:
 
         typer.echo(f"Loaded {len(records)} dataset records.")
 
+        # When LLM confirm is active, use more aggressive similarity thresholds
+        # for candidate generation (the LLM handles precision filtering).
+        effective_name = name_threshold
+        effective_combined = combined_threshold
+        if llm_confirm and name_threshold == 0.75:
+            effective_name = 0.60
+        if llm_confirm and combined_threshold == 0.70:
+            effective_combined = 0.55
+
         matches = reconcile(
             records,
             url_dedup=not no_url,
             similarity=not no_similarity,
-            similarity_name_threshold=name_threshold,
-            similarity_combined_threshold=combined_threshold,
+            llm_confirm=llm_confirm,
+            similarity_name_threshold=effective_name,
+            similarity_combined_threshold=effective_combined,
         )
 
-        if not matches:
-            typer.echo("No potential duplicates found.")
-            raise typer.Exit()
-
-        # Report
+        # Group matches by method
         url_matches = [m for m in matches if m.method == "url_dedup"]
+        llm_yes = [m for m in matches if m.method == "llm_confirmed"]
+        llm_unsure = [m for m in matches if m.method == "llm_unsure"]
         sim_matches = [m for m in matches if m.method == "similarity"]
 
         if url_matches:
             typer.echo(f"\n{'─'*60}")
-            typer.echo(f"URL/DOI MATCHES (high confidence): {len(url_matches)}")
+            typer.echo(f"URL/DOI MATCHES (auto-merge): {len(url_matches)}")
             typer.echo(f"{'─'*60}")
             for m in url_matches:
+                typer.echo(f"\n  [{m.confidence:.2f}] {m.reason}")
+                typer.echo(f"    A: {m.a.name}  [{', '.join(m.a.bibtex_keys)}]")
+                typer.echo(f"    B: {m.b.name}  [{', '.join(m.b.bibtex_keys)}]")
+
+        if llm_yes:
+            typer.echo(f"\n{'─'*60}")
+            typer.echo(f"LLM CONFIRMED (auto-merge): {len(llm_yes)}")
+            typer.echo(f"{'─'*60}")
+            for m in llm_yes:
+                typer.echo(f"\n  [{m.confidence:.2f}] {m.reason}")
+                typer.echo(f"    A: {m.a.name}  [{', '.join(m.a.bibtex_keys)}]")
+                typer.echo(f"    B: {m.b.name}  [{', '.join(m.b.bibtex_keys)}]")
+
+        if llm_unsure:
+            typer.echo(f"\n{'─'*60}")
+            typer.echo(f"LLM UNSURE (human review): {len(llm_unsure)}")
+            typer.echo(f"{'─'*60}")
+            for m in llm_unsure:
                 typer.echo(f"\n  [{m.confidence:.2f}] {m.reason}")
                 typer.echo(f"    A: {m.a.name}  [{', '.join(m.a.bibtex_keys)}]")
                 typer.echo(f"    B: {m.b.name}  [{', '.join(m.b.bibtex_keys)}]")
@@ -181,7 +252,23 @@ def register(app: typer.Typer) -> None:
                 typer.echo(f"    B: {m.b.name}  [{', '.join(m.b.bibtex_keys)}]")
                 typer.echo(f"       mod={m.b.modalities[:60]}  osi={m.b.osi_layers}  env={m.b.environment}")
 
-        typer.echo(f"\nTotal: {len(url_matches)} URL/DOI + {len(sim_matches)} similarity = {len(matches)} candidates")
+        total = len(url_matches) + len(llm_yes) + len(llm_unsure) + len(sim_matches)
+        typer.echo(f"\nTotal: {total} candidates")
+        if llm_confirm:
+            typer.echo(f"  URL/DOI auto-merge: {len(url_matches)}")
+            typer.echo(f"  LLM confirmed: {len(llm_yes)}")
+            typer.echo(f"  LLM unsure (needs review): {len(llm_unsure)}")
+        else:
+            typer.echo(f"  URL/DOI: {len(url_matches)}, Similarity: {len(sim_matches)}")
+
+        # Consolidated output
+        if consolidated:
+            canonical = consolidate(records, matches)
+            _write_consolidated_csv(canonical, Path(consolidated))
+            reused = [d for d in canonical if d.reuse_count > 1]
+            typer.echo(f"\nConsolidated: {len(canonical)} unique datasets "
+                       f"({len(reused)} reused across multiple papers)")
+            typer.echo(f"Wrote: {consolidated}")
 
         if out:
             report = {
