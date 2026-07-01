@@ -12,6 +12,7 @@ FetchJson = Callable[[str], dict[str, Any]]
 
 # venue label (normalized) -> DBLP publication-stream prefix (without the year)
 _DBLP_STREAMS = {
+    # ACM conferences
     "sigcomm": "conf/sigcomm/sigcomm",
     "imc": "conf/imc/imc",
     "nsdi": "conf/nsdi/nsdi",
@@ -19,11 +20,23 @@ _DBLP_STREAMS = {
     "mobisys": "conf/mobisys/mobisys",
     "sensys": "conf/sensys/sensys",
     "ipsn": "conf/ipsn/ipsn",
-    "infocom": "conf/infocom/infocom",
     "conext": "conf/conext/conext",
     "co-next": "conf/conext/conext",
     "hotnets": "conf/hotnets/hotnets",
+    # IEEE conferences
+    "icc": "conf/icc/icc",
+    "infocom": "conf/infocom/infocom",
     "globecom": "conf/globecom/globecom",
+}
+
+# Journal venue label -> DBLP journal stream prefix and volume-to-year offset.
+# DBLP TOC key for journals: journals/{key}/{key}{vol}.bht
+# offset: year = volume + offset  (equivalently, volume = year - offset)
+_DBLP_JOURNALS: dict[str, tuple[str, int]] = {
+    # IEEE Trans. Wireless Communications: vol 21 = 2022, so offset = 2001
+    "twc": ("journals/twc/twc", 2001),
+    "transwireless": ("journals/twc/twc", 2001),
+    "trans-wireless": ("journals/twc/twc", 2001),
 }
 
 _DOI_RE = re.compile(r"10\.\d{4,9}/\S+")
@@ -57,21 +70,46 @@ def is_non_paper_title(title: str) -> bool:
     return bool(_NON_PAPER_PREFIX_RE.match(title or ""))
 
 
+def _venue_key(venue: str) -> str:
+    return re.sub(r"[^a-z0-9-]", "", venue.strip().lower())
+
+
 def resolve_stream(venue: str) -> str | None:
     """Return the DBLP stream for a venue, or None if it has no mapping."""
-    key = re.sub(r"[^a-z0-9-]", "", venue.strip().lower())
+    key = _venue_key(venue)
     return _DBLP_STREAMS.get(key)
 
 
+def resolve_journal(venue: str) -> tuple[str, int] | None:
+    """Return (stream_prefix, year_offset) for a journal venue, or None."""
+    key = _venue_key(venue)
+    return _DBLP_JOURNALS.get(key)
+
+
 def stream_for_venue(venue: str) -> str:
-    key = re.sub(r"[^a-z0-9-]", "", venue.strip().lower())
+    key = _venue_key(venue)
     stream = _DBLP_STREAMS.get(key)
-    if stream is None:
-        raise ValueError(
-            f"No DBLP stream mapping for venue {venue!r}. Known venues: "
-            f"{', '.join(sorted(_DBLP_STREAMS))}. Pass --bibtex/--csv to ingest it directly."
-        )
-    return stream
+    if stream is not None:
+        return stream
+    journal = _DBLP_JOURNALS.get(key)
+    if journal is not None:
+        return journal[0]  # return prefix; caller handles volume
+    all_known = sorted(set(_DBLP_STREAMS) | set(_DBLP_JOURNALS))
+    raise ValueError(
+        f"No DBLP stream mapping for venue {venue!r}. Known venues: "
+        f"{', '.join(all_known)}. Pass --bibtex/--csv to ingest it directly."
+    )
+
+
+def journal_stream_for_year(venue: str, year: int) -> str:
+    """Return the full DBLP TOC stream (with volume number) for a journal + year."""
+    key = _venue_key(venue)
+    journal = _DBLP_JOURNALS.get(key)
+    if journal is None:
+        raise ValueError(f"No DBLP journal mapping for venue {venue!r}.")
+    prefix, offset = journal
+    volume = year - offset
+    return f"{prefix}{volume}"
 
 
 class DblpIngestAdapter(IngestAdapter):
@@ -94,8 +132,15 @@ class DblpIngestAdapter(IngestAdapter):
     ) -> None:
         self.venue = venue
         self.year = year
-        self.stream = stream or stream_for_venue(venue)
         self.sleep_seconds = sleep_seconds
+        self._is_journal = False
+        if stream is not None:
+            self.stream = stream
+        elif resolve_journal(venue) is not None:
+            self.stream = journal_stream_for_year(venue, year)
+            self._is_journal = True
+        else:
+            self.stream = stream_for_venue(venue)
         if fetch_json is None:
             from wireless_taxonomy.analyze.abstracts import _default_fetch_json
 
@@ -125,18 +170,25 @@ class DblpIngestAdapter(IngestAdapter):
                     authors=authors,
                     venue=self.venue,
                     year=int(info.get("year") or self.year),
-                    source_url=ee or f"https://dblp.org/db/{self.stream}{self.year}.html",
+                    source_url=ee or f"https://dblp.org/db/{self._toc_key().removesuffix('.bht')}.html",
                     abstract=None,
                     doi=doi or None,
                     source_method=self.source_method,
                     source_confidence=0.97 if title and authors else 0.70,
-                    evidence_text=f"DBLP {self.stream}{self.year}: {title}",
+                    evidence_text=f"DBLP {self._toc_key().removesuffix('.bht')}: {title}",
                 )
             )
         return seeds
 
+    def _toc_key(self) -> str:
+        # Journals: stream already includes volume (e.g. "journals/twc/twc22")
+        # Conferences: stream is prefix, year appended (e.g. "conf/icc/icc" + "2024")
+        if self._is_journal:
+            return f"{self.stream}.bht"
+        return f"{self.stream}{self.year}.bht"
+
     def _fetch_toc(self) -> list[dict[str, Any]]:
-        key = f"{self.stream}{self.year}.bht"
+        key = self._toc_key()
         hits: list[dict[str, Any]] = []
         offset = 0
         while True:
