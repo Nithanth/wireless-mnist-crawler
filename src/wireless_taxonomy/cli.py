@@ -86,7 +86,7 @@ app = typer.Typer(
 
 # ── Register commands (import after app is defined to avoid circular deps) ────
 
-from wireless_taxonomy.commands import admin, cache, classify, coverage, eval, extract, merge  # noqa: E402
+from wireless_taxonomy.commands import admin, cache, classify, coverage, eval, extract, merge, reconcile  # noqa: E402
 from wireless_taxonomy.commands._shared import parse_venue_years as _parse_venue_years  # noqa: F401 (re-exported for tests)
 
 classify.register(app)
@@ -96,6 +96,7 @@ extract.register(app)
 merge.register(app)
 cache.register(app)
 admin.register(app)
+reconcile.register(app)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
