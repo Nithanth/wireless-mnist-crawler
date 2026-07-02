@@ -494,10 +494,10 @@ class Pipeline:
                     yield (i, row, pdf_url, cached)
 
             def _prefetch(item):
-                _i, _row, pdf_url, cached = item
+                _i, row, pdf_url, cached = item
                 if not pdf_url or cached:
                     return None
-                return _fetch_pdf_bytes(pdf_url)
+                return _fetch_pdf_bytes(pdf_url, expected_title=row["title"])
 
             for item, fetched, error in parallel_map(_prefetch, _prefetch_items(), workers):
                 i, row, pdf_url, cached = item

@@ -146,7 +146,7 @@ class OpenAccessResolver:
             return None
         location = payload.get("best_oa_location") if isinstance(payload.get("best_oa_location"), dict) else {}
         pdf_url = _str(location.get("url_for_pdf")) or _str(location.get("url"))
-        if not pdf_url:
+        if not pdf_url or _is_acm_blocked(pdf_url):
             return None
         return OaResult(
             True,

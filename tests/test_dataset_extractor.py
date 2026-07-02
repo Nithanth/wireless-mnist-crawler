@@ -4,7 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from wireless_taxonomy.analyze.dataset_extractor import DatasetExtractor
+from wireless_taxonomy.analyze.dataset_extractor import (
+    DatasetExtractor,
+    _fetch_pdf_bytes,
+    _is_acm_blocked,
+    _title_words_in_text,
+)
 
 
 def _mock_router(fail_with_pdf=False, response_json=None):
@@ -93,3 +98,92 @@ def test_text_fallback_short_extraction_returns_error(mock_url, mock_bib, mock_f
     assert result.error
     assert "too short" in result.error
     assert result.datasets == []
+
+
+class TestAcmBlocked:
+    def test_direct_acm_url(self):
+        assert _is_acm_blocked("https://dl.acm.org/doi/pdf/10.1145/123")
+
+    def test_acm_doi_redirect(self):
+        assert _is_acm_blocked("https://doi.org/10.1145/3730567.3764475")
+
+    def test_arxiv_not_blocked(self):
+        assert not _is_acm_blocked("https://arxiv.org/pdf/2505.21733v2")
+
+    def test_usenix_not_blocked(self):
+        assert not _is_acm_blocked("https://www.usenix.org/system/files/nsdi24-paper.pdf")
+
+    def test_non_acm_doi_not_blocked(self):
+        assert not _is_acm_blocked("https://doi.org/10.1109/TWC.2024.123")
+
+
+class TestTitleWordsInText:
+    def test_exact_title_present(self):
+        assert _title_words_in_text(
+            "Efficient Multi-WAN Transport for 5G with OTTER",
+            "Efficient Multi-WAN Transport for 5G with OTTER Alice Bob Abstract We present...",
+        )
+
+    def test_hyphenated_linebreak_tolerated(self):
+        # "Communication" broken across lines still passes word-threshold matching.
+        assert _title_words_in_text(
+            "Radar Backscatter Communication with Low-power Tags",
+            "Radar Backscatter Communica- tion with Low-power Tags University Abstract",
+        )
+
+    def test_wrong_paper_rejected(self):
+        assert not _title_words_in_text(
+            "Massive MIMO Baseband Processing on a Single Server",
+            "A Study of Coral Reef Bleaching Patterns in the Pacific Ocean Abstract We surveyed...",
+        )
+
+    def test_short_words_ignored(self):
+        # Only words > 3 chars count, so stop-words don't inflate the match.
+        assert not _title_words_in_text(
+            "On the Use of the Web for the Study of DNS",
+            "Completely unrelated document about biology and chemistry experiments",
+        )
+
+
+class TestFetchPdfBytes:
+    def _response(self, body: bytes):
+        resp = MagicMock()
+        resp.read = MagicMock(return_value=body)
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def test_valid_pdf_returned(self):
+        pdf = b"%PDF-1.4 content"
+        with patch("urllib.request.urlopen", return_value=self._response(pdf)):
+            assert _fetch_pdf_bytes("https://x/paper.pdf") == pdf
+
+    def test_non_pdf_rejected(self):
+        with patch("urllib.request.urlopen", return_value=self._response(b"<html>landing page</html>")):
+            assert _fetch_pdf_bytes("https://x/paper.pdf") is None
+
+    def test_oversized_pdf_rejected_not_truncated(self):
+        # A body larger than max_bytes must be rejected, not silently truncated.
+        big = b"%PDF" + b"x" * 100
+        with patch("urllib.request.urlopen", return_value=self._response(big)):
+            assert _fetch_pdf_bytes("https://x/paper.pdf", max_bytes=50) is None
+
+    def test_transient_error_retried(self):
+        pdf = b"%PDF-1.4 content"
+        calls = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionResetError("transient")
+            return self._response(pdf)
+
+        with patch("urllib.request.urlopen", side_effect=flaky), patch("time.sleep"):
+            assert _fetch_pdf_bytes("https://x/paper.pdf") == pdf
+        assert calls["n"] == 2
+
+    def test_title_mismatch_rejected(self):
+        pdf = b"%PDF-1.4 content"
+        with patch("urllib.request.urlopen", return_value=self._response(pdf)), \
+             patch("wireless_taxonomy.analyze.dataset_extractor._pdf_matches_title", return_value=False):
+            assert _fetch_pdf_bytes("https://x/paper.pdf", expected_title="Some Paper") is None

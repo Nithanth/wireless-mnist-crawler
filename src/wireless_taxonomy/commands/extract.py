@@ -42,6 +42,8 @@ def register(app: typer.Typer) -> None:
         from wireless_taxonomy.analyze.cache import MetadataCache
         metadata_cache = MetadataCache(".wt_cache.json")
 
+        from wireless_taxonomy.analyze.dataset_extractor import _is_acm_blocked
+
         oa_pdf_urls: dict[str, str] = {}
         if oa_json:
             oa_paths = sorted(_glob.glob(oa_json)) if "*" in oa_json else [oa_json]
@@ -51,7 +53,7 @@ def register(app: typer.Typer) -> None:
                     for run in data.get("runs", []):
                         for paper in run.get("papers", []):
                             url = paper.get("pdf_url") or ""
-                            if url and "dl.acm.org" not in url:
+                            if url and not _is_acm_blocked(url):
                                 oa_pdf_urls[paper["title"]] = url
                 except Exception as exc:
                     typer.echo(f"Warning: could not load OA JSON {p}: {exc}", err=True)

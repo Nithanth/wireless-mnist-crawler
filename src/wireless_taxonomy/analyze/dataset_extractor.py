@@ -67,18 +67,88 @@ _BROWSER_UA = (
 )
 
 
-def _fetch_pdf_bytes(pdf_url: str, max_bytes: int = 1024 * 1024 * 10) -> bytes | None:
-    """Download PDF and return raw bytes for native LLM attachment (up to 10 MB)."""
+def _title_words_in_text(title: str, text: str, threshold: float = 0.6) -> bool:
+    """True if enough distinctive title words appear in the text.
+
+    Word-level matching (rather than exact substring) tolerates hyphenation,
+    line breaks, and ligature artifacts in PDF-extracted text.
+    """
+    norm = re.compile(r"[^a-z0-9]+")
+    text_words = set(norm.sub(" ", text.lower()).split())
+    title_words = [w for w in norm.sub(" ", title.lower()).split() if len(w) > 3]
+    if not title_words:
+        return True
+    hits = sum(1 for w in title_words if w in text_words)
+    return hits / len(title_words) >= threshold
+
+
+def _pdf_matches_title(pdf_bytes: bytes, expected_title: str) -> bool:
+    """Verify fetched PDF is the expected paper by checking its first pages.
+
+    Guards against wrong-paper matches from title-search OA providers. Errs on
+    the side of acceptance: scanned PDFs (no text layer) or extraction failures
+    pass, since a false rejection loses full text for the whole paper.
+    """
     try:
-        req = urllib.request.Request(
-            pdf_url,
-            headers={"User-Agent": _BROWSER_UA, "Accept": "application/pdf,*/*"},
-        )
-        with urllib.request.urlopen(req, timeout=25) as r:
-            raw = r.read(max_bytes)
-        return raw if raw[:4] == b"%PDF" else None
+        import io
+
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        text = " ".join((page.extract_text() or "") for page in reader.pages[:2])
     except Exception:
-        return None
+        return True
+    if len(text.strip()) < 200:
+        return True  # no usable text layer — can't verify, don't reject
+    return _title_words_in_text(expected_title, text)
+
+
+# 13 MB raw ≈ 17.3 MB base64 — fits Gemini's 20 MB inline-request limit with
+# room for the prompt. Larger files are rejected rather than truncated.
+_MAX_PDF_BYTES = 1024 * 1024 * 13
+
+
+def _fetch_pdf_bytes(
+    pdf_url: str,
+    max_bytes: int = _MAX_PDF_BYTES,
+    expected_title: str | None = None,
+    attempts: int = 3,
+) -> bytes | None:
+    """Download a PDF and return raw bytes for native LLM attachment.
+
+    Robustness guarantees:
+    - retries transient network errors with backoff;
+    - rejects files larger than ``max_bytes`` instead of returning silently
+      truncated (corrupt) bytes;
+    - when ``expected_title`` is given, rejects PDFs whose first pages don't
+      contain the title (wrong-paper guard for title-search OA providers).
+    """
+    for attempt in range(attempts):
+        try:
+            req = urllib.request.Request(
+                pdf_url,
+                headers={"User-Agent": _BROWSER_UA, "Accept": "application/pdf,*/*"},
+            )
+            with urllib.request.urlopen(req, timeout=25) as r:
+                raw = r.read(max_bytes + 1)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (408, 429, 500, 502, 503, 504) and attempt < attempts - 1:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            return None
+        except Exception:
+            if attempt < attempts - 1:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            return None
+        if raw[:4] != b"%PDF":
+            return None
+        if len(raw) > max_bytes:
+            return None  # oversized — a truncated PDF is corrupt, don't pass it on
+        if expected_title and not _pdf_matches_title(raw, expected_title):
+            return None
+        return raw
+    return None
 
 
 def _check_url_live(url: str) -> bool:
@@ -376,7 +446,7 @@ class DatasetExtractor:
             # Check DB text cache before hitting the network
             pdf_bytes = self._load_cached_pdf(paper_id, pdf_url)
             if not pdf_bytes:
-                pdf_bytes = _fetch_pdf_bytes(pdf_url)
+                pdf_bytes = _fetch_pdf_bytes(pdf_url, expected_title=title)
                 if pdf_bytes:
                     self._store_cached_pdf(paper_id, pdf_url, pdf_bytes)
             if pdf_bytes:
