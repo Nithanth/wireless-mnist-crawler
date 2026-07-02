@@ -367,6 +367,7 @@ class Pipeline:
         resolve_dois: bool = True,
         cache=None,
         resolver=None,
+        per_paper_timeout: int = 120,
     ) -> dict:
         """Report which papers in a venue/year have a legally fetchable full text.
 
@@ -376,8 +377,36 @@ class Pipeline:
         legally hosted OA copy. Returns the full per-paper set plus coverage
         counts. It reads OA *status* only — it never downloads or scrapes
         paywalled full text.
+
+        ``per_paper_timeout`` caps any single paper's OA resolution so a slow
+        or wedged network request cannot stall an entire venue-year run.
         """
-        from wireless_taxonomy.analyze.oa_availability import OpenAccessResolver, summarize
+        import signal
+        import sys
+        import time
+
+        from wireless_taxonomy.analyze.oa_availability import OpenAccessResolver, _NOT_FETCHABLE, summarize
+
+        def _resolve_with_timeout(title, doi, url):
+            class TimeoutError(Exception):
+                pass
+
+            def _handler(_signum, _frame):
+                raise TimeoutError()
+
+            old_handler = signal.signal(signal.SIGALRM, _handler)
+            old_alarm = signal.alarm(per_paper_timeout)
+            try:
+                return resolver.resolve(title, doi, url)
+            except TimeoutError:
+                print(
+                    f"  [!] OA resolution timeout ({per_paper_timeout}s): {title[:60]}",
+                    file=sys.stderr,
+                )
+                return _NOT_FETCHABLE
+            finally:
+                signal.alarm(old_alarm if old_alarm else 0)
+                signal.signal(signal.SIGALRM, old_handler)
 
         ingest_run = self.ingest(venue, year, source_type, source_value or "")
         if resolve_dois:
@@ -390,11 +419,21 @@ class Pipeline:
         ).fetchall()
         resolver = resolver or OpenAccessResolver(cache=cache)
         papers: list[dict] = []
-        for row in rows:
+        n_total = len(rows)
+        for i, row in enumerate(rows, 1):
+            if i % 10 == 0 or i == n_total:
+                print(f"  [{i}/{n_total}] resolving OA coverage...", file=sys.stderr)
             title = row["title"]
             doi = (row["doi"] or "").strip()
             url = source_urls.get(row["id"]) or (row["paper_url"] or "").strip()
-            result = resolver.resolve(title, doi or None, url or None)
+            start = time.monotonic()
+            result = _resolve_with_timeout(title, doi or None, url or None)
+            elapsed = time.monotonic() - start
+            if elapsed > 30:
+                print(
+                    f"  [!] slow OA resolution ({elapsed:.1f}s): {title[:60]}",
+                    file=sys.stderr,
+                )
             papers.append(
                 {
                     "title": title,
