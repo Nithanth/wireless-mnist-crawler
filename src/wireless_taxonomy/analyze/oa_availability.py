@@ -21,6 +21,15 @@ _ARXIV_ENTRY_RE = re.compile(r"<entry>(.*?)</entry>", re.DOTALL)
 _ARXIV_TITLE_RE = re.compile(r"<title>(.*?)</title>", re.DOTALL)
 _ARXIV_ID_RE = re.compile(r"<id>(.*?)</id>", re.DOTALL)
 
+
+def _is_acm_blocked(url: str) -> bool:
+    """True for URLs that resolve to ACM's programmatically-blocked PDFs.
+
+    OpenAlex reports ``https://doi.org/10.1145/...`` as OA, but those DOIs
+    redirect to dl.acm.org landing pages that the pipeline cannot download.
+    """
+    return "dl.acm.org" in url or "doi.org/10.1145" in url
+
 # OpenAlex / Unpaywall report this on every work. Anything other than "closed"
 # means a legally hosted copy exists somewhere (gold/hybrid = publisher, green =
 # repository/preprint, bronze = free-to-read on the publisher site w/o a license).
@@ -166,7 +175,7 @@ class OpenAccessResolver:
             return None
         location = payload.get("best_oa_location") if isinstance(payload.get("best_oa_location"), dict) else {}
         pdf_url = _str(location.get("pdf_url")) or _str(oa.get("oa_url"))
-        if not pdf_url:
+        if not pdf_url or _is_acm_blocked(pdf_url):
             return None
         return OaResult(
             True,
@@ -196,7 +205,7 @@ class OpenAccessResolver:
             payload = first
         oa_pdf = payload.get("openAccessPdf") if isinstance(payload.get("openAccessPdf"), dict) else {}
         pdf_url = _str(oa_pdf.get("url"))
-        if not pdf_url:
+        if not pdf_url or _is_acm_blocked(pdf_url):
             return None
         status = _str(oa_pdf.get("status")).lower()
         return OaResult(

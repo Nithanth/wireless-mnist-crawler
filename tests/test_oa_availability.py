@@ -78,6 +78,35 @@ def test_closed_paper_is_not_fetchable() -> None:
     )
     res = resolver.resolve("Some Paywalled Paper", "10.1/closed")
     assert res.fetchable is False
+
+
+def test_acm_doi_redirects_are_not_fetchable() -> None:
+    """OpenAlex reports doi.org/10.1145 URLs as OA, but they redirect to ACM."""
+    resolver = OpenAccessResolver(
+        fetch_json=_fetch_json([("api.openalex.org", {
+            "title": "A Wireless Paper",
+            "open_access": {"is_oa": True, "oa_status": "gold", "oa_url": "https://doi.org/10.1145/123456.789012"},
+            "best_oa_location": {"pdf_url": "https://doi.org/10.1145/123456.789012", "license": ""},
+        })]),
+        fetch_text=lambda u: "",
+        providers=["openalex"],
+    )
+    res = resolver.resolve("A Wireless Paper", "10.1145/123456.789012")
+    assert res.fetchable is False
+    assert res.provider == "none"
+
+
+def test_acm_direct_url_is_not_fetchable() -> None:
+    """Direct dl.acm.org PDF URLs are also blocked."""
+    resolver = OpenAccessResolver(
+        fetch_json=_fetch_json([("api.semanticscholar.org", {
+            "openAccessPdf": {"url": "https://dl.acm.org/doi/pdf/10.1145/123", "status": "GREEN", "license": ""},
+        })]),
+        fetch_text=lambda u: "",
+        providers=["semantic_scholar"],
+    )
+    res = resolver.resolve("A Wireless Paper", "10.1145/123456.789012")
+    assert res.fetchable is False
     assert res.oa_status == "closed"
     assert res.provider == "none"
 

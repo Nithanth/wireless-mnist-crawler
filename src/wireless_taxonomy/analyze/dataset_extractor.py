@@ -99,6 +99,17 @@ def _check_url_live(url: str) -> bool:
     return False
 
 
+def _is_acm_blocked(url: str) -> bool:
+    """Return True for URLs that resolve to ACM's paywalled PDFs.
+
+    OpenAlex sometimes reports ``https://doi.org/10.1145/...`` as an OA PDF
+    URL, but those DOIs redirect to dl.acm.org, which blocks programmatic
+    downloads. Treating them as blocked avoids wasting time fetching HTML
+    landing pages and keeps the extraction_source honest.
+    """
+    return "dl.acm.org" in url or "doi.org/10.1145" in url
+
+
 def _fetch_crossref_bibtex(doi: str, attempts: int = 3) -> str | None:
     """Retrieve BibTeX from CrossRef for a given DOI.
 
@@ -361,7 +372,7 @@ class DatasetExtractor:
 
         if pdf_bytes:
             extraction_source = "pdf"
-        elif pdf_url and "dl.acm.org" not in pdf_url:
+        elif pdf_url and not _is_acm_blocked(pdf_url):
             # Check DB text cache before hitting the network
             pdf_bytes = self._load_cached_pdf(paper_id, pdf_url)
             if not pdf_bytes:
