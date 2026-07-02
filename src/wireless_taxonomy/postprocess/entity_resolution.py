@@ -230,6 +230,13 @@ Are these the SAME dataset? Consider:
 - From the same measurement campaign or data collection effort
 - Would a reader treat these as the same dataset if cited?
 
+Be conservative: answer "yes" ONLY if the evidence clearly indicates the same
+underlying artifact (same name/URL/campaign). Two datasets that merely measure
+the same phenomenon (e.g. two different indoor WiFi CSI collections) are NOT
+the same. If the evidence is insufficient to decide, answer "unsure" — never
+guess "yes". A wrong merge corrupts reuse statistics; a missed merge is
+recoverable in review.
+
 Respond with JSON: {{"verdict": "yes" | "no" | "unsure", "reason": "<brief explanation>"}}
 """
 
@@ -428,15 +435,23 @@ class CanonicalDataset:
     merge_reason: str = ""
 
 
+# Only these match methods carry enough evidence to merge without human
+# review: a shared availability URL is near-certain identity, and llm_confirmed
+# means the LLM explicitly verified the pair. Similarity-only candidates and
+# llm_unsure pairs are surfaced for review but never auto-merged.
+_AUTO_MERGE_METHODS = {"url_dedup", "llm_confirmed"}
+
+
 def consolidate(
     datasets: list[DatasetRecord],
     matches: list[Match],
-    *,
-    auto_merge_threshold: float = 0.85,
 ) -> list[CanonicalDataset]:
     """Merge confirmed duplicates into a canonical dataset list.
 
-    Datasets linked by matches above ``auto_merge_threshold`` are merged.
+    Datasets are merged only when linked by a match whose *method* is in
+    ``_AUTO_MERGE_METHODS`` — the decision is rule-based (how the match was
+    established), not score-based, so tweaking similarity scores can never
+    silently change merge behaviour.
     The result is a deduplicated list with proper reuse counts.
 
     Each CanonicalDataset represents one real-world dataset, with:
@@ -467,8 +482,8 @@ def consolidate(
 
     # Apply merges from confirmed matches
     for m in matches:
-        if m.confidence < auto_merge_threshold:
-            continue  # only auto-merge high-confidence matches
+        if m.method not in _AUTO_MERGE_METHODS:
+            continue  # similarity-only / llm_unsure: review, never auto-merge
         # Find indices for each dataset in the match
         a_indices = name_to_indices.get(m.a.name, [])
         b_indices = name_to_indices.get(m.b.name, [])

@@ -222,3 +222,34 @@ class TestReconcile:
         # Should only appear once (URL dedup wins, similarity doesn't re-add)
         assert len(matches) == 1
         assert matches[0].method == "url_dedup"
+
+def test_consolidate_merges_by_method_not_score():
+    """Similarity/unsure matches must never auto-merge, regardless of score."""
+    from wireless_taxonomy.postprocess.entity_resolution import (
+        CanonicalDataset, DatasetRecord, Match, consolidate,
+    )
+
+    a = DatasetRecord(name="Campus WiFi Traces", bibtex_keys=["a2022x"])
+    b = DatasetRecord(name="Campus WiFi Dataset", bibtex_keys=["b2023y"])
+
+    # High-scoring similarity match: must NOT merge.
+    sim = Match(a=a, b=b, confidence=0.99, reason="name=0.99", method="similarity")
+    result = consolidate([a, b], [sim])
+    assert len(result) == 2
+
+    # llm_unsure: must NOT merge.
+    unsure = Match(a=a, b=b, confidence=0.99, reason="LLM unsure", method="llm_unsure")
+    result = consolidate([a, b], [unsure])
+    assert len(result) == 2
+
+    # llm_confirmed: merges even with a lower score.
+    yes = Match(a=a, b=b, confidence=0.5, reason="LLM yes", method="llm_confirmed")
+    result = consolidate([a, b], [yes])
+    assert len(result) == 1
+    assert set(result[0].bibtex_keys) == {"a2022x", "b2023y"}
+    assert result[0].reuse_count == 2
+
+    # url_dedup: merges.
+    url = Match(a=a, b=b, confidence=0.95, reason="shared URL", method="url_dedup")
+    result = consolidate([a, b], [url])
+    assert len(result) == 1
