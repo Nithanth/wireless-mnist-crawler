@@ -40,6 +40,15 @@ def register(app: typer.Typer) -> None:
         cache_path: str = typer.Option(
             ".wt_cache.json", "--cache-path", help="Where the abstract/DOI/OA cache lives (used unless --no-cache)."
         ),
+        workers: int = typer.Option(
+            1, "--workers", min=1, max=16, help="Concurrent OA resolver calls per venue-year."
+        ),
+        web_search: bool = typer.Option(
+            False,
+            "--web-search",
+            help="Last-resort LLM web search (Gemini grounding) for author-hosted PDFs the OA indexes miss. "
+            "Found URLs are verified by downloading + title-checking before being trusted.",
+        ),
         db: str = typer.Option("taxonomy.sqlite", "--db", help="SQLite work DB (created/reused)."),
     ) -> None:
         """Report the %/list of papers we can LEGALLY fetch full text for.
@@ -54,6 +63,9 @@ def register(app: typer.Typer) -> None:
         Unpaywall is the canonical legal-OA source but needs a contact email — set
         ``WIRELESS_TAXONOMY_CONTACT_EMAIL`` to enable it (the other sources still run
         without it).
+
+        Use ``--workers`` to resolve multiple papers in parallel (I/O-bound). Results
+        are identical to a sequential run; the cache is lock-protected.
         """
         valid_sources = {"dblp", "bibtex", "csv", "url"}
         if source not in valid_sources:
@@ -95,6 +107,8 @@ def register(app: typer.Typer) -> None:
                         source_value=source_value,
                         resolve_dois=resolve_dois,
                         cache=metadata_cache,
+                        workers=workers,
+                        web_search=web_search,
                     )
                 )
         finally:

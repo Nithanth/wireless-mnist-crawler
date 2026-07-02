@@ -32,18 +32,20 @@ FRESH_RESULTS=false
 FRESH_LLM=false
 EXTRACT_FRESH_FLAG=""
 WORKERS=6
+WEB_SEARCH_FLAG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --venues)        VENUES_STR="$2"; shift 2 ;;
     --years)         YEARS_STR="$2"; shift 2 ;;
     --workers)       WORKERS="$2"; shift 2 ;;
+    --web-search)    WEB_SEARCH_FLAG="--web-search"; shift ;;
     --fresh)         FRESH_RESULTS=true; FRESH_LLM=true; shift ;;
     --fresh-results) FRESH_RESULTS=true; shift ;;
     --fresh-llm)     FRESH_LLM=true; shift ;;
     *)
       echo "Unknown flag: $1"
-      echo "Usage: $0 [--venues \"NSDI,IMC\"] [--years \"2022:2025\"] [--workers N] [--fresh | --fresh-results | --fresh-llm]"
+      echo "Usage: $0 [--venues \"NSDI,IMC\"] [--years \"2022:2025\"] [--workers N] [--web-search] [--fresh | --fresh-results | --fresh-llm]"
       exit 1 ;;
   esac
 done
@@ -117,6 +119,7 @@ for VENUE in "${VENUES[@]}"; do
     echo "  $(ts) Step 1/2: fetch-coverage — finding OA PDF URLs..."
     if ! python -m wireless_taxonomy.cli fetch-coverage \
       --venue "$VENUE" --years "$YEAR" \
+      --workers "$WORKERS" $WEB_SEARCH_FLAG \
       --json "cov_${VENUE}_${YEAR}.json"; then
       echo "  $(ts) ✗ fetch-coverage FAILED for ${VENUE} ${YEAR} — skipping extraction"
       FAILED+=("${VENUE}_${YEAR}")
@@ -166,6 +169,23 @@ done
 echo ""
 echo "$(ts) Merging all results into master CSVs..."
 python -m wireless_taxonomy.cli merge-results --dir ./src/results --out ./src/results
+
+echo ""
+echo "$(ts) Reconciling datasets (URL dedup + LLM-confirmed merges)..."
+python -m wireless_taxonomy.cli reconcile-datasets \
+  --csv ./src/results/master_datasets.csv \
+  --json ./src/results/master_raw.json \
+  --llm-confirm \
+  --consolidated ./src/results/consolidated_datasets.csv \
+  --out ./src/results/reconcile_report.json \
+  || echo "$(ts) ✗ reconcile-datasets failed (results still usable; re-run manually)"
+
+echo ""
+echo "$(ts) Generating corpus report..."
+python -m wireless_taxonomy.cli report \
+  --dir ./src/results --cov-dir . \
+  --out ./src/results/master_report.md \
+  || echo "$(ts) ✗ report generation failed (re-run manually)"
 
 END_TIME=$(date +%s)
 TOTAL_TIME=$(( END_TIME - START_TIME ))

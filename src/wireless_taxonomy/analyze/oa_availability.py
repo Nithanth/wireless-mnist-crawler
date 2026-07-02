@@ -68,11 +68,14 @@ class OpenAccessResolver:
         fetch_text: FetchText | None = None,
         providers: list[str] | None = None,
         cache: Any | None = None,
+        web_search: bool = False,
+        router: Any | None = None,
     ) -> None:
         self.fetch_json = fetch_json or _default_fetch_json
         self.fetch_text = fetch_text or _default_fetch_text
         self.cache = cache
         self._mailto = (os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip()
+        self._router = router
         if providers is None:
             # "usenix" is authoritative-and-free for NSDI/OSDI/ATC/Security
             # (USENIX hosts every paper open-access), so it runs first and only
@@ -80,20 +83,34 @@ class OpenAccessResolver:
             # resolver but requires an email; without one it is skipped and the
             # others carry the load.
             providers = ["usenix", "unpaywall", "openalex", "semantic_scholar", "arxiv"]
+            if web_search:
+                # Last-resort: LLM web-search grounding finds author-hosted
+                # postprints the OA indexes miss. Runs only when everything
+                # else failed, and its URL is verified by downloading the PDF
+                # and title-checking the first pages before being trusted.
+                providers.append("llm_web_search")
         self.providers = providers
 
     def resolve(self, title: str | None, doi: str | None, url: str | None = None) -> OaResult:
         if self.cache is not None:
             cached = self.cache.get_oa(title, doi)
             if cached is not None:
-                return OaResult(
-                    bool(cached.get("fetchable")),
-                    cached.get("oa_status", "closed"),
-                    cached.get("license", ""),
-                    cached.get("pdf_url", ""),
-                    cached.get("provider", "cache"),
-                    cached.get("source_url", ""),
+                # A cached "closed" verdict predates web search if web search is
+                # now enabled — re-resolve so the new provider gets a chance.
+                stale_closed = (
+                    "llm_web_search" in self.providers
+                    and not cached.get("fetchable")
+                    and not cached.get("web_search_attempted")
                 )
+                if not stale_closed:
+                    return OaResult(
+                        bool(cached.get("fetchable")),
+                        cached.get("oa_status", "closed"),
+                        cached.get("license", ""),
+                        cached.get("pdf_url", ""),
+                        cached.get("provider", "cache"),
+                        cached.get("source_url", ""),
+                    )
         result = _NOT_FETCHABLE
         for provider in self.providers:
             handler = getattr(self, f"_{provider}", None)
@@ -121,6 +138,7 @@ class OpenAccessResolver:
                     "pdf_url": result.pdf_url,
                     "provider": result.provider,
                     "source_url": result.source_url,
+                    "web_search_attempted": "llm_web_search" in self.providers,
                 },
             )
         return result
@@ -251,6 +269,70 @@ class OpenAccessResolver:
             "arxiv",
             source_url,
         )
+
+    def _llm_web_search(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
+        """Last-resort provider: LLM with web-search grounding finds a PDF URL.
+
+        Asks Gemini (google_search tool) for a direct, publicly downloadable
+        PDF of this exact paper — author homepages and university mirrors that
+        the OA indexes miss. The returned URL is only trusted after actually
+        downloading it and verifying the paper title appears in the first
+        pages (the same wrong-paper guard extraction uses), so a bad search
+        result can never inject someone else's paper.
+        """
+        if not title or not title.strip():
+            return None
+        router = self._get_router()
+        if router is None:
+            return None
+        from wireless_taxonomy.llm import LlmRequest
+
+        prompt = (
+            "Find a direct, publicly downloadable PDF for this exact research paper:\n"
+            f"  Title: {title}\n"
+            + (f"  DOI: {doi}\n" if doi else "")
+            + "\n"
+            "Look for author-hosted copies (personal/university homepages), "
+            "institutional repositories, or preprint servers. The URL must point "
+            "directly at a .pdf file (not a landing page, not ResearchGate, not "
+            "IEEE Xplore or ACM DL which block downloads).\n\n"
+            'Return JSON only: {"pdf_url": "<direct PDF URL or empty string if none found>"}'
+        )
+        try:
+            response = router.complete(
+                LlmRequest(
+                    task="oa_pdf_web_search",
+                    schema_name="PdfUrlSearch",
+                    prompt=prompt,
+                    use_web_search=True,
+                )
+            )
+        except Exception:
+            return None
+        parsed = response.parsed if isinstance(response.parsed, dict) else {}
+        pdf_url = _str(parsed.get("pdf_url"))
+        if not pdf_url or not pdf_url.lower().startswith("http"):
+            return None
+        if _is_acm_blocked(pdf_url) or "ieeexplore.ieee.org" in pdf_url or "researchgate.net" in pdf_url:
+            return None
+        # Verify by downloading and title-checking — never trust search blindly.
+        from wireless_taxonomy.analyze.dataset_extractor import _fetch_pdf_bytes
+
+        if _fetch_pdf_bytes(pdf_url, expected_title=title) is None:
+            return None
+        return OaResult(True, "green", "", pdf_url, "llm_web_search", "gemini:google_search")
+
+    def _get_router(self) -> Any | None:
+        if self._router is None:
+            try:
+                from wireless_taxonomy.config import load_dotenv, load_llm_settings
+                from wireless_taxonomy.llm import LlmRouter
+
+                load_dotenv()
+                self._router = LlmRouter(load_llm_settings())
+            except Exception:
+                return None
+        return self._router
 
     def _with_mailto(self, url: str) -> str:
         if not self._mailto:

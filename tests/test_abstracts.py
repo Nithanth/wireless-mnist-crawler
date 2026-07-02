@@ -299,3 +299,48 @@ def test_acm_abstract_parses_block_and_meta() -> None:
     )
     assert "Starlink" in _acm_abstract(meta_html)
     assert _acm_abstract("<html>no abstract here</html>") == ""
+
+def test_circuit_breaker_opens_after_repeated_rate_limits() -> None:
+    from wireless_taxonomy.analyze.abstracts import _HostCircuitBreaker
+
+    breaker = _HostCircuitBreaker(failure_threshold=3, window_seconds=60.0, cooldown_seconds=60.0)
+    breaker.check("api.example.org")  # closed: no raise
+
+    breaker.record_rate_limit("api.example.org")
+    breaker.record_rate_limit("api.example.org")
+    breaker.check("api.example.org")  # still closed below threshold
+
+    breaker.record_rate_limit("api.example.org")  # threshold crossed → open
+    try:
+        breaker.check("api.example.org")
+        raise AssertionError("expected ConnectionError when circuit is open")
+    except ConnectionError as exc:
+        assert "circuit open" in str(exc)
+
+    # Other hosts are unaffected.
+    breaker.check("api.other.org")
+
+
+def test_circuit_breaker_success_resets_failures() -> None:
+    from wireless_taxonomy.analyze.abstracts import _HostCircuitBreaker
+
+    breaker = _HostCircuitBreaker(failure_threshold=2)
+    breaker.record_rate_limit("h")
+    breaker.record_success("h")  # resets the failure window
+    breaker.record_rate_limit("h")
+    breaker.check("h")  # one failure post-reset: still closed
+
+
+def test_circuit_breaker_cooldown_expires() -> None:
+    from wireless_taxonomy.analyze.abstracts import _HostCircuitBreaker
+
+    breaker = _HostCircuitBreaker(failure_threshold=1, cooldown_seconds=0.05)
+    breaker.record_rate_limit("h")
+    try:
+        breaker.check("h")
+        raise AssertionError("expected open circuit")
+    except ConnectionError:
+        pass
+    import time
+    time.sleep(0.06)
+    breaker.check("h")  # cooldown elapsed: closed again

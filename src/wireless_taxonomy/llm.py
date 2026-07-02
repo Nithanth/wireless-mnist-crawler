@@ -61,12 +61,24 @@ class LlmRouter:
         for provider in self.configured_providers():
             try:
                 content = self._complete_with_provider(provider, request)
+                parsed = _parse_json_content(content)
+                if request.schema_name and not isinstance(parsed, (dict, list)):
+                    # The task expects structured JSON output; an empty or
+                    # unparseable response (e.g. a truncated/blocked generation)
+                    # is a provider failure — fall through to the next provider
+                    # rather than surfacing garbage to the caller.
+                    raise RuntimeError(
+                        f"expected JSON for schema {request.schema_name!r} but got "
+                        f"unparseable content ({len(content)} chars)"
+                    )
                 return LlmResponse(
                     provider=provider.provider,
                     model=provider.model,
                     content=content,
-                    parsed=_parse_json_content(content),
+                    parsed=parsed,
                 )
+            except CreditExhaustedError:
+                raise
             except Exception as exc:  # Providers are fallbacks; preserve concise failure context.
                 errors.append(f"{provider.provider}: {exc}")
         if not errors:
@@ -223,7 +235,16 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[
                     "Top up your account and re-run; the cache will resume where you left off."
                 ) from exc
             last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
-            if exc.code not in _RETRYABLE_STATUS:
+            if exc.code == 429 and _looks_like_quota(detail):
+                # Gemini reports both transient rate limits AND hard daily-quota
+                # exhaustion as 429 RESOURCE_EXHAUSTED. Retry with backoff first;
+                # if it is still 429-quota after all attempts, it is a real
+                # quota wall — checkpoint and stop instead of erroring per-paper.
+                last_error = CreditExhaustedError(
+                    "Quota exhausted after retries (HTTP 429). "
+                    "Top up / wait for quota reset and re-run; the cache will resume where you left off."
+                )
+            elif exc.code not in _RETRYABLE_STATUS:
                 raise last_error from exc
         except URLError as exc:
             last_error = RuntimeError(str(exc))

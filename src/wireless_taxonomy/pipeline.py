@@ -1,6 +1,7 @@
 
 import json
 import sqlite3
+from typing import Any
 
 from wireless_taxonomy.analyze.candidates import KeywordCandidateClassifier, LlmCandidateClassifier
 from wireless_taxonomy.config import Settings
@@ -367,7 +368,8 @@ class Pipeline:
         resolve_dois: bool = True,
         cache=None,
         resolver=None,
-        per_paper_timeout: int = 120,
+        workers: int = 1,
+        web_search: bool = False,
     ) -> dict:
         """Report which papers in a venue/year have a legally fetchable full text.
 
@@ -378,35 +380,15 @@ class Pipeline:
         counts. It reads OA *status* only — it never downloads or scrapes
         paywalled full text.
 
-        ``per_paper_timeout`` caps any single paper's OA resolution so a slow
-        or wedged network request cannot stall an entire venue-year run.
+        ``workers`` controls the number of concurrent OA resolver calls. Each
+        paper is independent, so modest concurrency (4-6) reduces wall-clock
+        time without changing the result. The shared cache is lock-protected.
         """
-        import signal
         import sys
         import time
 
-        from wireless_taxonomy.analyze.oa_availability import OpenAccessResolver, _NOT_FETCHABLE, summarize
-
-        def _resolve_with_timeout(title, doi, url):
-            class TimeoutError(Exception):
-                pass
-
-            def _handler(_signum, _frame):
-                raise TimeoutError()
-
-            old_handler = signal.signal(signal.SIGALRM, _handler)
-            old_alarm = signal.alarm(per_paper_timeout)
-            try:
-                return resolver.resolve(title, doi, url)
-            except TimeoutError:
-                print(
-                    f"  [!] OA resolution timeout ({per_paper_timeout}s): {title[:60]}",
-                    file=sys.stderr,
-                )
-                return _NOT_FETCHABLE
-            finally:
-                signal.alarm(old_alarm if old_alarm else 0)
-                signal.signal(signal.SIGALRM, old_handler)
+        from wireless_taxonomy.analyze.oa_availability import OpenAccessResolver, summarize
+        from wireless_taxonomy.parallel import parallel_map
 
         ingest_run = self.ingest(venue, year, source_type, source_value or "")
         if resolve_dois:
@@ -417,37 +399,58 @@ class Pipeline:
             "SELECT id, title, doi, paper_url FROM papers WHERE conference_instance_id = ? ORDER BY id",
             (conference_instance_id,),
         ).fetchall()
-        resolver = resolver or OpenAccessResolver(cache=cache)
-        papers: list[dict] = []
+        resolver = resolver or OpenAccessResolver(cache=cache, web_search=web_search)
         n_total = len(rows)
-        for i, row in enumerate(rows, 1):
-            if i % 10 == 0 or i == n_total:
-                print(f"  [{i}/{n_total}] resolving OA coverage...", file=sys.stderr)
+
+        def _resolve_item(item: tuple[int, dict[str, Any]]) -> dict[str, Any]:
+            i, row = item
             title = row["title"]
             doi = (row["doi"] or "").strip()
             url = source_urls.get(row["id"]) or (row["paper_url"] or "").strip()
             start = time.monotonic()
-            result = _resolve_with_timeout(title, doi or None, url or None)
+            result = resolver.resolve(title, doi or None, url or None)
             elapsed = time.monotonic() - start
-            if elapsed > 30:
+            return {
+                "title": title,
+                "doi": doi,
+                "venue": venue,
+                "year": year,
+                "fetchable": result.fetchable,
+                "oa_status": result.oa_status,
+                "license": result.license,
+                "pdf_url": result.pdf_url,
+                "provider": result.provider,
+                "source_url": result.source_url,
+                "_elapsed": elapsed,
+                "_index": i,
+            }
+
+        papers: list[dict] = []
+        items = ((i, row) for i, row in enumerate(rows, 1))
+        for item, resolved, error in parallel_map(_resolve_item, items, workers):
+            if error is not None:
+                # Defensive: should not happen because resolve swallows exceptions,
+                # but log and continue rather than crashing a long batch.
                 print(
-                    f"  [!] slow OA resolution ({elapsed:.1f}s): {title[:60]}",
+                    f"  [!] OA resolver error on paper {item[0]}/{n_total}: {error}",
                     file=sys.stderr,
                 )
-            papers.append(
-                {
-                    "title": title,
-                    "doi": doi,
-                    "venue": venue,
-                    "year": year,
-                    "fetchable": result.fetchable,
-                    "oa_status": result.oa_status,
-                    "license": result.license,
-                    "pdf_url": result.pdf_url,
-                    "provider": result.provider,
-                    "source_url": result.source_url,
-                }
-            )
+                continue
+            i = resolved.pop("_index")
+            elapsed = resolved.pop("_elapsed")
+            if i % 10 == 0 or i == n_total:
+                print(f"  [{i}/{n_total}] resolved OA coverage", file=sys.stderr)
+            if elapsed > 30:
+                print(
+                    f"  [!] slow OA resolution ({elapsed:.1f}s): {resolved['title'][:60]}",
+                    file=sys.stderr,
+                )
+            papers.append(resolved)
+            if cache is not None and i % 50 == 0:
+                cache.save()
+
+        if cache is not None:
+            cache.save()
         summary = summarize(papers)
         return {"venue": venue, "year": year, **summary, "papers": papers}
 

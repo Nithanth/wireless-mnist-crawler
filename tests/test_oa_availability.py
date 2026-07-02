@@ -197,3 +197,96 @@ def test_metadata_cache_oa_roundtrip(tmp_path: Path) -> None:
     # set_oa indexes the same record under both the DOI key and the title key.
     assert reloaded.stats()["oa"] == 2
     assert reloaded.get_oa(None, "10.1/x") == reloaded.get_oa("A Wireless Paper", None)
+
+def test_web_search_provider_appended_only_when_enabled() -> None:
+    resolver = OpenAccessResolver(fetch_json=lambda url: {}, fetch_text=lambda url: "")
+    assert "llm_web_search" not in resolver.providers
+    resolver_ws = OpenAccessResolver(
+        fetch_json=lambda url: {}, fetch_text=lambda url: "", web_search=True
+    )
+    assert resolver_ws.providers[-1] == "llm_web_search"
+
+
+def test_web_search_rejects_blocked_and_unverified_urls(monkeypatch) -> None:
+    class FakeRouter:
+        def __init__(self, url):
+            self.url = url
+
+        def complete(self, request):
+            from wireless_taxonomy.llm import LlmResponse
+            return LlmResponse("google", "gemini-test", "{}", {"pdf_url": self.url})
+
+    resolver = OpenAccessResolver(
+        fetch_json=lambda url: {}, fetch_text=lambda url: "",
+        web_search=True, router=FakeRouter("https://dl.acm.org/doi/pdf/10.1145/x"),
+    )
+    assert resolver._llm_web_search("A Paper", None, None) is None  # ACM blocked
+
+    resolver = OpenAccessResolver(
+        fetch_json=lambda url: {}, fetch_text=lambda url: "",
+        web_search=True, router=FakeRouter("https://ieeexplore.ieee.org/document/1"),
+    )
+    assert resolver._llm_web_search("A Paper", None, None) is None  # IEEE blocked
+
+    # Good URL but PDF verification fails -> rejected.
+    monkeypatch.setattr(
+        "wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes",
+        lambda url, expected_title=None: None,
+    )
+    resolver = OpenAccessResolver(
+        fetch_json=lambda url: {}, fetch_text=lambda url: "",
+        web_search=True, router=FakeRouter("https://example.edu/paper.pdf"),
+    )
+    assert resolver._llm_web_search("A Paper", None, None) is None
+
+
+def test_web_search_accepts_verified_pdf(monkeypatch) -> None:
+    class FakeRouter:
+        def complete(self, request):
+            from wireless_taxonomy.llm import LlmResponse
+            return LlmResponse(
+                "google", "gemini-test", "{}", {"pdf_url": "https://example.edu/paper.pdf"}
+            )
+
+    monkeypatch.setattr(
+        "wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes",
+        lambda url, expected_title=None: b"%PDF-1.4 verified",
+    )
+    resolver = OpenAccessResolver(
+        fetch_json=lambda url: {}, fetch_text=lambda url: "",
+        web_search=True, router=FakeRouter(),
+    )
+    result = resolver._llm_web_search("A Paper", "10.1/x", None)
+    assert result is not None and result.fetchable
+    assert result.pdf_url == "https://example.edu/paper.pdf"
+    assert result.provider == "llm_web_search"
+
+
+def test_cached_closed_reresolved_when_web_search_enabled(tmp_path: Path) -> None:
+    path = tmp_path / "cache.json"
+    cache = MetadataCache(path)
+    # Cached miss from a pre-web-search run.
+    cache.set_oa("A Paper", "10.1/x", {
+        "fetchable": False, "oa_status": "closed", "license": "",
+        "pdf_url": "", "provider": "none", "source_url": "",
+    })
+
+    calls = []
+    resolver = OpenAccessResolver(
+        fetch_json=lambda url: (calls.append(url) or {}),
+        fetch_text=lambda url: (calls.append(url) or ""),
+        cache=cache,
+        web_search=True,
+        router=None,
+    )
+    resolver.providers = ["openalex", "llm_web_search"]  # skip network-heavy chain
+    resolver._router = type("R", (), {"complete": lambda self, req: (_ for _ in ()).throw(RuntimeError())})()
+    result = resolver.resolve("A Paper", "10.1/x")
+    assert calls  # cache was bypassed and providers were re-queried
+    # The refreshed verdict now records that web search was attempted...
+    got = cache.get_oa("A Paper", "10.1/x")
+    assert got["web_search_attempted"] is True
+    # ...so a second resolve is served from cache (no new provider calls).
+    n = len(calls)
+    resolver.resolve("A Paper", "10.1/x")
+    assert len(calls) == n

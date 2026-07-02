@@ -466,6 +466,58 @@ _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _MAX_RETRY_WAIT = 30.0
 
 
+class _HostCircuitBreaker:
+    """Per-host circuit breaker for rate-limited metadata APIs.
+
+    When a host returns repeated 429s within a short window, the circuit
+    "opens" for a cooldown period and further requests to that host fail
+    immediately instead of sleeping through per-request Retry-After waits.
+    Callers already treat provider failures as "try the next provider", so
+    failing fast turns a 2-minute stall per paper into milliseconds when a
+    provider is saturated (e.g. Semantic Scholar under parallel load).
+
+    Thread-safe: shared across the worker threads used by parallel stages.
+    """
+
+    def __init__(self, failure_threshold: int = 3, window_seconds: float = 60.0, cooldown_seconds: float = 60.0):
+        import threading
+        self._lock = threading.Lock()
+        self._failures: dict[str, list[float]] = {}
+        self._open_until: dict[str, float] = {}
+        self.failure_threshold = failure_threshold
+        self.window_seconds = window_seconds
+        self.cooldown_seconds = cooldown_seconds
+
+    def check(self, host: str) -> None:
+        """Raise ConnectionError immediately if the host's circuit is open."""
+        import time
+        with self._lock:
+            until = self._open_until.get(host, 0.0)
+            if time.monotonic() < until:
+                raise ConnectionError(
+                    f"circuit open for {host} ({until - time.monotonic():.0f}s cooldown remaining)"
+                )
+
+    def record_rate_limit(self, host: str) -> None:
+        """Record a 429; open the circuit if the threshold is crossed."""
+        import time
+        now = time.monotonic()
+        with self._lock:
+            window = [t for t in self._failures.get(host, []) if now - t < self.window_seconds]
+            window.append(now)
+            self._failures[host] = window
+            if len(window) >= self.failure_threshold:
+                self._open_until[host] = now + self.cooldown_seconds
+                self._failures[host] = []
+
+    def record_success(self, host: str) -> None:
+        with self._lock:
+            self._failures.pop(host, None)
+
+
+_circuit_breaker = _HostCircuitBreaker()
+
+
 def _retry_wait_seconds(exc: Exception, attempt: int) -> float:
     """Backoff before a retry, honoring a server ``Retry-After`` header on 429.
 
@@ -498,8 +550,11 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
     import json as _json
     import time
     from urllib.error import HTTPError, URLError
+    from urllib.parse import urlparse
     from urllib.request import Request, urlopen
 
+    host = urlparse(url).netloc
+    _circuit_breaker.check(host)
     headers = {"User-Agent": "wireless-taxonomy/0.1"}
     if "api.semanticscholar.org" in url:
         headers = _s2_headers()
@@ -510,11 +565,15 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
         try:
             with urlopen(Request(url, headers=headers), timeout=30) as response:
                 payload = _json.loads(response.read().decode("utf-8"))
+            _circuit_breaker.record_success(host)
             return payload if isinstance(payload, dict) else {}
         except HTTPError as exc:
             last_error = exc
             if exc.code not in _RETRYABLE_STATUS:
                 raise
+            if exc.code == 429:
+                _circuit_breaker.record_rate_limit(host)
+                _circuit_breaker.check(host)  # fail fast if this 429 tripped it
             wait = _retry_wait_seconds(exc, attempt)
         except (URLError, http.client.HTTPException, ConnectionError) as exc:
             # Transient connection drops (e.g. RemoteDisconnected from
@@ -533,8 +592,11 @@ def _default_fetch_json_post(url: str, body: dict[str, Any]) -> Any:
     import json as _json
     import time
     from urllib.error import HTTPError, URLError
+    from urllib.parse import urlparse
     from urllib.request import Request, urlopen
 
+    host = urlparse(url).netloc
+    _circuit_breaker.check(host)
     headers = _s2_headers() if "api.semanticscholar.org" in url else {"User-Agent": "wireless-taxonomy/0.1"}
     headers["Content-Type"] = "application/json"
     data = _json.dumps(body).encode("utf-8")
@@ -544,11 +606,16 @@ def _default_fetch_json_post(url: str, body: dict[str, Any]) -> Any:
         wait = min(1.5 * (2**attempt), 20.0)
         try:
             with urlopen(Request(url, data=data, headers=headers, method="POST"), timeout=60) as response:
-                return _json.loads(response.read().decode("utf-8"))
+                payload = _json.loads(response.read().decode("utf-8"))
+            _circuit_breaker.record_success(host)
+            return payload
         except HTTPError as exc:
             last_error = exc
             if exc.code not in _RETRYABLE_STATUS:
                 raise
+            if exc.code == 429:
+                _circuit_breaker.record_rate_limit(host)
+                _circuit_breaker.check(host)
             wait = _retry_wait_seconds(exc, attempt)
         except (URLError, http.client.HTTPException, ConnectionError) as exc:
             last_error = exc
