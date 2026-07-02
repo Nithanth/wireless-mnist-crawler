@@ -663,18 +663,11 @@ def _acm_abstract(html: str) -> str:
 
 def _acm_chrome_executable() -> str | None:
     """Locate a Chrome/Chromium binary Playwright can drive, if any."""
-    import glob
     import shutil
 
     explicit = (os.getenv("WIRELESS_TAXONOMY_CHROME_PATH") or "").strip()
     if explicit and os.path.exists(explicit):
         return explicit
-    candidates = sorted(
-        glob.glob("/opt/.devin/chrome/chrome/*/chrome-linux64/chrome"), reverse=True
-    )
-    for path in candidates:
-        if os.path.exists(path):
-            return path
     for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser"):
         found = shutil.which(name)
         if found:

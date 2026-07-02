@@ -60,6 +60,33 @@ class TestSimilarityFlagger:
         matches = SimilarityFlagger(name_threshold=0.75).resolve([a, b])
         assert len(matches) == 0
 
+    def test_blocking_skips_no_shared_token_pairs(self):
+        # No shared distinctive token — blocked before any ratio computation,
+        # and (sanity) such names couldn't pass the threshold anyway.
+        a = _ds("CelesTrak TLE Catalog", keys=["p1"])
+        b = _ds("WiFi CSI Sensing Corpus", keys=["p2"])
+        matches = SimilarityFlagger().resolve([a, b])
+        assert matches == []
+
+    def test_blocking_ignores_stopword_only_overlap(self):
+        # Only share generic words ("dataset", "network") — must not match.
+        a = _ds("Starlink Network Dataset", keys=["p1"])
+        b = _ds("LoRaWAN Network Dataset", keys=["p2"])
+        matches = SimilarityFlagger().resolve([a, b])
+        assert matches == []
+
+    def test_blocking_scales_without_quadratic_blowup(self):
+        # 2000 records with entirely distinct name tokens — the blocked
+        # comparison space is empty, so this should be near-instant.
+        import time
+
+        datasets = [_ds(f"UniqueSet{i} Alpha{i}", keys=[f"p{i}"]) for i in range(2000)]
+        start = time.monotonic()
+        matches = SimilarityFlagger().resolve(datasets)
+        elapsed = time.monotonic() - start
+        assert matches == []
+        assert elapsed < 2.0  # unblocked O(n²) SequenceMatcher would take far longer
+
 
 class TestLLMConfirmer:
     def test_yes_verdict(self):

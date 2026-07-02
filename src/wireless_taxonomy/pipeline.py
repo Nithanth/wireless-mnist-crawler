@@ -205,6 +205,7 @@ class Pipeline:
         use_llm: bool = False,
         cache=None,
         refresh_llm: bool = False,
+        workers: int = 1,
     ) -> int:
         """Wireless-candidate screening from title + abstract only.
 
@@ -212,7 +213,11 @@ class Pipeline:
         (yes|maybe) filter flags for later Jaccard evaluation against a gold set.
         When ``cache`` is supplied, LLM labels are read from / written to it so a
         re-run reuses saved labels (unless ``refresh_llm`` forces fresh calls).
+        ``workers`` bounds LLM-call parallelism; results and DB writes stay in
+        input order, so the output is identical to a sequential run.
         """
+        from wireless_taxonomy.parallel import parallel_map
+
         source_run = self._require_run(run_id)
         conference_instance_id = source_run["conference_instance_id"]
         stage_run_id = self._create_run(conference_instance_id, "classify-candidates", "run", str(run_id))
@@ -226,10 +231,17 @@ class Pipeline:
             "SELECT * FROM papers WHERE conference_instance_id = ? ORDER BY id", (conference_instance_id,)
         ).fetchall()
         counts = {"yes": 0, "no": 0, "maybe": 0}
+
+        def _classify(paper_dict):
+            return classifier.classify(paper_dict)
+
         try:
             with transaction(self.conn):
-                for i, paper in enumerate(rows, 1):
-                    prediction = classifier.classify(dict(paper))
+                for i, (paper, prediction, error) in enumerate(
+                    parallel_map(_classify, (dict(r) for r in rows), workers), 1
+                ):
+                    if error is not None:
+                        raise error
                     counts[prediction.label] = counts.get(prediction.label, 0) + 1
                     self.conn.execute(
                         """
@@ -280,6 +292,7 @@ class Pipeline:
         source_value: str | None = None,
         cache=None,
         refresh_llm: bool = False,
+        workers: int = 1,
     ) -> dict:
         """Sheet-free classification loop for a single venue/year.
 
@@ -294,7 +307,7 @@ class Pipeline:
         ingest_run = self.ingest(venue, year, source_type, source_value or "")
         self.enrich_abstracts(ingest_run, resolve_dois=resolve_dois, cache=cache)
         classify_run = self.classify_candidates(
-            ingest_run, use_llm=use_llm, cache=cache, refresh_llm=refresh_llm
+            ingest_run, use_llm=use_llm, cache=cache, refresh_llm=refresh_llm, workers=workers
         )
         classifier = "llm" if use_llm else "keyword"
         conference_instance_id = self._require_run(ingest_run)["conference_instance_id"]
@@ -309,7 +322,8 @@ class Pipeline:
             WHERE p.conference_instance_id = ? AND wcp.run_id = ?
             ORDER BY
                 CASE wcp.label WHEN 'yes' THEN 0 WHEN 'maybe' THEN 1 ELSE 2 END,
-                wcp.confidence DESC, p.title
+                CASE wcp.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END,
+                p.title
             """,
             (conference_instance_id, classify_run),
         ).fetchall()
@@ -321,7 +335,7 @@ class Pipeline:
                 "venue": row["venue"],
                 "year": row["year"],
                 "label": row["label"],
-                "confidence": round(float(row["confidence"]), 4) if row["confidence"] is not None else "",
+                "confidence": row["confidence"] or "",
                 "used_abstract": bool(row["used_abstract"]),
                 "has_abstract": bool((row["abstract"] or "").strip()),
             }
@@ -410,6 +424,7 @@ class Pipeline:
         extractor=None,
         fresh: bool = False,
         wireless_only: bool = True,
+        workers: int = 1,
     ) -> dict:
         """Extract dataset records from every fetchable paper in a venue/year.
 
@@ -422,6 +437,12 @@ class Pipeline:
         ``oa_pdf_urls`` is an optional {title: pdf_url} mapping produced by a
         prior ``text_availability_conference`` run so we skip re-fetching OA
         status.
+
+        ``workers`` bounds thread parallelism for the PDF-fetch, classify, and
+        extract stages. Each paper is independent (deterministic prompts,
+        content-addressed caching), so results are identical to a sequential
+        run; workers only perform network I/O while all SQLite writes stay on
+        the calling thread.
         """
         import sys
 
@@ -450,40 +471,64 @@ class Pipeline:
             from wireless_taxonomy.analyze.candidates import LlmCandidateClassifier
             from wireless_taxonomy.analyze.dataset_extractor import _fetch_pdf_bytes, load_cached_pdf, store_cached_pdf
             from wireless_taxonomy.llm import LlmRouter as _LlmRouter
+            from wireless_taxonomy.parallel import parallel_map
 
             classifier = LlmCandidateClassifier(
                 self.settings.llm, router=_LlmRouter(self.settings.llm), cache=cache
             )
             # Pre-fetch and cache all PDFs so both classification and extraction
-            # can reuse them without re-downloading.
+            # can reuse them without re-downloading. Fetches run in worker
+            # threads (pure network I/O); SQLite reads/writes stay on this
+            # thread. Bytes are not retained — they're reloaded from the DB
+            # cache per stage, keeping memory bounded at journal scale.
             n_total = len(rows)
-            pdf_cache: dict[int, bytes | None] = {}
-            for i, row in enumerate(rows, 1):
+
+            def _prefetch_items():
+                for i, row in enumerate(rows, 1):
+                    title = row["title"]
+                    pdf_url = (oa_pdf_urls or {}).get(title)
+                    cached = (
+                        load_cached_pdf(self.conn, row["id"], pdf_url) is not None
+                        if pdf_url else False
+                    )
+                    yield (i, row, pdf_url, cached)
+
+            def _prefetch(item):
+                _i, _row, pdf_url, cached = item
+                if not pdf_url or cached:
+                    return None
+                return _fetch_pdf_bytes(pdf_url)
+
+            for item, fetched, error in parallel_map(_prefetch, _prefetch_items(), workers):
+                i, row, pdf_url, cached = item
                 title = row["title"]
-                pdf_url = (oa_pdf_urls or {}).get(title)
-                pdf_bytes = None
-                if pdf_url:
-                    cached_pdf = load_cached_pdf(self.conn, row["id"], pdf_url)
-                    if cached_pdf is not None:
-                        pdf_bytes = cached_pdf
-                        print(f"  [{i}/{n_total}] PDF cached: {title[:60]}", file=sys.stderr)
-                    else:
-                        pdf_bytes = _fetch_pdf_bytes(pdf_url)
-                        if pdf_bytes:
-                            store_cached_pdf(self.conn, row["id"], pdf_url, pdf_bytes)
-                            print(f"  [{i}/{n_total}] PDF fetched: {title[:60]}", file=sys.stderr)
-                        else:
-                            print(f"  [{i}/{n_total}] PDF failed: {title[:60]}", file=sys.stderr)
-                else:
+                if not pdf_url:
                     print(f"  [{i}/{n_total}] No PDF URL: {title[:60]}", file=sys.stderr)
-                pdf_cache[row["id"]] = pdf_bytes
+                elif cached:
+                    print(f"  [{i}/{n_total}] PDF cached: {title[:60]}", file=sys.stderr)
+                elif fetched:
+                    store_cached_pdf(self.conn, row["id"], pdf_url, fetched)
+                    print(f"  [{i}/{n_total}] PDF fetched: {title[:60]}", file=sys.stderr)
+                else:
+                    print(f"  [{i}/{n_total}] PDF failed: {title[:60]}", file=sys.stderr)
+
+            # Classify (yes/maybe/no) with bounded parallelism. Workers only
+            # call the LLM (the shared cache is lock-protected); PDF bytes are
+            # loaded from the SQLite cache on this thread at submit time.
+            def _classify_items():
+                for i, row in enumerate(rows, 1):
+                    pdf_url = (oa_pdf_urls or {}).get(row["title"])
+                    pdf_bytes = load_cached_pdf(self.conn, row["id"], pdf_url) if pdf_url else None
+                    yield (i, row, pdf_bytes)
+
+            def _classify(item):
+                _i, row, pdf_bytes = item
+                return classifier.classify(dict(row), pdf_bytes=pdf_bytes)
 
             wireless_ids: set[int] = set()
-            for i, row in enumerate(rows, 1):
-                pdf_bytes = pdf_cache.get(row["id"])
-                try:
-                    pred = classifier.classify(dict(row), pdf_bytes=pdf_bytes)
-                except CreditExhaustedError:
+            for item, pred, error in parallel_map(_classify, _classify_items(), workers):
+                i, row, _pdf = item
+                if isinstance(error, CreditExhaustedError):
                     if cache is not None:
                         cache.save()
                     print(
@@ -491,15 +536,15 @@ class Pipeline:
                         "Re-run after reloading credits to resume.",
                         file=sys.stderr,
                     )
-                    raise
-                except Exception as exc:
+                    raise error
+                if error is not None:
                     # On LLM failure, default to "maybe" for max recall rather
                     # than silently dropping the paper.
-                    print(f"  [{i}/{n_total}] [!] error: {row['title'][:55]} — {exc}", file=sys.stderr)
+                    print(f"  [{i}/{n_total}] [!] error: {row['title'][:55]} — {error}", file=sys.stderr)
                     wireless_ids.add(row["id"])
                     continue
                 label_icon = {"yes": "+", "maybe": "~", "no": "-"}.get(pred.label, "?")
-                print(f"  [{i}/{n_total}] [{label_icon}] {pred.label}({pred.confidence:.2f}): {row['title'][:55]}", file=sys.stderr)
+                print(f"  [{i}/{n_total}] [{label_icon}] {pred.label}({pred.confidence}): {row['title'][:55]}", file=sys.stderr)
                 if pred.low_pass:
                     wireless_ids.add(row["id"])
                 # Save cache periodically so progress isn't lost on crash.
@@ -521,33 +566,50 @@ class Pipeline:
         run_id = self._create_run(conference_instance_id, "extract-datasets", source_type, source_value)
         n_extract = len(rows)
         results: list[dict] = []
-        for idx, row in enumerate(rows, 1):
+
+        # Extraction runs with bounded parallelism: workers call the LLM only.
+        # PDF bytes are loaded from the SQLite cache on this thread at submit
+        # time (so workers never touch self.conn), and all DB writes below
+        # happen on this thread as results arrive, in input order.
+        from wireless_taxonomy.analyze.dataset_extractor import load_cached_pdf as _load_pdf
+        from wireless_taxonomy.parallel import parallel_map as _pmap
+
+        def _extract_items():
+            for idx, row in enumerate(rows, 1):
+                pdf_url = (oa_pdf_urls or {}).get(row["title"])
+                pdf_bytes = _load_pdf(self.conn, row["id"], pdf_url) if pdf_url else None
+                yield (idx, row, pdf_url, pdf_bytes)
+
+        def _extract(item):
+            _idx, row, pdf_url, pdf_bytes = item
+            return extractor.extract(
+                paper_id=row["id"],
+                title=row["title"],
+                authors=row["authors"] or "",
+                venue=venue,
+                year=year,
+                doi=(row["doi"] or "").strip(),
+                pdf_url=pdf_url,
+                abstract=(row["abstract"] or "").strip() or None,
+                pdf_bytes=pdf_bytes,
+            )
+
+        for item, result, error in _pmap(_extract, _extract_items(), workers):
+            idx, row, pdf_url, _pdf = item
             title = row["title"]
             doi = (row["doi"] or "").strip()
-            pdf_url = (oa_pdf_urls or {}).get(title)
-            abstract = (row["abstract"] or "").strip() or None
 
             print(f"  [{idx}/{n_extract}] Extracting: {title[:60]}...", file=sys.stderr)
-            try:
-                result = extractor.extract(
-                    paper_id=row["id"],
-                    title=title,
-                    authors=row["authors"] or "",
-                    venue=venue,
-                    year=year,
-                    doi=doi,
-                    pdf_url=pdf_url,
-                    abstract=abstract,
-                )
-            except CreditExhaustedError:
-                if cache is not None:
-                    cache.save()
-                print(
-                    f"\n  Checkpoint saved after {idx - 1}/{n_extract} papers. "
-                    "Re-run after reloading credits to resume.",
-                    file=sys.stderr,
-                )
-                raise
+            if error is not None:
+                if isinstance(error, CreditExhaustedError):
+                    if cache is not None:
+                        cache.save()
+                    print(
+                        f"\n  Checkpoint saved after {idx - 1}/{n_extract} papers. "
+                        "Re-run after reloading credits to resume.",
+                        file=sys.stderr,
+                    )
+                raise error
 
             with transaction(self.conn):
                 self.conn.execute(

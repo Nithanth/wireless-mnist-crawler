@@ -76,7 +76,7 @@ class CandidatePrediction:
     classifier: str
     model_version: str
     label: Label
-    confidence: float
+    confidence: str  # "high", "medium", or "low"
     evidence: str
     used_abstract: bool
 
@@ -108,19 +108,19 @@ class KeywordCandidateClassifier:
 
         if wireless:
             label: Label = "yes"
-            confidence = min(0.98, 0.91 + (0.02 * min(len(wireless), 3)))
+            confidence = "high"
             category = "wireless"
         elif networking:
             label = "no"
-            confidence = 0.82 if abstract else 0.70
+            confidence = "high" if abstract else "medium"
             category = "networking_non_wireless"
         elif computing:
             label = "no"
-            confidence = 0.76 if abstract else 0.65
+            confidence = "medium"
             category = "not_relevant"
         else:
             label = "maybe"
-            confidence = 0.55 if abstract else 0.45
+            confidence = "low" if not abstract else "medium"
             category = "uncertain"
 
         return CandidatePrediction(
@@ -178,7 +178,7 @@ class LlmCandidateClassifier:
                     classifier=self.classifier,
                     model_version=_str(cached.get("model_version")) or self.provider_name,
                     label=_label(cached.get("label")),
-                    confidence=_float(cached.get("confidence"), 0.0),
+                    confidence=_confidence(cached.get("confidence")),
                     evidence=_str(cached.get("evidence")),
                     used_abstract=used_abstract,
                 )
@@ -199,7 +199,7 @@ class LlmCandidateClassifier:
             classifier=self.classifier,
             model_version=f"{self.provider_name}:{response.provider}:{response.model}",
             label=_label(payload.get("label")),
-            confidence=_float(payload.get("confidence"), 0.0),
+            confidence=_confidence(payload.get("confidence")),
             evidence=_str(payload.get("evidence")),
             used_abstract=used_abstract,
         )
@@ -275,16 +275,16 @@ link/medium is core to the work, not just incidentally mentioned.
 
 Examples:
 - Title: "EdgeRIC: Empowering Real-time Intelligent Optimization and Control in NextG Cellular Networks"
-  → {{"label": "yes", "confidence": 0.95, "evidence": "Core contribution is a RAN intelligent controller for 5G cellular."}}
+  → {{"label": "yes", "confidence": "high", "evidence": "Core contribution is a RAN intelligent controller for 5G cellular."}}
 - Title: "DINT: Fast In-Kernel Distributed Transactions with eBPF"
-  → {{"label": "no", "confidence": 0.95, "evidence": "In-kernel datacenter transactions, no wireless component."}}
+  → {{"label": "no", "confidence": "high", "evidence": "In-kernel datacenter transactions, no wireless component."}}
 - Title: "Habitus: Boosting Mobile Immersive Content Delivery through Full-body Pose Tracking and Multipath Networking"
-  → {{"label": "maybe", "confidence": 0.60, "evidence": "Uses mmWave multipath but main focus is immersive content delivery."}}
+  → {{"label": "maybe", "confidence": "medium", "evidence": "Uses mmWave multipath but main focus is immersive content delivery."}}
 
 Return JSON only:
 {{
   "label": "yes" or "no" or "maybe",
-  "confidence": 0.85,
+  "confidence": "high" or "medium" or "low",
   "evidence": "short reason grounded in the paper content"
 }}
 
@@ -292,7 +292,7 @@ Rules:
 - "yes": wireless link/medium is clearly central to the paper.
 - "no": clearly not about wireless.
 - "maybe": ambiguous, mixed, or not enough information to be sure.
-- confidence: 0.9+ means very certain, 0.5-0.7 means uncertain.
+- confidence: "high" = very certain, "medium" = fairly sure, "low" = uncertain.
 - Keep evidence to one short sentence.
 
 Paper:
@@ -312,6 +312,21 @@ def _float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _confidence(value: Any) -> str:
+    """Parse confidence — accepts categorical or legacy numeric values."""
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("high", "medium", "low"):
+            return s
+    if isinstance(value, (int, float)):
+        if value >= 0.85:
+            return "high"
+        if value >= 0.60:
+            return "medium"
+        return "low"
+    return "medium"
 
 
 def _str(value: Any) -> str:

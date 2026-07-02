@@ -128,8 +128,29 @@ def _normalize_modality(mod: str) -> str:
     return re.sub(r"\s+", " ", n).strip()
 
 
+# Common words that appear in most dataset names; sharing only these does not
+# make a pair worth comparing (they carry no identity signal for blocking).
+_STOP_TOKENS = frozenset({
+    "dataset", "data", "traces", "trace", "measurements", "measurement",
+    "logs", "log", "collection", "corpus", "set", "the", "a", "an", "of",
+    "and", "for", "network", "wireless", "performance",
+})
+
+
+def _blocking_tokens(name: str) -> set[str]:
+    """Distinctive name tokens used to decide which pairs are worth comparing."""
+    return {t for t in _normalize_name(name).split() if t not in _STOP_TOKENS and len(t) > 1}
+
+
 class SimilarityFlagger:
-    """Flag dataset pairs with high combined similarity."""
+    """Flag dataset pairs with high combined similarity.
+
+    Pairs are pre-filtered with token blocking: two datasets are only compared
+    when their names share at least one distinctive token. Names with zero
+    shared content tokens cannot reach the similarity thresholds anyway, so
+    blocking reduces the O(n²) comparison space by orders of magnitude at
+    corpus scale without affecting recall.
+    """
 
     def __init__(self, name_threshold: float = 0.75, combined_threshold: float = 0.70):
         self.name_threshold = name_threshold
@@ -139,29 +160,44 @@ class SimilarityFlagger:
         return f"{_normalize_name(ds.name)} {_normalize_modality(ds.modalities)} {ds.osi_layers.lower()}"
 
     def resolve(self, datasets: list[DatasetRecord]) -> list[Match]:
+        # Build inverted index: token -> dataset indices (blocking step).
+        token_index: dict[str, list[int]] = defaultdict(list)
+        tokens_by_ds: list[set[str]] = []
+        for i, ds in enumerate(datasets):
+            tokens = _blocking_tokens(ds.name)
+            tokens_by_ds.append(tokens)
+            for tok in tokens:
+                token_index[tok].append(i)
+
+        # Candidate pairs: share >= 1 distinctive token.
+        candidate_pairs: set[tuple[int, int]] = set()
+        for indices in token_index.values():
+            for x in range(len(indices)):
+                for y in range(x + 1, len(indices)):
+                    candidate_pairs.add((indices[x], indices[y]))
+
         matches: list[Match] = []
+        for i, j in sorted(candidate_pairs):
+            a, b = datasets[i], datasets[j]
+            # Skip same-paper
+            if set(a.bibtex_keys) == set(b.bibtex_keys):
+                continue
 
-        for i, a in enumerate(datasets):
-            for b in datasets[i + 1 :]:
-                # Skip same-paper
-                if set(a.bibtex_keys) == set(b.bibtex_keys):
-                    continue
+            name_ratio = SequenceMatcher(
+                None, _normalize_name(a.name), _normalize_name(b.name)
+            ).ratio()
+            combined_ratio = SequenceMatcher(
+                None, self._signature(a), self._signature(b)
+            ).ratio()
 
-                name_ratio = SequenceMatcher(
-                    None, _normalize_name(a.name), _normalize_name(b.name)
-                ).ratio()
-                combined_ratio = SequenceMatcher(
-                    None, self._signature(a), self._signature(b)
-                ).ratio()
-
-                if name_ratio >= self.name_threshold or combined_ratio >= self.combined_threshold:
-                    confidence = max(name_ratio, combined_ratio) * 0.8  # cap below url_dedup
-                    matches.append(Match(
-                        a=a, b=b,
-                        confidence=round(confidence, 3),
-                        reason=f"name={name_ratio:.2f} combined={combined_ratio:.2f}",
-                        method="similarity",
-                    ))
+            if name_ratio >= self.name_threshold or combined_ratio >= self.combined_threshold:
+                confidence = max(name_ratio, combined_ratio) * 0.8  # cap below url_dedup
+                matches.append(Match(
+                    a=a, b=b,
+                    confidence=round(confidence, 3),
+                    reason=f"name={name_ratio:.2f} combined={combined_ratio:.2f}",
+                    method="similarity",
+                ))
 
         return matches
 

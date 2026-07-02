@@ -19,6 +19,7 @@ def register(app: typer.Typer) -> None:
         oa_json: Optional[str] = typer.Option(None, "--oa-json", help="Glob path to cov_*.json files from fetch-coverage to reuse known PDF URLs."),
         fresh: bool = typer.Option(False, "--fresh", help="Ignore LLM cache and re-extract all papers. PDF text cache in the DB is still reused."),
         wireless_only: bool = typer.Option(True, "--wireless-only/--all-papers", help="Only extract datasets from papers classified as wireless (yes+maybe for max recall). Use --all-papers to process every paper."),
+        workers: int = typer.Option(1, "--workers", min=1, max=16, help="Thread parallelism for PDF fetch + LLM stages. Results are identical to a sequential run; 4-8 is a good default for paid API tiers."),
         db: str = typer.Option("taxonomy.sqlite", "--db"),
     ) -> None:
         """Run the full dataset-extraction loop for a venue and year range.
@@ -71,6 +72,7 @@ def register(app: typer.Typer) -> None:
                     cache=metadata_cache,
                     fresh=fresh,
                     wireless_only=wireless_only,
+                    workers=workers,
                 )
                 all_results.append(result)
                 typer.echo(

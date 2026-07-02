@@ -31,6 +31,7 @@ def register(app: typer.Typer) -> None:
         refresh_llm: bool = typer.Option(
             False, "--refresh-llm", help="Ignore cached LLM labels and re-call the model (fresh classification)."
         ),
+        workers: int = typer.Option(1, "--workers", min=1, max=16, help="Thread parallelism for LLM calls. Results are identical to a sequential run."),
         db: str = typer.Option("taxonomy.sqlite", "--db", help="SQLite work DB (created/reused)."),
     ) -> None:
         """Loop a venue over a year (or range): fetch list, backfill abstracts, label.
@@ -72,6 +73,7 @@ def register(app: typer.Typer) -> None:
                         source_value=source_value,
                         cache=metadata_cache,
                         refresh_llm=refresh_llm,
+                        workers=workers,
                     )
                 )
         finally:

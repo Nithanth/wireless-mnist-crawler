@@ -8,7 +8,7 @@ def _classify(title: str, abstract: str | None = None) -> object:
 def test_wireless_title_is_yes_with_category_evidence() -> None:
     pred = _classify("Beamforming for 5G MIMO Systems")
     assert pred.label == "yes"
-    assert pred.confidence >= 0.91
+    assert pred.confidence == "high"
     assert "category=wireless" in pred.evidence
     assert "beamforming" in pred.evidence
 
@@ -43,19 +43,16 @@ def test_normalization_matches_wifi_and_mmwave_variants() -> None:
     assert _classify("Millimeter wave links").label == "yes"
 
 
-def test_confidence_scales_with_matched_terms() -> None:
-    one = _classify("A wireless study")
-    many = _classify("5G mmWave MIMO beamforming with OFDM")
-    assert many.confidence > one.confidence
-    assert many.confidence <= 0.98
+def test_confidence_is_high_for_wireless() -> None:
+    pred = _classify("5G mmWave MIMO beamforming with OFDM")
+    assert pred.confidence == "high"
 
 
-def test_missing_abstract_flagged_in_evidence_and_lowers_confidence() -> None:
+def test_missing_abstract_flagged_in_evidence() -> None:
     with_abstract = _classify("Routing in networks", abstract="We study packet routing.")
     without_abstract = _classify("Routing in networks", abstract=None)
     assert "abstract_missing=true" in without_abstract.evidence
     assert "abstract_missing=true" not in with_abstract.evidence
-    assert without_abstract.confidence < with_abstract.confidence
 
 
 def test_used_abstract_flag() -> None:

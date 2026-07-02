@@ -3,6 +3,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,9 @@ class MetadataCache:
         self.oa: dict[str, dict[str, Any]] = {}
         self.dataset_usage: dict[str, dict[str, Any]] = {}
         self.dirty = False
+        # Guards mutations and save() so the cache is safe to share across
+        # worker threads (parallel classify/extract).
+        self._lock = threading.RLock()
         if self.path is not None and self.path.exists():
             self._load()
 
@@ -89,13 +93,14 @@ class MetadataCache:
         return None
 
     def set_abstract(self, title: str | None, doi: str | None, value: dict[str, str]) -> None:
-        wrote = False
-        for key in (_doi_key(doi), _title_key(title)):
-            if key:
-                self.abstracts[key] = value
-                wrote = True
-        if wrote:
-            self.dirty = True
+        with self._lock:
+            wrote = False
+            for key in (_doi_key(doi), _title_key(title)):
+                if key:
+                    self.abstracts[key] = value
+                    wrote = True
+            if wrote:
+                self.dirty = True
 
     # -- DOIs ----------------------------------------------------------------
 
@@ -104,10 +109,11 @@ class MetadataCache:
         return self.dois.get(key) if key else None
 
     def set_doi(self, title: str | None, value: dict[str, str]) -> None:
-        key = _title_key(title)
-        if key:
-            self.dois[key] = value
-            self.dirty = True
+        with self._lock:
+            key = _title_key(title)
+            if key:
+                self.dois[key] = value
+                self.dirty = True
 
     # -- open-access availability --------------------------------------------
 
@@ -118,39 +124,42 @@ class MetadataCache:
         return None
 
     def set_oa(self, title: str | None, doi: str | None, value: dict[str, Any]) -> None:
-        wrote = False
-        for key in (_doi_key(doi), _title_key(title)):
-            if key:
-                self.oa[key] = value
-                wrote = True
-        if wrote:
-            self.dirty = True
+        with self._lock:
+            wrote = False
+            for key in (_doi_key(doi), _title_key(title)):
+                if key:
+                    self.oa[key] = value
+                    wrote = True
+            if wrote:
+                self.dirty = True
 
     # -- dataset usage search ------------------------------------------------
 
     def get_dataset_usage(self, name: str) -> dict[str, Any] | None:
-        key = name.strip().lower()
-        entry = self.dataset_usage.get(key) if key else None
-        if entry is None:
-            return None
-        stored_at = entry.get("_stored_at")
-        if stored_at:
-            try:
-                age = datetime.now(timezone.utc) - datetime.fromisoformat(stored_at)
-                if age > timedelta(days=DATASET_USAGE_TTL_DAYS):
-                    del self.dataset_usage[key]
-                    self.dirty = True
-                    return None
-            except Exception:
-                pass
-        return entry
+        with self._lock:
+            key = name.strip().lower()
+            entry = self.dataset_usage.get(key) if key else None
+            if entry is None:
+                return None
+            stored_at = entry.get("_stored_at")
+            if stored_at:
+                try:
+                    age = datetime.now(timezone.utc) - datetime.fromisoformat(stored_at)
+                    if age > timedelta(days=DATASET_USAGE_TTL_DAYS):
+                        del self.dataset_usage[key]
+                        self.dirty = True
+                        return None
+                except Exception:
+                    pass
+            return entry
 
     def set_dataset_usage(self, name: str, value: dict[str, Any]) -> None:
-        key = name.strip().lower()
-        if key:
-            value["_stored_at"] = datetime.now(timezone.utc).isoformat()
-            self.dataset_usage[key] = value
-            self.dirty = True
+        with self._lock:
+            key = name.strip().lower()
+            if key:
+                value["_stored_at"] = datetime.now(timezone.utc).isoformat()
+                self.dataset_usage[key] = value
+                self.dirty = True
 
     # -- LLM labels ----------------------------------------------------------
 
@@ -158,52 +167,56 @@ class MetadataCache:
         return self.llm.get(key) if key else None
 
     def set_llm(self, key: str, value: dict[str, Any]) -> None:
-        if key:
-            self.llm[key] = value
-            self.dirty = True
+        with self._lock:
+            if key:
+                self.llm[key] = value
+                self.dirty = True
 
     # -- persistence ---------------------------------------------------------
 
     def save(self) -> None:
         """Atomically write the cache to disk if it changed."""
-        if self.path is None or not self.dirty:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload: dict[str, Any] = {"abstracts": self.abstracts, "dois": self.dois, "llm": self.llm, "oa": self.oa, "dataset_usage": self.dataset_usage}
-        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
-            os.replace(tmp, self.path)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-        self.dirty = False
+        with self._lock:
+            if self.path is None or not self.dirty:
+                return
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload: dict[str, Any] = {"abstracts": self.abstracts, "dois": self.dois, "llm": self.llm, "oa": self.oa, "dataset_usage": self.dataset_usage}
+            fd, tmp = tempfile.mkstemp(dir=str(self.path.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                os.replace(tmp, self.path)
+            finally:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            self.dirty = False
 
     def clear(self) -> None:
         """Wipe all sections and mark dirty so save() persists the empty state."""
-        self.abstracts.clear()
-        self.dois.clear()
-        self.llm.clear()
-        self.oa.clear()
-        self.dataset_usage.clear()
-        self.dirty = True
+        with self._lock:
+            self.abstracts.clear()
+            self.dois.clear()
+            self.llm.clear()
+            self.oa.clear()
+            self.dataset_usage.clear()
+            self.dirty = True
 
     def clear_section(self, section: str) -> int:
         """Clear one named section. Returns number of entries removed."""
-        mapping = {
-            "abstracts": self.abstracts,
-            "dois": self.dois,
-            "llm": self.llm,
-            "oa": self.oa,
-            "dataset_usage": self.dataset_usage,
-        }
-        if section not in mapping:
-            raise ValueError(f"Unknown section '{section}'. Valid: {list(mapping)}.")
-        count = len(mapping[section])
-        mapping[section].clear()
-        self.dirty = True
-        return count
+        with self._lock:
+            mapping = {
+                "abstracts": self.abstracts,
+                "dois": self.dois,
+                "llm": self.llm,
+                "oa": self.oa,
+                "dataset_usage": self.dataset_usage,
+            }
+            if section not in mapping:
+                raise ValueError(f"Unknown section '{section}'. Valid: {list(mapping)}.")
+            count = len(mapping[section])
+            mapping[section].clear()
+            self.dirty = True
+            return count
 
     def stats(self) -> dict[str, int]:
         return {"abstracts": len(self.abstracts), "dois": len(self.dois), "llm": len(self.llm), "oa": len(self.oa), "dataset_usage": len(self.dataset_usage)}

@@ -31,17 +31,19 @@ YEARS_STR="2022,2023,2024"
 FRESH_RESULTS=false
 FRESH_LLM=false
 EXTRACT_FRESH_FLAG=""
+WORKERS=6
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --venues)        VENUES_STR="$2"; shift 2 ;;
     --years)         YEARS_STR="$2"; shift 2 ;;
+    --workers)       WORKERS="$2"; shift 2 ;;
     --fresh)         FRESH_RESULTS=true; FRESH_LLM=true; shift ;;
     --fresh-results) FRESH_RESULTS=true; shift ;;
     --fresh-llm)     FRESH_LLM=true; shift ;;
     *)
       echo "Unknown flag: $1"
-      echo "Usage: $0 [--venues \"NSDI,IMC\"] [--years \"2022:2025\"] [--fresh | --fresh-results | --fresh-llm]"
+      echo "Usage: $0 [--venues \"NSDI,IMC\"] [--years \"2022:2025\"] [--workers N] [--fresh | --fresh-results | --fresh-llm]"
       exit 1 ;;
   esac
 done
@@ -129,6 +131,7 @@ for VENUE in "${VENUES[@]}"; do
     if ! python -m wireless_taxonomy.cli extract-datasets \
       --venue "$VENUE" --years "$YEAR" \
       --oa-json "cov_${VENUE}_${YEAR}.json" \
+      --workers "$WORKERS" \
       --out ./src/results $EXTRACT_FRESH_FLAG; then
       echo "  $(ts) ✗ extract-datasets FAILED for ${VENUE} ${YEAR}"
       FAILED+=("${VENUE}_${YEAR}")

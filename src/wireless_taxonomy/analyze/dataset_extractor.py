@@ -28,6 +28,9 @@ COLLECTION_ENVS = {"Physical Lab Testbed", "Real World Deployment", "Simulation"
 RELATIONSHIP_TYPES = {"introduced", "reused", "extended", "compared_against", "unclear"}
 
 
+CONFIDENCE_LEVELS = ("high", "medium", "low")
+
+
 @dataclass
 class DatasetRecord:
     name: str
@@ -39,7 +42,7 @@ class DatasetRecord:
     availability_url: str
     collection_environment: str
     known_users: list[str]
-    confidence: float
+    confidence: str  # "high", "medium", or "low"
     evidence_text: str
 
 
@@ -96,22 +99,37 @@ def _check_url_live(url: str) -> bool:
     return False
 
 
-def _fetch_crossref_bibtex(doi: str) -> str | None:
-    """Retrieve BibTeX from CrossRef for a given DOI."""
+def _fetch_crossref_bibtex(doi: str, attempts: int = 3) -> str | None:
+    """Retrieve BibTeX from CrossRef for a given DOI.
+
+    Retries with exponential backoff on rate-limit/transient errors so that
+    concurrent workers degrade gracefully instead of silently falling back to
+    minimal BibTeX when doi.org throttles.
+    """
     if not doi:
         return None
     url = f"https://doi.org/{urllib.parse.quote(doi, safe='/')}"
-    req = urllib.request.Request(
-        url,
-        headers={"Accept": "application/x-bibtex", "User-Agent": "wireless-taxonomy/0.1"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            text = r.read().decode("utf-8", errors="replace")
-        if text.strip().startswith("@"):
-            return text.strip()
-    except Exception:
-        pass
+    for attempt in range(attempts):
+        req = urllib.request.Request(
+            url,
+            headers={"Accept": "application/x-bibtex", "User-Agent": "wireless-taxonomy/0.1"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                text = r.read().decode("utf-8", errors="replace")
+            if text.strip().startswith("@"):
+                return text.strip()
+            return None
+        except urllib.error.HTTPError as exc:
+            if exc.code in (408, 429, 500, 502, 503, 504) and attempt < attempts - 1:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            return None
+        except Exception:
+            if attempt < attempts - 1:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            return None
     return None
 
 
@@ -241,8 +259,8 @@ For each dataset extract:
 - collection_environment: one of "Physical Lab Testbed", "Real World Deployment",
   "Simulation", "Crowdsourced", "Unknown"
 - known_users: up to 5 OTHER papers that also use this dataset ([] if unsure — do not hallucinate)
-- confidence: 0.0–1.0 (0.9+ = clear named dataset with strong evidence;
-  0.6–0.8 = reasonable but less certain; below 0.5 = weak/speculative)
+- confidence: "high" (clear named dataset with strong evidence), "medium"
+  (reasonable but less certain), or "low" (weak/speculative)
 - evidence_text: one sentence quoting or closely paraphrasing the paper
 
 Examples:
@@ -258,7 +276,7 @@ Examples:
       "availability_notes": "We release our dataset at https://github.com/example/5g-trace-nyc under MIT license.",
       "collection_environment": "Real World Deployment",
       "known_users": [],
-      "confidence": 0.95,
+      "confidence": "high",
       "evidence_text": "We collected 5G NR traces across 12 routes in NYC over 3 months."
     }},
     {{
@@ -271,7 +289,7 @@ Examples:
       "availability_notes": "",
       "collection_environment": "Real World Deployment",
       "known_users": [],
-      "confidence": 0.80,
+      "confidence": "medium",
       "evidence_text": "We collected 47 drone flights with concurrent LTE and 5G measurements across 3 operators."
     }},
     {{
@@ -284,7 +302,7 @@ Examples:
       "availability_notes": "",
       "collection_environment": "Real World Deployment",
       "known_users": ["Diversity in Smartphone Usage (IMC 2010)", "Modeling WiFi Availability (SIGCOMM 2005)"],
-      "confidence": 0.90,
+      "confidence": "high",
       "evidence_text": "We evaluate our model on the CRAWDAD dartmouth/campus WiFi trace."
     }}
   ]
@@ -320,7 +338,15 @@ class DatasetExtractor:
         doi: str,
         pdf_url: str | None,
         abstract: str | None,
+        pdf_bytes: bytes | None = None,
     ) -> DatasetExtractionResult:
+        """Extract dataset records for one paper.
+
+        ``pdf_bytes`` may be supplied by the caller (e.g. pre-fetched by the
+        pipeline) — this skips the internal SQLite/network fetch, which lets
+        ``extract`` run safely in a worker thread without touching the DB
+        connection.
+        """
         from wireless_taxonomy.llm import LlmRequest
 
         bibtex_key = _make_bibtex_key(authors, year, title)
@@ -330,11 +356,12 @@ class DatasetExtractor:
         else:
             bibtex = _make_minimal_bibtex(bibtex_key, title, authors, year, venue, doi)
 
-        pdf_bytes: bytes | None = None
         extraction_source = "abstract"
         text_section = ""
 
-        if pdf_url and "dl.acm.org" not in pdf_url:
+        if pdf_bytes:
+            extraction_source = "pdf"
+        elif pdf_url and "dl.acm.org" not in pdf_url:
             # Check DB text cache before hitting the network
             pdf_bytes = self._load_cached_pdf(paper_id, pdf_url)
             if not pdf_bytes:
@@ -477,10 +504,40 @@ _GARBAGE_EXACT = frozenset({
     "training sets", "collected traces", "real-world traces", "performance tests",
     "open-source code and data",
 })
-MIN_DATASET_CONFIDENCE = 0.50
-# Introduced datasets get a lower bar — the paper's own data matters even if
-# they didn't brand it; the LLM will mint an AuthorYear-description name.
-MIN_INTRODUCED_CONFIDENCE = 0.60
+# Minimum accepted confidence levels for filtering.
+# Both introduced and reused datasets require at least "medium".
+_PASS_CONFIDENCE = {"high", "medium"}
+
+
+def _parse_confidence(raw: Any) -> str:
+    """Parse confidence from LLM output — handles both categorical and numeric.
+
+    New extractions produce "high"/"medium"/"low". Old cached results may
+    have numeric floats which are mapped: >=0.60 → "medium", >=0.85 → "high".
+    """
+    if raw is None:
+        return "low"
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in CONFIDENCE_LEVELS:
+            return s
+        # Try parsing as a numeric string from old cache
+        try:
+            return _numeric_to_categorical(float(s))
+        except (TypeError, ValueError):
+            return "low"
+    if isinstance(raw, (int, float)):
+        return _numeric_to_categorical(float(raw))
+    return "low"
+
+
+def _numeric_to_categorical(score: float) -> str:
+    """Map legacy numeric confidence to categorical for old cached results."""
+    if score >= 0.85:
+        return "high"
+    if score >= 0.60:
+        return "medium"
+    return "low"
 
 
 def _is_garbage_name(name: str) -> bool:
@@ -512,21 +569,22 @@ def _parse_dataset_records(raw: list[Any]) -> list[DatasetRecord]:
         name = str(item.get("name") or "").strip()
         if not name:
             continue
-        confidence = float(item.get("confidence") or 0.0)
+        confidence = _parse_confidence(item.get("confidence"))
         rel = str(item.get("relationship_type") or "unclear").lower()
         if rel not in RELATIONSHIP_TYPES:
             rel = "unclear"
 
-        # Filtering logic depends on relationship type:
-        # - "introduced": lenient — paper's own data. Accept if confidence is
-        #   reasonable and the LLM minted an AuthorYear name or gave a proper name.
+        # Filtering: reject low-confidence datasets. Both introduced and
+        # reused require at least "medium" confidence.
+        if confidence not in _PASS_CONFIDENCE:
+            continue
+
+        # Name quality filtering depends on relationship type:
+        # - "introduced": lenient — paper's own data. Only reject the most
+        #   egregious garbage (figure refs, table refs).
         # - everything else ("reused", "extended", etc.): strict — must be a
         #   proper searchable name that can be cross-referenced across papers.
         if rel == "introduced":
-            if confidence < MIN_INTRODUCED_CONFIDENCE:
-                continue
-            # For introduced datasets, only reject the most egregious garbage
-            # (figure refs, table refs). AuthorYear-minted names always pass.
             if not _looks_like_authored_name(name):
                 lower = name.lower().strip()
                 if lower.startswith(("figure ", "fig.", "fig ", "table ")):
@@ -534,9 +592,6 @@ def _parse_dataset_records(raw: list[Any]) -> list[DatasetRecord]:
                 if lower in _GARBAGE_EXACT:
                     continue
         else:
-            # Reused/extended/compared_against — must have a proper name
-            if confidence < MIN_DATASET_CONFIDENCE:
-                continue
             if _is_garbage_name(name):
                 continue
 
