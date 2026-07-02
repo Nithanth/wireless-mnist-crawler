@@ -33,11 +33,15 @@ def test_default_model_names_are_current_requested_defaults(monkeypatch, tmp_pat
     ]:
         monkeypatch.delenv(name, raising=False)
 
+    # Prevent the project-root .env from overriding the defaults under test.
+    monkeypatch.setattr("wireless_taxonomy.config._resolve_dotenv_path", lambda _path: None)
+
     settings = load_settings(tmp_path / "taxonomy.sqlite")
 
-    assert settings.llm.providers["openai"].model == "gpt-5.4-mini"
-    assert settings.llm.providers["anthropic"].model == "claude-sonnet-4-6"
+    assert settings.llm.providers["openai"].model == "gpt-4.1-mini"
+    assert settings.llm.providers["anthropic"].model == "claude-3-5-sonnet-20241022"
     assert settings.llm.providers["google"].model == "gemini-3.5-flash"
+    assert settings.llm.primary_provider == "google"
 
 
 def test_google_provider_accepts_gemini_api_key(monkeypatch, tmp_path: Path) -> None:

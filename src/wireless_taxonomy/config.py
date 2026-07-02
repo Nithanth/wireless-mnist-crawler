@@ -66,7 +66,7 @@ def load_settings(db_path: str | Path = "taxonomy.sqlite") -> Settings:
 
 
 def load_llm_settings() -> LlmSettings:
-    primary = _provider(os.getenv("WIRELESS_TAXONOMY_LLM_PROVIDER", "openai"))
+    primary = _provider(os.getenv("WIRELESS_TAXONOMY_LLM_PROVIDER", "google"))
     fallbacks = tuple(
         _provider(value)
         for value in _csv_env("WIRELESS_TAXONOMY_LLM_FALLBACKS")
@@ -75,13 +75,13 @@ def load_llm_settings() -> LlmSettings:
     providers: dict[LlmProvider, ProviderConfig] = {
         "openai": ProviderConfig(
             provider="openai",
-            model=os.getenv("WIRELESS_TAXONOMY_OPENAI_MODEL", "gpt-5.4-mini"),
+            model=os.getenv("WIRELESS_TAXONOMY_OPENAI_MODEL", "gpt-4.1-mini"),
             api_key_env="OPENAI_API_KEY",
             api_key_configured=bool(os.getenv("OPENAI_API_KEY")),
         ),
         "anthropic": ProviderConfig(
             provider="anthropic",
-            model=os.getenv("WIRELESS_TAXONOMY_ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+            model=os.getenv("WIRELESS_TAXONOMY_ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"),
             api_key_env="ANTHROPIC_API_KEY",
             api_key_configured=bool(os.getenv("ANTHROPIC_API_KEY")),
         ),
