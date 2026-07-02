@@ -2,6 +2,7 @@
 import csv as _csv
 import glob as _glob
 import json
+import os
 import re as _re
 from pathlib import Path
 
@@ -21,8 +22,9 @@ def register(app: typer.Typer) -> None:
     ) -> None:
         """Merge all per-venue/year CSVs and JSONs into master files.
 
-        Reads all *_papers.csv, *_bibtex.csv, *_datasets.csv, and *_raw.json files
-        from --dir and produces:
+        Reads per-venue/year *_papers.csv, *_bibtex.csv, *_datasets.csv, and
+        *_raw.json files from --dir (skipping prior master_* and consolidated_*
+        outputs) and produces:
           master_papers.csv, master_bibtex.csv, master_datasets.csv, master_raw.json
 
         With --min-corpus-reuse=2 (the default), only datasets referenced by at
@@ -33,33 +35,40 @@ def register(app: typer.Typer) -> None:
         dst.mkdir(parents=True, exist_ok=True)
 
         # --- Papers ---
-        papers_files = sorted(_glob.glob(str(src / "*_papers.csv")))
+        # Only merge per-venue/year files; skip prior master/consolidated outputs.
+        papers_files = sorted(
+            p for p in _glob.glob(str(src / "*_papers.csv"))
+            if not os.path.basename(p).startswith(("master_", "consolidated_"))
+        )
         all_paper_rows: list[dict] = []
-        paper_fields: list[str] = []
+        paper_fields: set[str] = set()
         for f in papers_files:
             with open(f, newline="", encoding="utf-8") as fh:
                 reader = _csv.DictReader(fh)
-                if not paper_fields and reader.fieldnames:
-                    paper_fields = list(reader.fieldnames)
+                if reader.fieldnames:
+                    paper_fields.update(reader.fieldnames)
                 all_paper_rows.extend(reader)
         if all_paper_rows:
             p = dst / "master_papers.csv"
             with p.open("w", newline="", encoding="utf-8") as fh:
-                writer = _csv.DictWriter(fh, fieldnames=paper_fields)
+                writer = _csv.DictWriter(fh, fieldnames=sorted(paper_fields))
                 writer.writeheader()
                 writer.writerows(all_paper_rows)
             typer.echo(f"  {p.name}: {len(all_paper_rows)} papers from {len(papers_files)} files")
 
         # --- BibTeX ---
-        bibtex_files = sorted(_glob.glob(str(src / "*_bibtex.csv")))
+        bibtex_files = sorted(
+            p for p in _glob.glob(str(src / "*_bibtex.csv"))
+            if not os.path.basename(p).startswith(("master_", "consolidated_"))
+        )
         all_bib_rows: list[dict] = []
         seen_bib_keys: set[str] = set()
-        bib_fields: list[str] = []
+        bib_fields: set[str] = set()
         for f in bibtex_files:
             with open(f, newline="", encoding="utf-8") as fh:
                 reader = _csv.DictReader(fh)
-                if not bib_fields and reader.fieldnames:
-                    bib_fields = list(reader.fieldnames)
+                if reader.fieldnames:
+                    bib_fields.update(reader.fieldnames)
                 for row in reader:
                     key = row.get("Bibtex Citation Key", "")
                     if key not in seen_bib_keys:
@@ -68,20 +77,23 @@ def register(app: typer.Typer) -> None:
         if all_bib_rows:
             p = dst / "master_bibtex.csv"
             with p.open("w", newline="", encoding="utf-8") as fh:
-                writer = _csv.DictWriter(fh, fieldnames=bib_fields)
+                writer = _csv.DictWriter(fh, fieldnames=sorted(bib_fields))
                 writer.writeheader()
                 writer.writerows(all_bib_rows)
             typer.echo(f"  {p.name}: {len(all_bib_rows)} entries from {len(bibtex_files)} files")
 
         # --- Datasets (deduplicated, cross-corpus paper counts, reuse filter) ---
-        datasets_files = sorted(_glob.glob(str(src / "*_datasets.csv")))
+        datasets_files = sorted(
+            p for p in _glob.glob(str(src / "*_datasets.csv"))
+            if not os.path.basename(p).startswith(("master_", "consolidated_"))
+        )
         merged_ds: dict[str, dict] = {}
-        ds_fields: list[str] = []
+        ds_fields: set[str] = set()
         for f in datasets_files:
             with open(f, newline="", encoding="utf-8") as fh:
                 reader = _csv.DictReader(fh)
-                if not ds_fields and reader.fieldnames:
-                    ds_fields = list(reader.fieldnames)
+                if reader.fieldnames:
+                    ds_fields.update(reader.fieldnames)
                 for row in reader:
                     name = row.get("Dataset Name", "")
                     if name not in merged_ds:
@@ -156,7 +168,7 @@ def register(app: typer.Typer) -> None:
         if merged_ds:
             p = dst / "master_datasets.csv"
             with p.open("w", newline="", encoding="utf-8") as fh:
-                writer = _csv.DictWriter(fh, fieldnames=ds_fields)
+                writer = _csv.DictWriter(fh, fieldnames=sorted(ds_fields))
                 writer.writeheader()
                 for name in sorted(merged_ds):
                     writer.writerow(merged_ds[name])
