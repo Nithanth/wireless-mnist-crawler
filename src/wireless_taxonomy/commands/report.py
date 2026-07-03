@@ -55,8 +55,27 @@ def _load_coverage(cov_dirs: list[Path]) -> dict[tuple[str, int], dict[str, Any]
                 coverage[(str(venue).lower(), int(year))] = {
                     "total": run.get("total_papers", 0),
                     "fetchable": run.get("fetchable", 0),
+                    "by_source": dict(run.get("by_source") or {}),
                 }
     return coverage
+
+
+def _provider_census(coverage: dict[tuple[str, int], dict[str, Any]]) -> tuple[Counter, int, int]:
+    """Aggregate PDF-retrieval attribution across all venue-years.
+
+    Returns (per-provider fetch counts, total fetchable, total papers) so the
+    report can show which providers actually delivered the corpus — e.g. how
+    much came from free OA indexes vs. paid web search.
+    """
+    census: Counter = Counter()
+    fetchable = 0
+    total = 0
+    for cov in coverage.values():
+        total += cov.get("total", 0) or 0
+        fetchable += cov.get("fetchable", 0) or 0
+        for provider, n in (cov.get("by_source") or {}).items():
+            census[provider or "unknown"] += n
+    return census, fetchable, total
 
 
 def _venue_year_stats(entries: list[dict], coverage: dict) -> list[dict[str, Any]]:
@@ -223,6 +242,23 @@ def register(app: typer.Typer) -> None:
             f"({pdf_pct:.1f}%) — the rest used title+abstract fallback."
         )
 
+        provider_census, cov_fetchable, cov_total = _provider_census(coverage)
+        provider_md: list[str] = []
+        if provider_census:
+            typer.echo(
+                f"\nPDF retrieval by provider ({cov_fetchable}/{cov_total} proceedings papers resolved):"
+            )
+            provider_md += [
+                "\n### PDF retrieval by provider\n",
+                f"{cov_fetchable}/{cov_total} proceedings papers resolved to a fetchable PDF.\n",
+                "| Provider | PDFs found | Share of resolved |",
+                "|----------|-----------:|------------------:|",
+            ]
+            for provider, n in provider_census.most_common():
+                share = 100.0 * n / max(cov_fetchable, 1)
+                typer.echo(f"  {n:>6}×  {provider:<18} ({share:.1f}% of resolved)")
+                provider_md.append(f"| {provider} | {n} | {share:.1f}% |")
+
         census_md: list[str] = []
         classification_census, extraction_census = _model_census(entries)
         _echo_census("Classification", classification_census, census_md)
@@ -251,6 +287,8 @@ def register(app: typer.Typer) -> None:
             "  (`extraction_source` records which path each paper used).",
             "",
         ]
+        if provider_md:
+            md += ["## PDF retrieval attribution", *provider_md, ""]
         if census_md:
             md += ["## Model homogeneity audit", *census_md, ""]
         if top:
