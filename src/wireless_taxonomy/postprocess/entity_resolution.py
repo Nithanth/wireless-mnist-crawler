@@ -254,12 +254,24 @@ class LLMConfirmer:
       - "no"     → drop (not returned)
     """
 
-    def __init__(self, llm_complete: "Any | None" = None):
+    def __init__(
+        self,
+        llm_complete: "Any | None" = None,
+        workers: int = 4,
+        max_pairs: int | None = 500,
+    ):
         """Accept a callable(prompt: str) -> str for LLM completion.
 
         If None, will lazily initialize from the project's LlmRouter.
+        ``workers`` bounds concurrent LLM calls (each pair is independent, so
+        results are identical to a sequential run). ``max_pairs`` caps how many
+        candidates are sent to the LLM — the highest-similarity pairs go first;
+        overflow pairs are returned as "llm_skipped" for human review rather
+        than silently dropped.
         """
         self._complete = llm_complete
+        self.workers = max(1, workers)
+        self.max_pairs = max_pairs
 
     def _get_complete(self) -> "Any":
         if self._complete is None:
@@ -279,12 +291,24 @@ class LLMConfirmer:
         """Filter candidate matches through LLM confirmation.
 
         Returns only confirmed ("yes") and uncertain ("unsure") pairs.
-        "no" verdicts are dropped.
+        "no" verdicts are dropped. Pairs beyond ``max_pairs`` (lowest
+        similarity first to be cut) are returned as "llm_skipped" so nothing
+        is silently lost. LLM calls run ``workers``-wide in parallel; output
+        order matches input order.
         """
+        import sys
+
+        from wireless_taxonomy.parallel import parallel_map
+
         complete = self._get_complete()
         confirmed: list[Match] = []
 
-        for candidate in candidates:
+        # Highest-similarity candidates get LLM budget first.
+        ranked = sorted(candidates, key=lambda m: -m.confidence)
+        to_confirm = ranked if self.max_pairs is None else ranked[: self.max_pairs]
+        skipped = [] if self.max_pairs is None else ranked[self.max_pairs :]
+
+        def _judge(candidate: Match) -> dict[str, str]:
             prompt = _LLM_CONFIRM_PROMPT.format(
                 a_name=candidate.a.name,
                 a_keys=", ".join(candidate.a.bibtex_keys),
@@ -299,15 +323,19 @@ class LLMConfirmer:
                 b_env=candidate.b.environment,
                 b_url=candidate.b.availability_url,
             )
+            return _parse_verdict(complete(prompt))
 
-            try:
-                raw = complete(prompt)
-                parsed = _parse_verdict(raw)
+        n = len(to_confirm)
+        for i, (candidate, parsed, error) in enumerate(
+            parallel_map(_judge, to_confirm, self.workers), 1
+        ):
+            if error is not None or not isinstance(parsed, dict):
+                verdict, reason = "unsure", "LLM call failed; flagging for human review"
+            else:
                 verdict = parsed.get("verdict", "unsure").lower().strip()
                 reason = parsed.get("reason", "")
-            except Exception:
-                verdict = "unsure"
-                reason = "LLM call failed; flagging for human review"
+            if i % 10 == 0 or i == n:
+                print(f"  [{i}/{n}] LLM merge confirmations", file=sys.stderr)
 
             if verdict == "no":
                 continue  # drop false positive
@@ -319,6 +347,15 @@ class LLMConfirmer:
                 confidence=confidence,
                 reason=f"LLM {verdict}: {reason}",
                 method="llm_confirmed" if verdict == "yes" else "llm_unsure",
+            ))
+
+        for candidate in skipped:
+            confirmed.append(Match(
+                a=candidate.a,
+                b=candidate.b,
+                confidence=0.60,
+                reason=f"similarity {candidate.confidence:.2f}; over LLM budget (max_pairs={self.max_pairs})",
+                method="llm_skipped",
             ))
 
         return confirmed
@@ -361,6 +398,8 @@ def reconcile(
     llm_confirm: bool = False,
     similarity_name_threshold: float = 0.75,
     similarity_combined_threshold: float = 0.70,
+    llm_workers: int = 4,
+    llm_max_pairs: int | None = 500,
 ) -> list[Match]:
     """Run all enabled resolution strategies and return deduplicated matches.
 
@@ -397,7 +436,7 @@ def reconcile(
 
         if llm_confirm and sim_filtered:
             # LLM precision filter: confirm or reject similarity candidates
-            confirmer = LLMConfirmer()
+            confirmer = LLMConfirmer(workers=llm_workers, max_pairs=llm_max_pairs)
             confirmed = confirmer.confirm_pairs(sim_filtered)
             for m in confirmed:
                 pair_key = tuple(sorted([m.a.name, m.b.name]))

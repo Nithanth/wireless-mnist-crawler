@@ -280,13 +280,172 @@ def test_cached_closed_reresolved_when_web_search_enabled(tmp_path: Path) -> Non
         router=None,
     )
     resolver.providers = ["openalex", "llm_web_search"]  # skip network-heavy chain
+
+    # 1) Web search ERRORS (rate limit / network): the verdict must stay
+    #    retryable — a failed attempt is not an attempt.
     resolver._router = type("R", (), {"complete": lambda self, req: (_ for _ in ()).throw(RuntimeError())})()
-    result = resolver.resolve("A Paper", "10.1/x")
+    resolver.resolve("A Paper", "10.1/x")
     assert calls  # cache was bypassed and providers were re-queried
-    # The refreshed verdict now records that web search was attempted...
+    got = cache.get_oa("A Paper", "10.1/x")
+    assert got["web_search_attempted"] is False
+
+    # 2) Web search RUNS and finds nothing: now the attempt is recorded...
+    class _NoResult:
+        parsed = {"pdf_url": ""}
+
+    resolver._router = type("R", (), {"complete": lambda self, req: _NoResult()})()
+    resolver.resolve("A Paper", "10.1/x")
     got = cache.get_oa("A Paper", "10.1/x")
     assert got["web_search_attempted"] is True
-    # ...so a second resolve is served from cache (no new provider calls).
+
+    # ...so a third resolve is served from cache (no new provider calls).
     n = len(calls)
     resolver.resolve("A Paper", "10.1/x")
     assert len(calls) == n
+
+
+# ── Google CSE provider ──────────────────────────────────────────────────────
+
+_CSE_ITEMS = {
+    "items": [
+        {"link": "https://dl.acm.org/doi/pdf/10.1145/1.2"},          # blocked domain
+        {"link": "https://other.edu/wrong-paper.pdf"},                # fails title check
+        {"link": "https://cs.stanford.edu/~author/paper.pdf"},        # verified hit
+    ]
+}
+
+
+def _cse_resolver(monkeypatch, fetch_json):
+    monkeypatch.setenv("GOOGLE_CSE_API_KEY", "k")
+    monkeypatch.setenv("GOOGLE_CSE_ID", "cx")
+    return OpenAccessResolver(fetch_json=fetch_json, fetch_text=lambda u: "", web_search=True)
+
+
+def test_web_search_prefers_google_cse_when_configured(monkeypatch) -> None:
+    resolver = _cse_resolver(monkeypatch, lambda url: {})
+    assert "google_cse" in resolver.providers
+    assert "llm_web_search" not in resolver.providers
+
+
+def test_web_search_falls_back_to_llm_without_cse_keys(monkeypatch) -> None:
+    monkeypatch.delenv("GOOGLE_CSE_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_CSE_ID", raising=False)
+    resolver = OpenAccessResolver(fetch_json=lambda u: {}, fetch_text=lambda u: "", web_search=True)
+    assert "llm_web_search" in resolver.providers
+    assert "google_cse" not in resolver.providers
+
+
+def test_google_cse_only_trusts_title_verified_pdf(monkeypatch) -> None:
+    """Blocked domains are skipped, unverified PDFs rejected, verified hit wins."""
+    resolver = _cse_resolver(monkeypatch, _fetch_json([("customsearch", _CSE_ITEMS)]))
+    resolver.providers = ["google_cse"]
+
+    verified: list[str] = []
+
+    def fake_fetch(url, max_bytes=0, expected_title=None, attempts=3):
+        verified.append(url)
+        return b"%PDF" if "stanford" in url else None
+
+    import wireless_taxonomy.analyze.dataset_extractor as de
+
+    monkeypatch.setattr(de, "_fetch_pdf_bytes", fake_fetch)
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert res.fetchable
+    assert res.provider == "google_cse"
+    assert res.pdf_url == "https://cs.stanford.edu/~author/paper.pdf"
+    # ACM link never reached verification; the other two were checked in order.
+    assert verified == ["https://other.edu/wrong-paper.pdf", "https://cs.stanford.edu/~author/paper.pdf"]
+
+
+def test_google_cse_no_verified_hit_returns_closed_but_attempted(monkeypatch, tmp_path) -> None:
+    cache = MetadataCache(tmp_path / "c.json")
+    resolver = _cse_resolver(monkeypatch, _fetch_json([("customsearch", _CSE_ITEMS)]))
+    resolver.cache = cache
+    resolver.providers = ["google_cse"]
+
+    import wireless_taxonomy.analyze.dataset_extractor as de
+
+    monkeypatch.setattr(de, "_fetch_pdf_bytes", lambda *a, **k: None)
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert not res.fetchable
+    got = cache.get_oa("A Wireless Paper", "10.1/x")
+    assert got["web_search_attempted"] is True  # ran and found nothing — cache it
+
+
+def test_google_cse_quota_error_stays_retryable(monkeypatch, tmp_path) -> None:
+    cache = MetadataCache(tmp_path / "c.json")
+
+    def exploding_fetch(url):
+        if "customsearch" in url:
+            raise RuntimeError("HTTP 429: daily quota exceeded")
+        return {}
+
+    resolver = _cse_resolver(monkeypatch, exploding_fetch)
+    resolver.cache = cache
+    resolver.providers = ["google_cse"]
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert not res.fetchable
+    got = cache.get_oa("A Wireless Paper", "10.1/x")
+    assert got["web_search_attempted"] is False  # search never ran — retry next time
+
+
+# ── CORE provider ────────────────────────────────────────────────────────────
+
+_CORE_RESULTS = {
+    "results": [
+        {"title": "A Totally Different Paper", "downloadUrl": "https://repo.edu/other.pdf"},
+        {
+            "title": "A Wireless Paper",
+            "downloadUrl": "https://core.ac.uk/download/123.pdf",
+            "sourceFulltextUrls": ["https://repo.uni.edu/paper.pdf"],
+        },
+    ]
+}
+
+
+def test_core_provider_title_matched_and_verified(monkeypatch) -> None:
+    monkeypatch.setenv("CORE_API_KEY", "ck")
+    resolver = OpenAccessResolver(
+        fetch_json=_fetch_json([("api.core.ac.uk", _CORE_RESULTS)]), fetch_text=lambda u: ""
+    )
+    assert "core" in resolver.providers
+    resolver.providers = ["core"]
+
+    verified: list[str] = []
+
+    def fake_fetch(url, max_bytes=0, expected_title=None, attempts=3):
+        verified.append(url)
+        return b"%PDF" if "repo.uni.edu" in url else None
+
+    import wireless_taxonomy.analyze.dataset_extractor as de
+
+    monkeypatch.setattr(de, "_fetch_pdf_bytes", fake_fetch)
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert res.fetchable
+    assert res.provider == "core"
+    assert res.pdf_url == "https://repo.uni.edu/paper.pdf"
+    # Wrong-title result skipped entirely; downloadUrl tried before source URL.
+    assert verified == ["https://core.ac.uk/download/123.pdf", "https://repo.uni.edu/paper.pdf"]
+
+
+def test_core_provider_skipped_without_key(monkeypatch) -> None:
+    monkeypatch.delenv("CORE_API_KEY", raising=False)
+    resolver = OpenAccessResolver(fetch_json=lambda u: {}, fetch_text=lambda u: "")
+    assert "core" not in resolver.providers
+
+
+def test_core_throttle_enforces_min_interval(monkeypatch) -> None:
+    monkeypatch.setenv("WIRELESS_TAXONOMY_CORE_MIN_INTERVAL_SECONDS", "2.5")
+    sleeps: list[float] = []
+    import wireless_taxonomy.analyze.oa_availability as oa
+
+    monkeypatch.setattr(oa.time, "sleep", lambda s: sleeps.append(s))
+    clock = {"t": 100.0}
+    monkeypatch.setattr(oa.time, "monotonic", lambda: clock["t"])
+    OpenAccessResolver._core_last_call = 0.0
+    OpenAccessResolver._core_throttle()  # first call: no wait
+    assert sleeps == []
+    clock["t"] = 100.5  # only 0.5s later
+    OpenAccessResolver._core_throttle()  # second call: must wait ~2.0s
+    assert len(sleeps) == 1 and abs(sleeps[0] - 2.0) < 0.01
+    OpenAccessResolver._core_last_call = 0.0

@@ -46,8 +46,9 @@ def register(app: typer.Typer) -> None:
         web_search: bool = typer.Option(
             False,
             "--web-search",
-            help="Last-resort LLM web search (Gemini grounding) for author-hosted PDFs the OA indexes miss. "
-            "Found URLs are verified by downloading + title-checking before being trusted.",
+            help="Last-resort web search for author-hosted PDFs the OA indexes miss: Google CSE when "
+            "GOOGLE_CSE_API_KEY/GOOGLE_CSE_ID are set, else Gemini grounding. Every found URL is "
+            "verified by downloading + title-checking before being trusted.",
         ),
         db: str = typer.Option("taxonomy.sqlite", "--db", help="SQLite work DB (created/reused)."),
     ) -> None:

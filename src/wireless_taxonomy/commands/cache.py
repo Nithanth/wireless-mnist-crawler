@@ -57,3 +57,52 @@ def register(app: typer.Typer) -> None:
         else:
             typer.echo(f"Unknown action '{action}'. Use: status | clear | clear-section", err=True)
             raise typer.Exit(1)
+
+    @app.command("cache-set-pdf")
+    def cache_set_pdf(
+        title: str = typer.Option(..., "--title", help="Exact paper title (used as the cache key)."),
+        pdf_url: str = typer.Option(..., "--pdf-url", help="Direct URL to a legally hosted PDF of this paper."),
+        doi: Optional[str] = typer.Option(None, "--doi", help="Paper DOI (also keyed in the cache if given)."),
+        cache_path: str = typer.Option(".wt_cache.json", "--cache-path"),
+        verify: bool = typer.Option(
+            True, "--verify/--no-verify", help="Download the PDF and title-check it before trusting the URL."
+        ),
+    ) -> None:
+        """Manually override the OA cache with a known-good PDF URL for one paper.
+
+        For papers the OA indexes and web search miss (e.g. an author-hosted
+        copy you found yourself). The URL is downloaded and title-verified
+        first (unless --no-verify), then written to the OA cache so the next
+        extract-datasets run fetches it like any other open-access paper.
+        """
+        from wireless_taxonomy.analyze.cache import MetadataCache
+
+        if verify:
+            from wireless_taxonomy.analyze.dataset_extractor import _fetch_pdf_bytes
+
+            typer.echo(f"Verifying {pdf_url} ...")
+            if _fetch_pdf_bytes(pdf_url, expected_title=title) is None:
+                typer.echo(
+                    "Verification FAILED: could not download a valid PDF whose first pages "
+                    "contain this title. Check the URL (or use --no-verify to force).",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            typer.echo("Verified: PDF downloads and title matches.")
+
+        c = MetadataCache(cache_path)
+        c.set_oa(
+            title,
+            doi,
+            {
+                "fetchable": True,
+                "oa_status": "green",
+                "license": "",
+                "pdf_url": pdf_url,
+                "provider": "manual",
+                "source_url": pdf_url,
+                "web_search_attempted": True,
+            },
+        )
+        c.save()
+        typer.echo(f"OA cache updated: '{title[:60]}' -> {pdf_url}")

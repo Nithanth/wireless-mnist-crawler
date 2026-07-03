@@ -1,6 +1,7 @@
 
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -218,6 +219,7 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[
     attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_LLM_MAX_RETRIES", "4")))
     last_error: Exception | None = None
     for attempt in range(attempts):
+        retry_after = 0.0
         request = Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -235,15 +237,18 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[
                     "Top up your account and re-run; the cache will resume where you left off."
                 ) from exc
             last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
-            if exc.code == 429 and _looks_like_quota(detail):
-                # Gemini reports both transient rate limits AND hard daily-quota
-                # exhaustion as 429 RESOURCE_EXHAUSTED. Retry with backoff first;
-                # if it is still 429-quota after all attempts, it is a real
-                # quota wall — checkpoint and stop instead of erroring per-paper.
-                last_error = CreditExhaustedError(
-                    "Quota exhausted after retries (HTTP 429). "
-                    "Top up / wait for quota reset and re-run; the cache will resume where you left off."
-                )
+            if exc.code == 429:
+                # Gemini reports both transient per-minute rate limits AND hard
+                # daily-quota exhaustion as 429 RESOURCE_EXHAUSTED. Only a
+                # daily/monthly quota is a real credit wall worth checkpointing
+                # for; per-minute limits just need patience (honor the server's
+                # suggested retry delay when present).
+                retry_after = _retry_delay_seconds(exc, detail)
+                if _looks_like_daily_quota(detail):
+                    last_error = CreditExhaustedError(
+                        "Daily quota exhausted (HTTP 429). "
+                        "Top up / wait for quota reset and re-run; the cache will resume where you left off."
+                    )
             elif exc.code not in _RETRYABLE_STATUS:
                 raise last_error from exc
         except URLError as exc:
@@ -251,7 +256,7 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[
         except ConnectionError as exc:
             last_error = RuntimeError(str(exc))
         if attempt + 1 < attempts:
-            time.sleep(min(2.0 * (2**attempt), 30.0))
+            time.sleep(max(retry_after, min(2.0 * (2**attempt), 30.0)))
     assert last_error is not None
     raise last_error
 
@@ -263,6 +268,41 @@ def _looks_like_quota(detail: str) -> bool:
         "quota", "billing", "exceeded", "insufficient", "payment",
         "resource_exhausted", "rate_limit", "limit exceeded",
     ))
+
+
+def _looks_like_daily_quota(detail: str) -> bool:
+    """True only for a hard daily/monthly quota wall, NOT a per-minute rate limit.
+
+    Gemini returns 429 RESOURCE_EXHAUSTED for both. The error body names the
+    tripped quota (e.g. ``GenerateRequestsPerDayPerProjectPerModel`` vs
+    ``...PerMinute...``); billing/credit language also indicates a hard wall.
+    A per-minute limit must never be treated as credit exhaustion — it clears
+    on its own within a minute.
+    """
+    lower = detail.lower()
+    if "perminute" in lower or "per minute" in lower:
+        return False
+    return any(term in lower for term in (
+        "perday", "per day", "daily", "billing", "insufficient", "payment", "credit",
+    ))
+
+
+def _retry_delay_seconds(exc: Any, detail: str) -> float:
+    """Server-suggested wait before retrying a 429 (capped at 90s).
+
+    Honors the ``Retry-After`` header and Gemini's ``RetryInfo.retryDelay``
+    (e.g. ``"retryDelay": "37s"``) in the error body.
+    """
+    try:
+        header = (exc.headers.get("Retry-After") or "").strip() if exc.headers else ""
+        if header:
+            return min(float(header), 90.0)
+    except (ValueError, AttributeError):
+        pass
+    match = re.search(r'"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"', detail)
+    if match:
+        return min(float(match.group(1)), 90.0)
+    return 0.0
 
 
 def _parse_json_content(content: str) -> dict[str, Any] | list[Any] | None:

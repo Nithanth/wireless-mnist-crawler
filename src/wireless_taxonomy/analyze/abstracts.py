@@ -558,12 +558,24 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
     headers = {"User-Agent": "wireless-taxonomy/0.1"}
     if "api.semanticscholar.org" in url:
         headers = _s2_headers()
-    attempts = max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "5")))
+    elif "api.core.ac.uk" in url:
+        # CORE is behind Cloudflare and blocks non-browser User-Agents. The key
+        # must be sent as a Bearer token, not a query parameter, to avoid 403s.
+        headers = {"User-Agent": _BROWSER_UA, "Accept": "application/json"}
+        core_key = (os.getenv("CORE_API_KEY") or "").strip()
+        if core_key:
+            headers["Authorization"] = f"Bearer {core_key}"
+    # CORE is slow/flaky — give it fewer retries and a shorter timeout so it
+    # never holds up the rest of the resolver chain for minutes.
+    is_core = "api.core.ac.uk" in url
+    max_retries = 2 if is_core else max(1, int(os.getenv("WIRELESS_TAXONOMY_FETCH_MAX_RETRIES", "5")))
+    req_timeout = 15 if is_core else 30
+    attempts = max_retries
     last_error: Exception | None = None
     for attempt in range(attempts):
         wait = min(1.5 * (2**attempt), 20.0)
         try:
-            with urlopen(Request(url, headers=headers), timeout=30) as response:
+            with urlopen(Request(url, headers=headers), timeout=req_timeout) as response:
                 payload = _json.loads(response.read().decode("utf-8"))
             _circuit_breaker.record_success(host)
             return payload if isinstance(payload, dict) else {}

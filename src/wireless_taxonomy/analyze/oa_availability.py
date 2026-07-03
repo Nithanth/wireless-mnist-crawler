@@ -1,6 +1,8 @@
 
 import os
 import re
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -12,6 +14,7 @@ from wireless_taxonomy.analyze.abstracts import (
     _str,
 )
 from wireless_taxonomy.analyze.text_match import title_matches
+from wireless_taxonomy.llm import CreditExhaustedError
 
 FetchJson = Callable[[str], dict[str, Any]]
 FetchText = Callable[[str], str]
@@ -51,6 +54,15 @@ class OaResult:
 _NOT_FETCHABLE = OaResult(False, "closed", "", "", "none", "")
 
 
+class _WebSearchError(RuntimeError):
+    """LLM web search failed to RUN (rate limit, no router, network error).
+
+    Distinct from "ran and found nothing": a failed attempt must not be cached
+    as ``web_search_attempted`` or the paper is permanently marked closed and
+    the search is never retried.
+    """
+
+
 class OpenAccessResolver:
     """Detects a legally fetchable open-access full text for a paper.
 
@@ -75,30 +87,39 @@ class OpenAccessResolver:
         self.fetch_text = fetch_text or _default_fetch_text
         self.cache = cache
         self._mailto = (os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip()
+        self._cse_key = (os.getenv("GOOGLE_CSE_API_KEY") or "").strip()
+        self._cse_id = (os.getenv("GOOGLE_CSE_ID") or "").strip()
+        self._core_key = (os.getenv("CORE_API_KEY") or "").strip()
         self._router = router
         if providers is None:
             # "usenix" is authoritative-and-free for NSDI/OSDI/ATC/Security
             # (USENIX hosts every paper open-access), so it runs first and only
             # fires for usenix.org URLs. Unpaywall is the canonical legal-OA
             # resolver but requires an email; without one it is skipped and the
-            # others carry the load.
+            # others carry the load. CORE (free, ~300M works from institutional
+            # repositories) runs after the indexes and before paid web search,
+            # so it absorbs most of the residual for free.
             providers = ["usenix", "unpaywall", "openalex", "semantic_scholar", "arxiv"]
+            if self._core_key:
+                providers.append("core")
             if web_search:
-                # Last-resort: LLM web-search grounding finds author-hosted
-                # postprints the OA indexes miss. Runs only when everything
-                # else failed, and its URL is verified by downloading the PDF
-                # and title-checking the first pages before being trusted.
-                providers.append("llm_web_search")
+                # Last-resort web search for author-hosted postprints the OA
+                # indexes miss. Google CSE (real search results, deterministic)
+                # when configured; Gemini grounding otherwise. Either way, a
+                # candidate URL is ONLY trusted after downloading the PDF and
+                # verifying the paper title appears in its first pages.
+                providers.append("google_cse" if (self._cse_key and self._cse_id) else "llm_web_search")
         self.providers = providers
 
     def resolve(self, title: str | None, doi: str | None, url: str | None = None) -> OaResult:
+        has_web_search = bool({"llm_web_search", "google_cse"} & set(self.providers))
         if self.cache is not None:
             cached = self.cache.get_oa(title, doi)
             if cached is not None:
                 # A cached "closed" verdict predates web search if web search is
                 # now enabled — re-resolve so the new provider gets a chance.
                 stale_closed = (
-                    "llm_web_search" in self.providers
+                    has_web_search
                     and not cached.get("fetchable")
                     and not cached.get("web_search_attempted")
                 )
@@ -112,12 +133,20 @@ class OpenAccessResolver:
                         cached.get("source_url", ""),
                     )
         result = _NOT_FETCHABLE
+        web_search_attempted = has_web_search
         for provider in self.providers:
             handler = getattr(self, f"_{provider}", None)
             if handler is None:
                 continue
             try:
                 found = handler(title, doi, url)
+            except _WebSearchError:
+                # Search didn't run (rate limit / config) — leave the cache
+                # entry retryable rather than poisoning it as "attempted".
+                found = None
+                web_search_attempted = False
+            except CreditExhaustedError:
+                raise  # checkpoint upstream; never cache a closed verdict
             except Exception:
                 found = None
             if found is not None and found.fetchable:
@@ -138,7 +167,7 @@ class OpenAccessResolver:
                     "pdf_url": result.pdf_url,
                     "provider": result.provider,
                     "source_url": result.source_url,
-                    "web_search_attempted": "llm_web_search" in self.providers,
+                    "web_search_attempted": web_search_attempted,
                 },
             )
         return result
@@ -270,6 +299,100 @@ class OpenAccessResolver:
             source_url,
         )
 
+    # CORE's free tier allows ~5 search requests per 10 seconds. A process-wide
+    # throttle keeps concurrent workers under that ceiling so CORE lookups
+    # succeed instead of burning 429 retries (tune via env if you have a paid key).
+    _core_lock = threading.Lock()
+    _core_last_call = 0.0
+
+    @classmethod
+    def _core_throttle(cls) -> None:
+        interval = float(os.getenv("WIRELESS_TAXONOMY_CORE_MIN_INTERVAL_SECONDS", "2.5"))
+        with cls._core_lock:
+            wait = cls._core_last_call + interval - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            cls._core_last_call = time.monotonic()
+
+    def _core(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
+        """CORE (core.ac.uk): free aggregator of ~300M institutional-repository works.
+
+        Searches by title, requires a fuzzy title match on the result metadata,
+        then downloads + title-verifies the hosted PDF before trusting it —
+        the same guarantee as every other provider.
+        """
+        if not title or not title.strip():
+            return None
+        if not self._core_key:
+            return None
+        source_url = "https://api.core.ac.uk/v3/search/works/?" + urlencode(
+            {"q": f'title:"{title}"', "limit": "5"}
+        )
+        self._core_throttle()
+        payload = self.fetch_json(source_url)
+        results = payload.get("results") if isinstance(payload.get("results"), list) else []
+        from wireless_taxonomy.analyze.dataset_extractor import _fetch_pdf_bytes
+
+        for item in results[:5]:
+            if not isinstance(item, dict):
+                continue
+            if not title_matches(title, _str(item.get("title"))):
+                continue
+            candidates = [_str(item.get("downloadUrl"))]
+            urls = item.get("sourceFulltextUrls")
+            if isinstance(urls, list):
+                candidates.extend(_str(u) for u in urls)
+            for candidate in candidates:
+                if not candidate.lower().startswith("http"):
+                    continue
+                if _is_acm_blocked(candidate) or "ieeexplore.ieee.org" in candidate:
+                    continue
+                # VERIFIED APPROVAL: download + title-check before trusting.
+                if _fetch_pdf_bytes(candidate, expected_title=title) is None:
+                    continue
+                return OaResult(True, "green", "", candidate, "core", source_url)
+        return None
+
+    def _google_cse(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
+        """Last-resort provider: Google Programmable Search finds a PDF URL.
+
+        Runs the same query a human would (``"<title>" filetype:pdf``) via the
+        Custom Search JSON API and tries the top hits in order. A hit is ONLY
+        accepted after downloading it and verifying the paper title appears in
+        the PDF's first pages (``_fetch_pdf_bytes(expected_title=...)``) — a
+        wrong search result can never inject someone else's paper.
+        """
+        if not title or not title.strip():
+            return None
+        if not (self._cse_key and self._cse_id):
+            raise _WebSearchError("Google CSE not configured")
+        from wireless_taxonomy.analyze.dataset_extractor import _fetch_pdf_bytes
+
+        # Exact-phrase PDF query first; a looser query as fallback for titles
+        # Google indexes with slightly different punctuation.
+        for query in (f'"{title}" filetype:pdf', f"{title} pdf"):
+            source_url = "https://www.googleapis.com/customsearch/v1?" + urlencode(
+                {"key": self._cse_key, "cx": self._cse_id, "q": query, "num": "5"}
+            )
+            try:
+                payload = self.fetch_json(source_url)
+            except Exception as exc:
+                # Search never ran (daily quota / network) — keep the verdict
+                # retryable instead of caching it as attempted.
+                raise _WebSearchError(str(exc)) from exc
+            items = payload.get("items") if isinstance(payload.get("items"), list) else []
+            for item in items[:5]:
+                candidate = _str(item.get("link") if isinstance(item, dict) else "")
+                if not candidate.lower().startswith("http"):
+                    continue
+                if _is_acm_blocked(candidate) or "ieeexplore.ieee.org" in candidate or "researchgate.net" in candidate:
+                    continue
+                # VERIFIED APPROVAL: download + title-check before trusting.
+                if _fetch_pdf_bytes(candidate, expected_title=title) is None:
+                    continue
+                return OaResult(True, "green", "", candidate, "google_cse", source_url)
+        return None
+
     def _llm_web_search(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
         """Last-resort provider: LLM with web-search grounding finds a PDF URL.
 
@@ -284,18 +407,25 @@ class OpenAccessResolver:
             return None
         router = self._get_router()
         if router is None:
-            return None
+            raise _WebSearchError("no LLM router available")
         from wireless_taxonomy.llm import LlmRequest
 
         prompt = (
-            "Find a direct, publicly downloadable PDF for this exact research paper:\n"
+            "Find a direct, publicly downloadable PDF for this exact research paper.\n"
             f"  Title: {title}\n"
             + (f"  DOI: {doi}\n" if doi else "")
             + "\n"
-            "Look for author-hosted copies (personal/university homepages), "
-            "institutional repositories, or preprint servers. The URL must point "
-            "directly at a .pdf file (not a landing page, not ResearchGate, not "
-            "IEEE Xplore or ACM DL which block downloads).\n\n"
+            "Search strategy:\n"
+            "1. Search for the title in quotes plus 'pdf' or 'filetype:pdf'.\n"
+            "2. Also try the title plus 'paper.pdf' or the last name of the first author.\n"
+            "3. Examine the first 5 results, including any from .edu, university "
+            "homepages, institutional repositories, or preprint servers.\n"
+            "4. Prefer URLs that end in .pdf and are hosted on author/university pages.\n"
+            "\n"
+            "Do NOT return ResearchGate, IEEE Xplore, ACM DL, arXiv abstract pages, or "
+            "any landing page that requires clicking. The URL must point directly at a "
+            "downloadable .pdf file (or redirect immediately to one).\n"
+            "\n"
             'Return JSON only: {"pdf_url": "<direct PDF URL or empty string if none found>"}'
         )
         try:
@@ -307,8 +437,12 @@ class OpenAccessResolver:
                     use_web_search=True,
                 )
             )
-        except Exception:
-            return None
+        except CreditExhaustedError:
+            raise
+        except Exception as exc:
+            # The search never ran (rate limit, network) — signal so the
+            # verdict is not cached as web_search_attempted.
+            raise _WebSearchError(str(exc)) from exc
         parsed = response.parsed if isinstance(response.parsed, dict) else {}
         pdf_url = _str(parsed.get("pdf_url"))
         if not pdf_url or not pdf_url.lower().startswith("http"):

@@ -171,14 +171,16 @@ echo "$(ts) Merging all results into master CSVs..."
 python -m wireless_taxonomy.cli merge-results --dir ./src/results --out ./src/results
 
 echo ""
-echo "$(ts) Reconciling datasets (URL dedup + LLM-confirmed merges)..."
-python -m wireless_taxonomy.cli reconcile-datasets \
-  --csv ./src/results/master_datasets.csv \
-  --json ./src/results/master_raw.json \
-  --llm-confirm \
-  --consolidated ./src/results/consolidated_datasets.csv \
-  --out ./src/results/reconcile_report.json \
-  || echo "$(ts) ✗ reconcile-datasets failed (results still usable; re-run manually)"
+# Reconciliation is intentionally run separately for the hero run — it can be
+# slow/expensive at corpus scale and is not needed after every incremental batch.
+# Run it manually when the full corpus is collected:
+#   wireless-taxonomy reconcile-datasets \
+#     --csv ./src/results/master_datasets.csv \
+#     --json ./src/results/master_raw.json \
+#     --out ./src/results/reconcile_report.json
+# To also use LLM confirmation add --llm-confirm (parallel, capped via
+# --llm-workers N and --max-llm-pairs N; overflow pairs flagged for review).
+echo "$(ts) Skipping reconciliation in batch mode (run separately for final corpus)."
 
 echo ""
 echo "$(ts) Generating corpus report..."

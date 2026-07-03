@@ -253,3 +253,52 @@ def test_consolidate_merges_by_method_not_score():
     url = Match(a=a, b=b, confidence=0.95, reason="shared URL", method="url_dedup")
     result = consolidate([a, b], [url])
     assert len(result) == 1
+
+
+class TestLLMConfirmerParallelAndCap:
+    def test_parallel_workers_preserve_results(self):
+        calls = []
+
+        def mock_complete(prompt):
+            calls.append(prompt)
+            return '{"verdict": "yes", "reason": "same"}'
+
+        confirmer = LLMConfirmer(llm_complete=mock_complete, workers=4)
+        candidates = [
+            Match(a=_ds(f"Set{i}", keys=[f"a{i}"]), b=_ds(f"Set{i}b", keys=[f"b{i}"]),
+                  confidence=0.65, reason="t", method="similarity")
+            for i in range(9)
+        ]
+        result = confirmer.confirm_pairs(candidates)
+        assert len(result) == 9
+        assert len(calls) == 9
+        assert all(m.method == "llm_confirmed" for m in result)
+
+    def test_max_pairs_cap_flags_overflow_as_skipped(self):
+        calls = []
+
+        def mock_complete(prompt):
+            calls.append(prompt)
+            return '{"verdict": "no", "reason": "different"}'
+
+        confirmer = LLMConfirmer(llm_complete=mock_complete, workers=2, max_pairs=3)
+        # Confidence descending: highest-similarity pairs must get LLM budget.
+        candidates = [
+            Match(a=_ds(f"S{i}", keys=[f"a{i}"]), b=_ds(f"S{i}b", keys=[f"b{i}"]),
+                  confidence=0.80 - i * 0.02, reason="t", method="similarity")
+            for i in range(5)
+        ]
+        result = confirmer.confirm_pairs(candidates)
+        assert len(calls) == 3  # only top-3 hit the LLM
+        # The 2 overflow pairs are returned as llm_skipped, never dropped or merged.
+        assert len(result) == 2
+        assert all(m.method == "llm_skipped" for m in result)
+        skipped_names = {m.a.name for m in result}
+        assert skipped_names == {"S3", "S4"}  # the two lowest-similarity pairs
+
+    def test_llm_skipped_is_never_auto_merged(self):
+        from wireless_taxonomy.postprocess.entity_resolution import _AUTO_MERGE_METHODS
+
+        assert "llm_skipped" not in _AUTO_MERGE_METHODS
+        assert "llm_unsure" not in _AUTO_MERGE_METHODS
+        assert "similarity" not in _AUTO_MERGE_METHODS

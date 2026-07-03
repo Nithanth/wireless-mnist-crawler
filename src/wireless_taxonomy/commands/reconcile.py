@@ -3,7 +3,7 @@
 import csv as _csv
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -65,26 +65,43 @@ def _load_datasets_from_json(path: Path) -> list[DatasetRecord]:
     data = json.loads(path.read_text(encoding="utf-8"))
     records: list[DatasetRecord] = []
 
-    # Handle both single-file and master_raw.json (list of runs)
-    runs_list = data if isinstance(data, list) else [data]
+    # Handle multiple formats:
+    #  1. A dict with "runs" key: {venue, years, runs: [run, ...]}
+    #  2. A list of such dicts (master_raw.json)
+    #  3. A list containing a mix of dicts and nested lists (merge edge case)
+    #  4. A single run dict with "papers" directly
 
-    for run_data in runs_list:
-        for run in run_data.get("runs", []):
-            for paper in run.get("papers", []):
-                key = paper.get("bibtex_key", "")
-                for ds in paper.get("datasets", []):
-                    name = ds.get("name", "").strip()
-                    if not name:
-                        continue
-                    records.append(DatasetRecord(
-                        name=name,
-                        bibtex_keys=[key] if key else [],
-                        modalities="; ".join(ds.get("modalities", [])),
-                        osi_layers="; ".join(ds.get("osi_layers", [])),
-                        environment=ds.get("collection_environment", ""),
-                        availability_url=ds.get("availability_url", ""),
-                        availability_notes=ds.get("availability_notes", ""),
-                    ))
+    def _iter_runs(obj: Any) -> list[dict]:
+        """Flatten any shape into a list of run dicts (each has 'papers')."""
+        if isinstance(obj, dict):
+            if "papers" in obj:
+                return [obj]
+            return obj.get("runs", [])
+        if isinstance(obj, list):
+            out: list[dict] = []
+            for item in obj:
+                out.extend(_iter_runs(item))
+            return out
+        return []
+
+    for run in _iter_runs(data):
+        if not isinstance(run, dict):
+            continue
+        for paper in run.get("papers", []):
+            key = paper.get("bibtex_key", "")
+            for ds in paper.get("datasets", []):
+                name = ds.get("name", "").strip()
+                if not name:
+                    continue
+                records.append(DatasetRecord(
+                    name=name,
+                    bibtex_keys=[key] if key else [],
+                    modalities="; ".join(ds.get("modalities", [])),
+                    osi_layers="; ".join(ds.get("osi_layers", [])),
+                    environment=ds.get("collection_environment", ""),
+                    availability_url=ds.get("availability_url", ""),
+                    availability_notes=ds.get("availability_notes", ""),
+                ))
 
     return records
 
@@ -142,6 +159,12 @@ def register(app: typer.Typer) -> None:
         ),
         llm_confirm: bool = typer.Option(
             False, "--llm-confirm", help="Use LLM to confirm/reject similarity candidates."
+        ),
+        llm_workers: int = typer.Option(
+            4, "--llm-workers", min=1, max=16, help="Concurrent LLM confirmation calls."
+        ),
+        max_llm_pairs: int = typer.Option(
+            500, "--max-llm-pairs", help="Cap on pairs sent to the LLM (highest-similarity first); overflow is flagged 'llm_skipped' for review. 0 = unlimited."
         ),
         out: Optional[str] = typer.Option(
             None, "--out", help="Write JSON report here."
@@ -206,12 +229,14 @@ def register(app: typer.Typer) -> None:
             llm_confirm=llm_confirm,
             similarity_name_threshold=effective_name,
             similarity_combined_threshold=effective_combined,
+            llm_workers=llm_workers,
+            llm_max_pairs=None if max_llm_pairs <= 0 else max_llm_pairs,
         )
 
         # Group matches by method
         url_matches = [m for m in matches if m.method == "url_dedup"]
         llm_yes = [m for m in matches if m.method == "llm_confirmed"]
-        llm_unsure = [m for m in matches if m.method == "llm_unsure"]
+        llm_unsure = [m for m in matches if m.method in ("llm_unsure", "llm_skipped")]
         sim_matches = [m for m in matches if m.method == "similarity"]
 
         if url_matches:
