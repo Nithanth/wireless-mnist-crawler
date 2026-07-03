@@ -17,6 +17,13 @@ from wireless_taxonomy.models import EvidenceClaim, PaperSeed, new_id, utc_now
 from wireless_taxonomy.review.queue import insert_review_item
 
 
+def _norm_title(title: str | None) -> str:
+    """Normalized title for --refresh-paper matching (same rules as the cache)."""
+    from wireless_taxonomy.analyze.cache import _cache_key_title
+
+    return _cache_key_title(title)
+
+
 def _cache_has_abstract(cache, title: str | None, doi: str | None) -> bool:
     """True if the disk cache already holds a real abstract for this paper.
 
@@ -467,6 +474,7 @@ class Pipeline:
         fresh: bool = False,
         wireless_only: bool = True,
         workers: int = 1,
+        refresh_titles: set[str] | None = None,
     ) -> dict:
         """Extract dataset records from every fetchable paper in a venue/year.
 
@@ -490,6 +498,8 @@ class Pipeline:
 
         from wireless_taxonomy.analyze.dataset_extractor import DatasetExtractor
         from wireless_taxonomy.llm import LlmRouter
+
+        refresh_titles = {_norm_title(t) for t in (refresh_titles or set()) if _norm_title(t)}
 
         ingest_run = self.ingest(venue, year, source_type, source_value or "")
 
@@ -541,18 +551,33 @@ class Pipeline:
                     return None
                 return _fetch_pdf_bytes(pdf_url, expected_title=row["title"])
 
+            print(f"\n  ── Stage 1/3: PDF prefetch — {n_total} papers ──", file=sys.stderr)
+            n_cached = n_fetched = n_failed = n_nourl = 0
             for item, fetched, error in parallel_map(_prefetch, _prefetch_items(), workers):
                 i, row, pdf_url, cached = item
                 title = row["title"]
                 if not pdf_url:
-                    print(f"  [{i}/{n_total}] No PDF URL: {title[:60]}", file=sys.stderr)
+                    n_nourl += 1
                 elif cached:
-                    print(f"  [{i}/{n_total}] PDF cached: {title[:60]}", file=sys.stderr)
+                    n_cached += 1
                 elif fetched:
                     store_cached_pdf(self.conn, row["id"], pdf_url, fetched)
-                    print(f"  [{i}/{n_total}] PDF fetched: {title[:60]}", file=sys.stderr)
+                    n_fetched += 1
+                    print(f"  [{i}/{n_total}] downloaded: {title[:60]}", file=sys.stderr)
                 else:
-                    print(f"  [{i}/{n_total}] PDF failed: {title[:60]}", file=sys.stderr)
+                    n_failed += 1
+                    print(f"  [{i}/{n_total}] download FAILED: {title[:60]}", file=sys.stderr)
+                if i % 25 == 0 or i == n_total:
+                    print(
+                        f"  [{i}/{n_total}] … {n_cached} cached · {n_fetched} downloaded "
+                        f"· {n_failed} failed · {n_nourl} no PDF URL",
+                        file=sys.stderr,
+                    )
+            print(
+                f"  ── Stage 1/3 done: {n_cached + n_fetched}/{n_total} papers have full text "
+                f"({n_cached} cached, {n_fetched} downloaded, {n_failed} failed, {n_nourl} no URL) ──",
+                file=sys.stderr,
+            )
 
             # Classify (yes/maybe/no) with bounded parallelism. Workers only
             # call the LLM (the shared cache is lock-protected); PDF bytes are
@@ -565,8 +590,14 @@ class Pipeline:
 
             def _classify(item):
                 _i, row, pdf_bytes = item
-                return classifier.classify(dict(row), pdf_bytes=pdf_bytes)
+                force = bool(refresh_titles) and _norm_title(row["title"]) in refresh_titles
+                return classifier.classify(dict(row), pdf_bytes=pdf_bytes, refresh=force)
 
+            print(
+                f"\n  ── Stage 2/3: Wireless classification — {n_total} papers "
+                "([+] yes · [~] maybe · [-] no) ──",
+                file=sys.stderr,
+            )
             wireless_ids: set[int] = set()
             for item, pred, error in parallel_map(_classify, _classify_items(), workers):
                 i, row, _pdf = item
@@ -597,7 +628,11 @@ class Pipeline:
                 cache.save()
             total_before = len(rows)
             rows = [r for r in rows if r["id"] in wireless_ids]
-            print(f"  Wireless filter: {len(rows)}/{total_before} papers pass low_pass (yes+maybe)", file=sys.stderr)
+            print(
+                f"  ── Stage 2/3 done: {len(rows)}/{total_before} papers classified wireless "
+                "(yes+maybe, max recall) — the rest are skipped ──",
+                file=sys.stderr,
+            )
 
         effective_cache = None if fresh else cache
         extractor = extractor or DatasetExtractor(
@@ -625,6 +660,7 @@ class Pipeline:
 
         def _extract(item):
             _idx, row, pdf_url, pdf_bytes = item
+            force = bool(refresh_titles) and _norm_title(row["title"]) in refresh_titles
             return extractor.extract(
                 paper_id=row["id"],
                 title=row["title"],
@@ -635,8 +671,13 @@ class Pipeline:
                 pdf_url=pdf_url,
                 abstract=(row["abstract"] or "").strip() or None,
                 pdf_bytes=pdf_bytes,
+                refresh=force,
             )
 
+        print(
+            f"\n  ── Stage 3/3: Dataset extraction — {n_extract} wireless papers ──",
+            file=sys.stderr,
+        )
         for item, result, error in _pmap(_extract, _extract_items(), workers):
             idx, row, pdf_url, _pdf = item
             title = row["title"]

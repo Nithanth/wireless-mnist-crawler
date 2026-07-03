@@ -18,6 +18,10 @@ def register(app: typer.Typer) -> None:
         out: str = typer.Option(".", "--out", help="Output directory for the 3 CSV sheets + raw JSON."),
         oa_json: Optional[str] = typer.Option(None, "--oa-json", help="Glob path to cov_*.json files from fetch-coverage to reuse known PDF URLs."),
         fresh: bool = typer.Option(False, "--fresh", help="Ignore LLM cache and re-extract all papers. PDF text cache in the DB is still reused."),
+        refresh_paper: list[str] = typer.Option(
+            [], "--refresh-paper",
+            help="Force re-classify + re-extract just this paper (exact title, case/punctuation-insensitive); repeatable. Cache is refreshed for these papers only.",
+        ),
         wireless_only: bool = typer.Option(True, "--wireless-only/--all-papers", help="Only extract datasets from papers classified as wireless (yes+maybe for max recall). Use --all-papers to process every paper."),
         workers: int = typer.Option(1, "--workers", min=1, max=16, help="Thread parallelism for PDF fetch + LLM stages. Results are identical to a sequential run; 4-8 is a good default for paid API tiers."),
         db: str = typer.Option("taxonomy.sqlite", "--db"),
@@ -75,6 +79,7 @@ def register(app: typer.Typer) -> None:
                     fresh=fresh,
                     wireless_only=wireless_only,
                     workers=workers,
+                    refresh_titles=set(refresh_paper) if refresh_paper else None,
                 )
                 all_results.append(result)
                 typer.echo(

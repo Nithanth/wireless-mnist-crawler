@@ -240,6 +240,7 @@ def _router_with_identity(provider, model, response_json=None):
     entry.provider = provider
     entry.model = model
     router.configured_providers = MagicMock(return_value=(entry,))
+    router.select_provider = MagicMock(return_value=entry)
     return router
 
 
@@ -290,3 +291,33 @@ def test_legacy_v1_cache_entries_are_migrated_not_rebilled(mock_url, mock_bib, m
     assert router.complete.call_count == 0  # migrated, not re-billed
     v2_key = _extraction_cache_key(21, content_hash, "google/flash-1")
     assert cache.get_llm(v2_key) is not None
+
+
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._check_url_live", return_value=None)
+def test_refresh_skips_cache_read_but_writes_fresh_result(mock_url, mock_bib, mock_fetch):
+    """refresh=True forces a fresh LLM call for one paper and overwrites the cache."""
+    cache = _DictCache()
+    kwargs = dict(paper_id=30, title="Refresh Me", authors="A",
+                  venue="ICC", year=2024, doi="", pdf_url=None,
+                  abstract="We collected the BazSet dataset of LTE traces in a lab.")
+
+    r1 = _router_with_identity("google", "flash-1")
+    DatasetExtractor(router=r1, cache=cache, conn=None).extract(**kwargs)
+    assert r1.complete.call_count == 1
+
+    # Cached: no call.
+    r2 = _router_with_identity("google", "flash-1")
+    DatasetExtractor(router=r2, cache=cache, conn=None).extract(**kwargs)
+    assert r2.complete.call_count == 0
+
+    # refresh=True: fresh call despite the cache.
+    r3 = _router_with_identity("google", "flash-1")
+    DatasetExtractor(router=r3, cache=cache, conn=None).extract(**kwargs, refresh=True)
+    assert r3.complete.call_count == 1
+
+    # And the refreshed result is served from cache afterwards.
+    r4 = _router_with_identity("google", "flash-1")
+    DatasetExtractor(router=r4, cache=cache, conn=None).extract(**kwargs)
+    assert r4.complete.call_count == 0

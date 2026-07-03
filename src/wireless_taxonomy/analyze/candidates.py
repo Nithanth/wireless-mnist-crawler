@@ -153,25 +153,45 @@ class LlmCandidateClassifier:
         self.refresh = refresh
 
     def _model_identity(self) -> str:
-        """Stable identifier for the configured provider/model fallback chain.
+        """Stable identifier for the primary provider/model only.
 
         Part of the cache key so a label is reused only while the model that
-        produced it is unchanged; swapping providers/models invalidates it.
+        produced it is unchanged; swapping the primary model invalidates it.
+        Fallbacks are a resilience mechanism and do NOT change the experiment
+        identity — adding or removing them should not bust the cache.
         """
         try:
-            providers = self.router.configured_providers()
+            provider = self.router.select_provider()
+            return f"{provider.provider}/{provider.model}"
         except Exception:
-            providers = ()
-        return ",".join(f"{p.provider}/{p.model}" for p in providers)
+            return ""
 
-    def classify(self, paper: dict[str, Any], pdf_bytes: bytes | None = None) -> CandidatePrediction:
+    def classify(self, paper: dict[str, Any], pdf_bytes: bytes | None = None, refresh: bool = False) -> CandidatePrediction:
         paper_id = int(paper["id"])
         abstract = paper.get("abstract")
         used_abstract = bool(abstract and str(abstract).strip())
         prompt = _prompt(paper, has_pdf=pdf_bytes is not None)
-        cache_key = _llm_cache_key(self.provider_name, self._model_identity(), prompt)
-        if self.cache is not None and not self.refresh:
+        model_id = self._model_identity()
+        cache_key = _llm_cache_key(self.provider_name, model_id, prompt)
+        if self.cache is not None and not self.refresh and not refresh:
             cached = self.cache.get_llm(cache_key)
+            if cached is None:
+                # Migrate from the old full-chain key format (pre-refactor):
+                # the old key included every provider with an API key, e.g.
+                # "google/gemini-3.5-flash,openai/gpt-5.4-mini,anthropic/...".
+                # Reconstruct that chain from ALL configured keys (not the
+                # fallback setting, which may have changed) and adopt the
+                # legacy entry under the new primary-only key.
+                try:
+                    legacy_providers = self.router.all_configured_providers()
+                    legacy_id = ",".join(f"{p.provider}/{p.model}" for p in legacy_providers)
+                    if legacy_id and legacy_id != model_id:
+                        legacy_key = _llm_cache_key(self.provider_name, legacy_id, prompt)
+                        cached = self.cache.get_llm(legacy_key)
+                        if cached is not None:
+                            self.cache.set_llm(cache_key, cached)
+                except Exception:
+                    pass
             if cached is not None:
                 return CandidatePrediction(
                     paper_id=paper_id,

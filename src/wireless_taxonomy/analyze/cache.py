@@ -172,6 +172,43 @@ class MetadataCache:
                 self.llm[key] = value
                 self.dirty = True
 
+    def llm_model_census(self) -> dict[str, int]:
+        """Count LLM entries grouped by the model_version recorded inside them.
+
+        Entries with no recorded model (legacy) count under ``unrecorded``.
+        """
+        census: dict[str, int] = {}
+        for entry in self.llm.values():
+            model = str(entry.get("model_version") or "unrecorded")
+            census[model] = census.get(model, 0) + 1
+        return census
+
+    def gc_llm(self, keep_model: str, drop_unrecorded: bool = False) -> int:
+        """Remove LLM entries whose recorded model does NOT match ``keep_model``.
+
+        ``keep_model`` is a case-insensitive substring match against each
+        entry's ``model_version`` (e.g. "gemini-3.5-flash" matches both
+        "google:gemini-3.5-flash" and "llm_candidate_v0:google:gemini-3.5-flash").
+        Legacy entries with no recorded model are kept unless
+        ``drop_unrecorded`` is set. Returns the number of entries removed.
+        """
+        needle = keep_model.strip().lower()
+        with self._lock:
+            doomed = []
+            for key, entry in self.llm.items():
+                model = str(entry.get("model_version") or "").lower()
+                if not model:
+                    if drop_unrecorded:
+                        doomed.append(key)
+                    continue
+                if needle not in model:
+                    doomed.append(key)
+            for key in doomed:
+                del self.llm[key]
+            if doomed:
+                self.dirty = True
+            return len(doomed)
+
     # -- persistence ---------------------------------------------------------
 
     def save(self) -> None:

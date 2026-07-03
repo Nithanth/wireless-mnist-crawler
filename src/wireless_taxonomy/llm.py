@@ -48,6 +48,22 @@ class LlmRouter:
     def configured_providers(self) -> tuple[ProviderConfig, ...]:
         return tuple(provider for provider in self.settings.ordered_providers() if provider.api_key_configured)
 
+    def all_configured_providers(self) -> tuple[ProviderConfig, ...]:
+        """Every provider with an API key configured, primary first.
+
+        Unlike ``configured_providers`` this ignores the fallback setting —
+        it's used to reconstruct legacy cache identities that were written
+        when the full fallback chain was part of the cache key, so removing
+        fallbacks from .env doesn't orphan previously cached results.
+        """
+        primary = self.settings.primary_provider
+        ordered = [primary] + [p for p in self.settings.providers if p != primary]
+        return tuple(
+            self.settings.providers[p]
+            for p in ordered
+            if p in self.settings.providers and self.settings.providers[p].api_key_configured
+        )
+
     def select_provider(self) -> ProviderConfig:
         configured = self.configured_providers()
         if not configured:

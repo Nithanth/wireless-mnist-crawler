@@ -8,15 +8,25 @@ import typer
 def register(app: typer.Typer) -> None:
     @app.command("cache")
     def cache_cmd(
-        action: str = typer.Argument("status", help="Action: status | clear | clear-section"),
+        action: str = typer.Argument("status", help="Action: status | inspect | gc | clear | clear-section"),
         section: Optional[str] = typer.Argument(None, help="Section name for clear-section (abstracts, dois, llm, oa, dataset_usage)"),
         cache_path: str = typer.Option(".wt_cache.json", "--cache-path"),
+        keep_model: Optional[str] = typer.Option(
+            None, "--keep-model",
+            help="For gc: keep LLM entries whose recorded model matches this substring (e.g. 'gemini-3.5-flash'); everything else is pruned.",
+        ),
+        drop_unrecorded: bool = typer.Option(
+            False, "--drop-unrecorded",
+            help="For gc: also prune legacy LLM entries that never recorded a model.",
+        ),
     ) -> None:
         """Inspect or manage the .wt_cache.json LLM/API response cache.
 
         \b
         Actions:
           status         Show entry counts per section and file size
+          inspect        Show LLM entries grouped by the model that produced them
+          gc             Prune LLM entries from other models (requires --keep-model)
           clear          Wipe the entire cache (prompts for confirmation)
           clear-section  Clear one section: abstracts | dois | llm | oa | dataset_usage
         """
@@ -35,6 +45,35 @@ def register(app: typer.Typer) -> None:
             typer.echo(f"Cache: {p}  ({size_kb:.1f} KB)")
             for section_name, count in stats.items():
                 typer.echo(f"  {section_name:<20} {count} entries")
+
+        elif action == "inspect":
+            census = c.llm_model_census()
+            if not census:
+                typer.echo("LLM section is empty.")
+                raise typer.Exit()
+            typer.echo(f"LLM cache entries by model ({sum(census.values())} total):")
+            for model, count in sorted(census.items(), key=lambda kv: -kv[1]):
+                typer.echo(f"  {count:>6}×  {model}")
+
+        elif action == "gc":
+            if not keep_model:
+                typer.echo("gc requires --keep-model <substring>, e.g. --keep-model gemini-3.5-flash", err=True)
+                raise typer.Exit(1)
+            census = c.llm_model_census()
+            doomed_total = sum(
+                n for m, n in census.items()
+                if (m == "unrecorded" and drop_unrecorded)
+                or (m != "unrecorded" and keep_model.strip().lower() not in m.lower())
+            )
+            if doomed_total == 0:
+                typer.echo("Nothing to prune — all LLM entries already match.")
+                raise typer.Exit()
+            typer.confirm(
+                f"Prune {doomed_total} LLM entries not matching '{keep_model}' from {p}?", abort=True
+            )
+            removed = c.gc_llm(keep_model, drop_unrecorded=drop_unrecorded)
+            c.save()
+            typer.echo(f"Pruned {removed} LLM entries. Kept models matching '{keep_model}'.")
 
         elif action == "clear":
             typer.confirm(f"Wipe ALL entries in {p}?", abort=True)
@@ -55,7 +94,7 @@ def register(app: typer.Typer) -> None:
                 raise typer.Exit(1)
 
         else:
-            typer.echo(f"Unknown action '{action}'. Use: status | clear | clear-section", err=True)
+            typer.echo(f"Unknown action '{action}'. Use: status | inspect | gc | clear | clear-section", err=True)
             raise typer.Exit(1)
 
     @app.command("cache-set-pdf")

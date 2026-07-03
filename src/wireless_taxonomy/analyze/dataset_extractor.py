@@ -423,15 +423,16 @@ class DatasetExtractor:
         self.conn = conn
 
     def _model_identity(self) -> str:
-        """Stable identifier for the configured provider/model fallback chain.
+        """Stable identifier for the primary provider/model only.
 
         Part of the extraction cache key so results are reused only while the
-        model that produced them is unchanged; swapping models re-runs
-        extraction (clean control experiments).
+        model that produced them is unchanged; swapping the primary model
+        re-runs extraction (clean control experiments). Fallbacks are a
+        resilience mechanism and do NOT change the experiment identity.
         """
         try:
-            providers = self.router.configured_providers()
-            return ",".join(f"{p.provider}/{p.model}" for p in providers)
+            provider = self.router.select_provider()
+            return f"{provider.provider}/{provider.model}"
         except Exception:
             return ""
 
@@ -446,13 +447,15 @@ class DatasetExtractor:
         pdf_url: str | None,
         abstract: str | None,
         pdf_bytes: bytes | None = None,
+        refresh: bool = False,
     ) -> DatasetExtractionResult:
         """Extract dataset records for one paper.
 
         ``pdf_bytes`` may be supplied by the caller (e.g. pre-fetched by the
         pipeline) — this skips the internal SQLite/network fetch, which lets
         ``extract`` run safely in a worker thread without touching the DB
-        connection.
+        connection. ``refresh`` skips the cache read (but still writes the
+        fresh result), forcing re-extraction of this one paper.
         """
         from wireless_taxonomy.llm import LlmRequest
 
@@ -503,16 +506,32 @@ class DatasetExtractor:
         model_identity = self._model_identity()
         cache_key = _extraction_cache_key(paper_id, content_hash, model_identity)
 
-        if self.cache is not None:
+        if self.cache is not None and not refresh:
             cached = self.cache.get_llm(cache_key)
             if cached is None and model_identity:
-                # Migrate pre-model-scoped (v1) entries: they were produced by
-                # the same historical model chain, so adopt them under the new
-                # key once instead of re-billing the extraction.
+                # Migration 1: pre-model-scoped (v1) entries had no model in
+                # the key at all — adopt them under the new key once.
                 legacy = self.cache.get_llm(_extraction_cache_key(paper_id, content_hash))
                 if legacy is not None:
                     self.cache.set_llm(cache_key, legacy)
                     cached = legacy
+            if cached is None and model_identity:
+                # Migration 2: old full-chain format included every provider
+                # with an API key (e.g. "google/flash,openai/...,anthropic/...").
+                # Reconstruct that chain from ALL configured keys (not the
+                # fallback setting, which may have changed) and adopt the
+                # legacy entry under the new primary-only key.
+                try:
+                    all_providers = self.router.all_configured_providers()
+                    chain_id = ",".join(f"{p.provider}/{p.model}" for p in all_providers)
+                    if chain_id and chain_id != model_identity:
+                        chain_key = _extraction_cache_key(paper_id, content_hash, chain_id)
+                        legacy2 = self.cache.get_llm(chain_key)
+                        if legacy2 is not None:
+                            self.cache.set_llm(cache_key, legacy2)
+                            cached = legacy2
+                except Exception:
+                    pass
             if cached is not None:
                 return self._from_cache(cached, paper_id, title, authors, venue, year, doi, bibtex_key, bibtex, extraction_source)
 
