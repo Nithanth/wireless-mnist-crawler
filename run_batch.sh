@@ -73,6 +73,15 @@ START_TIME=$(date +%s)
 
 ts() { date "+%H:%M:%S"; }
 
+# Format seconds as "1h 23m 45s" / "23m 45s" / "45s"
+fmt_dur() {
+  local s=$1 h m
+  h=$(( s / 3600 )); m=$(( (s % 3600) / 60 )); s=$(( s % 60 ))
+  if [ "$h" -gt 0 ]; then echo "${h}h ${m}m ${s}s"
+  elif [ "$m" -gt 0 ]; then echo "${m}m ${s}s"
+  else echo "${s}s"; fi
+}
+
 # ── Archive old results ──────────────────────────────────
 if [ "$FRESH_RESULTS" = true ]; then
   RESULTS_DIR="./src/results"
@@ -151,16 +160,16 @@ for VENUE in "${VENUES[@]}"; do
     if [ "$CURRENT" -gt 0 ]; then
       AVG_PER_LOOP=$(( TOTAL_ELAPSED / CURRENT ))
       ETA_SECS=$(( AVG_PER_LOOP * REMAINING ))
-      ETA_MIN=$(( ETA_SECS / 60 ))
+      ETA_STR="$(fmt_dur "$ETA_SECS")"
     else
-      ETA_MIN="?"
+      ETA_STR="?"
     fi
 
     COMPLETED+=("${VENUE}_${YEAR}")
 
     echo ""
-    echo "  ✓ ${VENUE} ${YEAR} complete in ${LOOP_ELAPSED}s"
-    echo "  ─ Progress: ${CURRENT}/${TOTAL} done | ${REMAINING} remaining | ETA ~${ETA_MIN}min"
+    echo "  ✓ ${VENUE} ${YEAR} complete in $(fmt_dur "$LOOP_ELAPSED")"
+    echo "  ─ Progress: ${CURRENT}/${TOTAL} done | ${REMAINING} remaining | ETA ~${ETA_STR}"
     echo "  ─ Completed so far: ${COMPLETED[*]}"
     echo ""
   done
@@ -191,12 +200,11 @@ python -m wireless_taxonomy.cli report \
 
 END_TIME=$(date +%s)
 TOTAL_TIME=$(( END_TIME - START_TIME ))
-TOTAL_MIN=$(( TOTAL_TIME / 60 ))
 
 echo ""
 echo "╔══════════════════════════════════════════════╗"
 echo "║  ALL ${TOTAL} LOOPS DONE                           ║"
-echo "║  Total time: ${TOTAL_MIN} minutes                  "
+echo "║  Total time: $(fmt_dur "$TOTAL_TIME")                  "
 echo "║  Finished: $(date)"
 echo "║  Results in: ./src/results/                  "
 echo "║  Master files: master_papers.csv,            "
