@@ -59,6 +59,7 @@ class DatasetExtractionResult:
     datasets: list[DatasetRecord]
     extraction_source: str
     error: str | None = None
+    model_version: str = ""
 
 
 _BROWSER_UA = (
@@ -396,7 +397,19 @@ Return ONLY valid JSON — no markdown, no explanation outside the JSON.
 """
 
 
-def _extraction_cache_key(paper_id: int, text_hash: str) -> str:
+def _extraction_cache_key(paper_id: int, text_hash: str, model_identity: str = "") -> str:
+    """Content-addressed extraction key, scoped to the model that produced it.
+
+    ``model_identity`` ties the cached extraction to the provider/model chain,
+    so switching models re-runs extraction (clean A/B experiments) instead of
+    silently serving another model's output. Passing "" yields the legacy v1
+    key, kept for cache migration of pre-model-scoped entries.
+    """
+    if model_identity:
+        digest = hashlib.sha256(
+            f"dataset_extract:v2:{model_identity}:{paper_id}:{text_hash}".encode()
+        ).hexdigest()
+        return f"de:v2:{digest}"
     digest = hashlib.sha256(f"dataset_extract:v1:{paper_id}:{text_hash}".encode()).hexdigest()
     return f"de:v1:{digest}"
 
@@ -408,6 +421,19 @@ class DatasetExtractor:
         self.router = router
         self.cache = cache
         self.conn = conn
+
+    def _model_identity(self) -> str:
+        """Stable identifier for the configured provider/model fallback chain.
+
+        Part of the extraction cache key so results are reused only while the
+        model that produced them is unchanged; swapping models re-runs
+        extraction (clean control experiments).
+        """
+        try:
+            providers = self.router.configured_providers()
+            return ",".join(f"{p.provider}/{p.model}" for p in providers)
+        except Exception:
+            return ""
 
     def extract(
         self,
@@ -452,16 +478,41 @@ class DatasetExtractor:
             if pdf_bytes:
                 extraction_source = "pdf"
 
+        if not pdf_bytes and not (abstract or "").strip():
+            # Neither full text nor abstract: extraction would be pure guesswork
+            # (hallucination) and a wasted LLM call. Return an empty result.
+            return DatasetExtractionResult(
+                paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
+                doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
+                datasets=[], extraction_source="skipped_no_text",
+            )
+
         if not pdf_bytes:
-            fallback_text = abstract or f"Title: {title}\nAuthors: {authors}"
-            extraction_source = "abstract" if abstract else "title_only"
-            text_section = f"\nPaper text (abstract only — full text unavailable):\n---\n{fallback_text[:8000]}\n---\n"
+            extraction_source = "abstract"
+            text_section = (
+                f"\nPaper text (abstract only — full text unavailable):\n---\n{abstract[:8000]}\n---\n"
+                "\nSTRICT ABSTRACT MODE: you only have the abstract, not the paper. "
+                "Extract a dataset ONLY if the abstract EXPLICITLY describes it — a named "
+                "dataset, or a clearly stated data collection with concrete specifics "
+                "(what was measured, where/how). Papers of this type usually use data, but "
+                "you must NOT infer or invent datasets the paper 'probably' has: if the "
+                'abstract does not explicitly describe one, return {"datasets": []}.\n'
+            )
 
         content_hash = hashlib.sha256((pdf_bytes or (abstract or title).encode())).hexdigest()[:16]
-        cache_key = _extraction_cache_key(paper_id, content_hash)
+        model_identity = self._model_identity()
+        cache_key = _extraction_cache_key(paper_id, content_hash, model_identity)
 
         if self.cache is not None:
             cached = self.cache.get_llm(cache_key)
+            if cached is None and model_identity:
+                # Migrate pre-model-scoped (v1) entries: they were produced by
+                # the same historical model chain, so adopt them under the new
+                # key once instead of re-billing the extraction.
+                legacy = self.cache.get_llm(_extraction_cache_key(paper_id, content_hash))
+                if legacy is not None:
+                    self.cache.set_llm(cache_key, legacy)
+                    cached = legacy
             if cached is not None:
                 return self._from_cache(cached, paper_id, title, authors, venue, year, doi, bibtex_key, bibtex, extraction_source)
 
@@ -548,13 +599,19 @@ class DatasetExtractor:
                     ds.availability_url = url_match.group(0).rstrip('.,)')
                     ds.availability = _check_url_live(ds.availability_url)
 
+        model_version = f"{response.provider}:{response.model}"
         if self.cache is not None:
-            self.cache.set_llm(cache_key, {"datasets": [_record_to_dict(d) for d in datasets], "source": extraction_source})
+            self.cache.set_llm(cache_key, {
+                "datasets": [_record_to_dict(d) for d in datasets],
+                "source": extraction_source,
+                "model_version": model_version,
+            })
 
         return DatasetExtractionResult(
             paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
             doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
             datasets=datasets, extraction_source=extraction_source,
+            model_version=model_version,
         )
 
     def _load_cached_pdf(self, paper_id: int, pdf_url: str) -> bytes | None:
@@ -572,6 +629,7 @@ class DatasetExtractor:
             paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
             doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
             datasets=datasets, extraction_source=cached.get("source", extraction_source),
+            model_version=cached.get("model_version", "unknown-cached"),
         )
 
 

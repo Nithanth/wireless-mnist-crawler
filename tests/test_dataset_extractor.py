@@ -187,3 +187,106 @@ class TestFetchPdfBytes:
         with patch("urllib.request.urlopen", return_value=self._response(pdf)), \
              patch("wireless_taxonomy.analyze.dataset_extractor._pdf_matches_title", return_value=False):
             assert _fetch_pdf_bytes("https://x/paper.pdf", expected_title="Some Paper") is None
+
+
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._check_url_live", return_value=None)
+def test_no_pdf_no_abstract_skips_llm_entirely(mock_url, mock_bib, mock_fetch):
+    """Title-only papers are never sent to the LLM — extraction from a title
+    alone is pure hallucination and wasted spend."""
+    router = _mock_router()
+    extractor = DatasetExtractor(router=router, cache=None, conn=None)
+    result = extractor.extract(
+        paper_id=10, title="Mystery Paper", authors="Doe, J.",
+        venue="ICC", year=2024, doi="", pdf_url=None, abstract="",
+    )
+    assert result.extraction_source == "skipped_no_text"
+    assert result.datasets == []
+    router.complete.assert_not_called()
+
+
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._check_url_live", return_value=None)
+def test_abstract_only_prompt_uses_strict_mode(mock_url, mock_bib, mock_fetch):
+    """Abstract-only extraction must instruct the LLM to extract ONLY explicitly
+    described datasets (anti-hallucination guard)."""
+    router = _mock_router(response_json={"datasets": []})
+    extractor = DatasetExtractor(router=router, cache=None, conn=None)
+    result = extractor.extract(
+        paper_id=11, title="Some 5G Paper", authors="Doe, J.",
+        venue="ICC", year=2024, doi="", pdf_url=None,
+        abstract="We propose a scheduling algorithm for 5G RAN slicing.",
+    )
+    assert result.extraction_source == "abstract"
+    prompt = router.complete.call_args[0][0].prompt
+    assert "STRICT ABSTRACT MODE" in prompt
+    assert "EXPLICITLY" in prompt
+
+
+class _DictCache:
+    def __init__(self):
+        self.d = {}
+    def get_llm(self, key):
+        return self.d.get(key)
+    def set_llm(self, key, value):
+        self.d[key] = value
+
+
+def _router_with_identity(provider, model, response_json=None):
+    router = _mock_router(response_json=response_json)
+    entry = MagicMock()
+    entry.provider = provider
+    entry.model = model
+    router.configured_providers = MagicMock(return_value=(entry,))
+    return router
+
+
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._check_url_live", return_value=None)
+def test_extraction_cache_is_model_scoped(mock_url, mock_bib, mock_fetch):
+    """Switching models must re-run extraction, not serve another model's output."""
+    cache = _DictCache()
+    kwargs = dict(paper_id=20, title="Model Scope Paper", authors="A",
+                  venue="ICC", year=2024, doi="", pdf_url=None,
+                  abstract="We collected the FooSet dataset of 5G traces in a lab.")
+
+    r1 = _router_with_identity("google", "flash-1")
+    DatasetExtractor(router=r1, cache=cache, conn=None).extract(**kwargs)
+    assert r1.complete.call_count == 1
+
+    # Same model chain: served from cache, no new call.
+    r1b = _router_with_identity("google", "flash-1")
+    DatasetExtractor(router=r1b, cache=cache, conn=None).extract(**kwargs)
+    assert r1b.complete.call_count == 0
+
+    # Different model chain: fresh extraction.
+    r2 = _router_with_identity("openai", "gpt-x")
+    DatasetExtractor(router=r2, cache=cache, conn=None).extract(**kwargs)
+    assert r2.complete.call_count == 1
+
+
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._check_url_live", return_value=None)
+def test_legacy_v1_cache_entries_are_migrated_not_rebilled(mock_url, mock_bib, mock_fetch):
+    """Pre-model-scoped (v1) cache entries are adopted under the new key."""
+    import hashlib as h
+    from wireless_taxonomy.analyze.dataset_extractor import _extraction_cache_key
+
+    cache = _DictCache()
+    abstract = "We collected the BarSet dataset of WiFi CSI in an office."
+    content_hash = h.sha256(abstract.encode()).hexdigest()[:16]
+    legacy_key = _extraction_cache_key(21, content_hash)  # v1 (no model)
+    cache.set_llm(legacy_key, {"datasets": [], "source": "abstract"})
+
+    router = _router_with_identity("google", "flash-1")
+    result = DatasetExtractor(router=router, cache=cache, conn=None).extract(
+        paper_id=21, title="Legacy Paper", authors="B", venue="IMC", year=2023,
+        doi="", pdf_url=None, abstract=abstract,
+    )
+    assert router.complete.call_count == 0  # migrated, not re-billed
+    v2_key = _extraction_cache_key(21, content_hash, "google/flash-1")
+    assert cache.get_llm(v2_key) is not None

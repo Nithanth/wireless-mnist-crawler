@@ -449,3 +449,125 @@ def test_core_throttle_enforces_min_interval(monkeypatch) -> None:
     OpenAccessResolver._core_throttle()  # second call: must wait ~2.0s
     assert len(sleeps) == 1 and abs(sleeps[0] - 2.0) < 0.01
     OpenAccessResolver._core_last_call = 0.0
+
+
+# ── Brave Search provider ────────────────────────────────────────────────────
+
+_BRAVE_RESULTS = {
+    "web": {
+        "results": [
+            {"url": "https://dl.acm.org/doi/pdf/10.1145/1.2"},          # blocked domain
+            {"url": "https://other.edu/wrong-paper.pdf"},                # fails title check
+            {"url": "https://cs.stanford.edu/~author/paper.pdf"},        # verified hit
+        ]
+    }
+}
+
+
+def _brave_resolver(monkeypatch, fetch_json):
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "bk")
+    monkeypatch.delenv("GOOGLE_CSE_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_CSE_ID", raising=False)
+    return OpenAccessResolver(fetch_json=fetch_json, fetch_text=lambda u: "", web_search=True)
+
+
+def test_web_search_prefers_brave_when_configured(monkeypatch) -> None:
+    resolver = _brave_resolver(monkeypatch, lambda url: {})
+    assert "brave_search" in resolver.providers
+    assert "llm_web_search" not in resolver.providers
+
+
+def test_brave_and_cse_both_run_when_both_configured(monkeypatch) -> None:
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "bk")
+    monkeypatch.setenv("GOOGLE_CSE_API_KEY", "k")
+    monkeypatch.setenv("GOOGLE_CSE_ID", "cx")
+    resolver = OpenAccessResolver(fetch_json=lambda u: {}, fetch_text=lambda u: "", web_search=True)
+    assert resolver.providers.index("brave_search") < resolver.providers.index("google_cse")
+    assert "llm_web_search" not in resolver.providers
+
+
+def test_brave_only_trusts_title_verified_pdf(monkeypatch) -> None:
+    """Blocked domains skipped, unverified PDFs rejected, verified hit wins."""
+    monkeypatch.setenv("WIRELESS_TAXONOMY_BRAVE_MIN_INTERVAL_SECONDS", "0")
+    resolver = _brave_resolver(monkeypatch, _fetch_json([("api.search.brave.com", _BRAVE_RESULTS)]))
+    resolver.providers = ["brave_search"]
+
+    verified: list[str] = []
+
+    def fake_fetch(url, max_bytes=0, expected_title=None, attempts=3):
+        verified.append(url)
+        return b"%PDF" if "stanford" in url else None
+
+    import wireless_taxonomy.analyze.dataset_extractor as de
+
+    monkeypatch.setattr(de, "_fetch_pdf_bytes", fake_fetch)
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert res.fetchable
+    assert res.provider == "brave_search"
+    assert res.pdf_url == "https://cs.stanford.edu/~author/paper.pdf"
+    assert verified == ["https://other.edu/wrong-paper.pdf", "https://cs.stanford.edu/~author/paper.pdf"]
+
+
+def test_brave_rate_limit_error_stays_retryable(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("WIRELESS_TAXONOMY_BRAVE_MIN_INTERVAL_SECONDS", "0")
+    cache = MetadataCache(tmp_path / "c.json")
+
+    def exploding_fetch(url):
+        if "api.search.brave.com" in url:
+            raise RuntimeError("HTTP 429: rate limit")
+        return {}
+
+    resolver = _brave_resolver(monkeypatch, exploding_fetch)
+    resolver.cache = cache
+    resolver.providers = ["brave_search"]
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert not res.fetchable
+    got = cache.get_oa("A Wireless Paper", "10.1/x")
+    assert got["web_search_attempted"] is False  # search never ran — retry next time
+
+
+def test_closed_verdict_searched_by_old_provider_is_retried_with_new(monkeypatch, tmp_path) -> None:
+    """A closed verdict web-searched by Gemini must be re-resolved once
+    Brave/CSE are configured — the new providers may find what Gemini missed."""
+    monkeypatch.setenv("WIRELESS_TAXONOMY_BRAVE_MIN_INTERVAL_SECONDS", "0")
+    cache = MetadataCache(tmp_path / "c.json")
+    # Simulate an old cache entry: closed, searched by the Gemini provider.
+    cache.set_oa("A Wireless Paper", "10.1/x", {
+        "fetchable": False, "oa_status": "closed", "license": "", "pdf_url": "",
+        "provider": "none", "source_url": "",
+        "web_search_attempted": True, "web_search_providers": ["llm_web_search"],
+    })
+
+    resolver = _brave_resolver(monkeypatch, _fetch_json([("api.search.brave.com", _BRAVE_RESULTS)]))
+    resolver.cache = cache
+    resolver.providers = ["brave_search"]
+
+    import wireless_taxonomy.analyze.dataset_extractor as de
+    monkeypatch.setattr(de, "_fetch_pdf_bytes", lambda url, **k: b"%PDF" if "stanford" in url else None)
+
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert res.fetchable  # Brave re-searched and found the Stanford mirror
+    assert res.provider == "brave_search"
+    got = cache.get_oa("A Wireless Paper", "10.1/x")
+    assert got["fetchable"] is True
+
+
+def test_closed_verdict_searched_by_same_providers_is_not_researched(monkeypatch, tmp_path) -> None:
+    cache = MetadataCache(tmp_path / "c.json")
+    cache.set_oa("A Wireless Paper", "10.1/x", {
+        "fetchable": False, "oa_status": "closed", "license": "", "pdf_url": "",
+        "provider": "none", "source_url": "",
+        "web_search_attempted": True, "web_search_providers": ["brave_search"],
+    })
+    calls = []
+
+    def counting_fetch(url):
+        calls.append(url)
+        return {}
+
+    resolver = _brave_resolver(monkeypatch, counting_fetch)
+    resolver.cache = cache
+    resolver.providers = ["brave_search"]
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert not res.fetchable
+    assert calls == []  # served from cache; no re-search

@@ -90,6 +90,7 @@ class OpenAccessResolver:
         self._cse_key = (os.getenv("GOOGLE_CSE_API_KEY") or "").strip()
         self._cse_id = (os.getenv("GOOGLE_CSE_ID") or "").strip()
         self._core_key = (os.getenv("CORE_API_KEY") or "").strip()
+        self._brave_key = (os.getenv("BRAVE_SEARCH_API_KEY") or "").strip()
         self._router = router
         if providers is None:
             # "usenix" is authoritative-and-free for NSDI/OSDI/ATC/Security
@@ -104,24 +105,40 @@ class OpenAccessResolver:
                 providers.append("core")
             if web_search:
                 # Last-resort web search for author-hosted postprints the OA
-                # indexes miss. Google CSE (real search results, deterministic)
-                # when configured; Gemini grounding otherwise. Either way, a
-                # candidate URL is ONLY trusted after downloading the PDF and
-                # verifying the paper title appears in its first pages.
-                providers.append("google_cse" if (self._cse_key and self._cse_id) else "llm_web_search")
+                # indexes miss. Brave (whole-web index) is preferred; Google
+                # CSE (domain-whitelisted since Google deprecated whole-web
+                # CSEs) runs as an extra layer if configured; Gemini grounding
+                # only when neither is available. Either way, a candidate URL
+                # is ONLY trusted after downloading the PDF and verifying the
+                # paper title appears in its first pages.
+                if self._brave_key:
+                    providers.append("brave_search")
+                if self._cse_key and self._cse_id:
+                    providers.append("google_cse")
+                if not self._brave_key and not (self._cse_key and self._cse_id):
+                    providers.append("llm_web_search")
         self.providers = providers
 
+    _WEB_SEARCH_PROVIDERS = frozenset({"llm_web_search", "google_cse", "brave_search"})
+
     def resolve(self, title: str | None, doi: str | None, url: str | None = None) -> OaResult:
-        has_web_search = bool({"llm_web_search", "google_cse"} & set(self.providers))
+        ws_providers = sorted(self._WEB_SEARCH_PROVIDERS & set(self.providers))
+        has_web_search = bool(ws_providers)
         if self.cache is not None:
             cached = self.cache.get_oa(title, doi)
             if cached is not None:
-                # A cached "closed" verdict predates web search if web search is
-                # now enabled — re-resolve so the new provider gets a chance.
+                # A cached "closed" verdict is stale if web search is now
+                # enabled and either (a) it was never web-searched, or (b) it
+                # was searched with a different provider set (e.g. the old
+                # Gemini grounding) — re-resolve so the new providers get a
+                # chance at papers the old search missed.
                 stale_closed = (
                     has_web_search
                     and not cached.get("fetchable")
-                    and not cached.get("web_search_attempted")
+                    and (
+                        not cached.get("web_search_attempted")
+                        or cached.get("web_search_providers", []) != ws_providers
+                    )
                 )
                 if not stale_closed:
                     return OaResult(
@@ -168,6 +185,7 @@ class OpenAccessResolver:
                     "provider": result.provider,
                     "source_url": result.source_url,
                     "web_search_attempted": web_search_attempted,
+                    "web_search_providers": ws_providers if web_search_attempted else [],
                 },
             )
         return result
@@ -351,6 +369,60 @@ class OpenAccessResolver:
                 if _fetch_pdf_bytes(candidate, expected_title=title) is None:
                     continue
                 return OaResult(True, "green", "", candidate, "core", source_url)
+        return None
+
+    # Brave's free "Data for Search" tier allows 1 request/second. A
+    # process-wide throttle keeps concurrent workers under that ceiling.
+    _brave_lock = threading.Lock()
+    _brave_last_call = 0.0
+
+    @classmethod
+    def _brave_throttle(cls) -> None:
+        interval = float(os.getenv("WIRELESS_TAXONOMY_BRAVE_MIN_INTERVAL_SECONDS", "1.1"))
+        with cls._brave_lock:
+            wait = cls._brave_last_call + interval - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            cls._brave_last_call = time.monotonic()
+
+    def _brave_search(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
+        """Last-resort provider: Brave Search (whole-web index) finds a PDF URL.
+
+        Runs the same query a human would (``"<title>" filetype:pdf``) against
+        Brave's independent web index and tries the top hits in order. A hit is
+        ONLY accepted after downloading it and verifying the paper title
+        appears in the PDF's first pages (``_fetch_pdf_bytes(expected_title=...)``)
+        — a wrong search result can never inject someone else's paper.
+        """
+        if not title or not title.strip():
+            return None
+        if not self._brave_key:
+            raise _WebSearchError("Brave Search not configured")
+        from wireless_taxonomy.analyze.dataset_extractor import _fetch_pdf_bytes
+
+        for query in (f'"{title}" filetype:pdf', f"{title} pdf"):
+            source_url = "https://api.search.brave.com/res/v1/web/search?" + urlencode(
+                {"q": query, "count": "5"}
+            )
+            self._brave_throttle()
+            try:
+                payload = self.fetch_json(source_url)
+            except Exception as exc:
+                # Search never ran (rate limit / quota / network) — keep the
+                # verdict retryable instead of caching it as attempted.
+                raise _WebSearchError(str(exc)) from exc
+            web = payload.get("web") if isinstance(payload.get("web"), dict) else {}
+            results = web.get("results") if isinstance(web.get("results"), list) else []
+            for item in results[:5]:
+                candidate = _str(item.get("url") if isinstance(item, dict) else "")
+                if not candidate.lower().startswith("http"):
+                    continue
+                if _is_acm_blocked(candidate) or "ieeexplore.ieee.org" in candidate or "researchgate.net" in candidate:
+                    continue
+                # VERIFIED APPROVAL: download + title-check before trusting.
+                if _fetch_pdf_bytes(candidate, expected_title=title) is None:
+                    continue
+                return OaResult(True, "green", "", candidate, "brave_search", source_url)
         return None
 
     def _google_cse(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:

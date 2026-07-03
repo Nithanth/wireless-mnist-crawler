@@ -88,6 +88,55 @@ def _venue_year_stats(entries: list[dict], coverage: dict) -> list[dict[str, Any
     return stats
 
 
+def _model_census(entries: list[dict]) -> tuple[Counter, Counter]:
+    """Census of actual models used per stage, for homogeneity auditing.
+
+    Extraction census comes from the per-paper ``model_version`` in the raw
+    JSONs. Classification census comes from the taxonomy DB when present.
+    A clean single-model corpus shows exactly one model per stage; anything
+    else means fragmentation (e.g. LLM fallbacks fired mid-run).
+    """
+    extraction = Counter(
+        (p.get("model_version") or "unrecorded")
+        for e in entries for p in e["papers"]
+    )
+    classification: Counter = Counter()
+    try:
+        import sqlite3
+
+        for db in _glob.glob("**/taxonomy.sqlite", recursive=True):
+            conn = sqlite3.connect(db)
+            for model, n in conn.execute(
+                "SELECT model_version, COUNT(*) FROM wireless_candidate_predictions GROUP BY model_version"
+            ).fetchall():
+                classification[model or "unrecorded"] += n
+            conn.close()
+            break
+    except Exception:
+        pass
+    return classification, extraction
+
+
+def _echo_census(name: str, census: Counter, lines_md: list[str]) -> None:
+    if not census:
+        return
+    real_models = [m for m in census if m not in ("unrecorded", "unknown-cached", "")]
+    mixed = len(real_models) > 1
+    typer.echo(f"\n{name} model census:")
+    lines_md.append(f"\n### {name} model census\n")
+    for model, n in census.most_common():
+        typer.echo(f"  {n:>6}×  {model}")
+        lines_md.append(f"- `{model}`: {n}")
+    if mixed:
+        warning = (
+            f"⚠ MIXED MODELS in {name.lower()} — corpus is fragmented across "
+            f"{len(real_models)} models. For a clean experiment, re-run the "
+            "minority papers under the majority model (caches make this cheap)."
+        )
+        typer.echo(warning)
+        lines_md.append(f"\n**{warning}**")
+
+
 def _top_reused(results_dir: Path, limit: int = 20) -> list[tuple[str, int, str]]:
     """Top reused datasets: prefer consolidated CSV, fall back to master CSV."""
     consolidated = results_dir / "consolidated_datasets.csv"
@@ -174,6 +223,11 @@ def register(app: typer.Typer) -> None:
             f"({pdf_pct:.1f}%) — the rest used title+abstract fallback."
         )
 
+        census_md: list[str] = []
+        classification_census, extraction_census = _model_census(entries)
+        _echo_census("Classification", classification_census, census_md)
+        _echo_census("Extraction", extraction_census, census_md)
+
         top = _top_reused(results)
         if top:
             typer.echo(f"\nTop reused datasets (≥2 papers):")
@@ -197,6 +251,8 @@ def register(app: typer.Typer) -> None:
             "  (`extraction_source` records which path each paper used).",
             "",
         ]
+        if census_md:
+            md += ["## Model homogeneity audit", *census_md, ""]
         if top:
             md += [
                 "## Top reused datasets (≥2 papers in corpus)",

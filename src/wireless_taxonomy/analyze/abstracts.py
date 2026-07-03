@@ -565,6 +565,11 @@ def _default_fetch_json(url: str) -> dict[str, Any]:
         core_key = (os.getenv("CORE_API_KEY") or "").strip()
         if core_key:
             headers["Authorization"] = f"Bearer {core_key}"
+    elif "api.search.brave.com" in url:
+        headers = {
+            "Accept": "application/json",
+            "X-Subscription-Token": (os.getenv("BRAVE_SEARCH_API_KEY") or "").strip(),
+        }
     # CORE is slow/flaky — give it fewer retries and a shorter timeout so it
     # never holds up the rest of the resolver chain for minutes.
     is_core = "api.core.ac.uk" in url

@@ -713,6 +713,7 @@ class Pipeline:
                 "bibtex_key": result.bibtex_key,
                 "bibtex": result.bibtex,
                 "extraction_source": result.extraction_source,
+                "model_version": result.model_version,
                 "error": result.error,
                 "datasets": [
                     {
