@@ -770,8 +770,13 @@ class Pipeline:
                         "known_users": ds.known_users,
                         "confidence": ds.confidence,
                         "evidence_text": ds.evidence_text,
+                        "grounded": ds.grounded,
                     }
                     for ds in result.datasets
+                ],
+                "dropped": [
+                    {"name": d.name, "reason": d.reason, "raw": d.raw}
+                    for d in (result.dropped or [])
                 ],
             })
 
@@ -787,12 +792,24 @@ class Pipeline:
 
         self._complete_run(run_id, f"Extracted datasets for {len(results)} papers in {venue} {year}.")
         total_datasets = sum(len(r["datasets"]) for r in results)
+        total_dropped = sum(len(r.get("dropped") or []) for r in results)
+        total_ungrounded = sum(
+            1 for r in results for d in r["datasets"] if d.get("grounded") is False
+        )
+        if total_dropped or total_ungrounded:
+            print(
+                f"  ── Quality: {total_dropped} items filtered out "
+                f"| {total_ungrounded} datasets with ungrounded evidence ──",
+                file=sys.stderr,
+            )
         return {
             "venue": venue,
             "year": year,
             "total_papers": len(results),
             "papers_with_datasets": sum(1 for r in results if r["datasets"]),
             "total_dataset_records": total_datasets,
+            "total_dropped": total_dropped,
+            "total_ungrounded": total_ungrounded,
             "run_id": run_id,
             "papers": results,
         }

@@ -103,6 +103,24 @@ def register(app: typer.Typer) -> None:
 
         all_papers = [p for r in all_results for p in r["papers"]]
 
+        # Audit log: dropped items + ungrounded evidence
+        all_dropped = []
+        all_ungrounded = []
+        for p in all_papers:
+            for d in (p.get("dropped") or []):
+                all_dropped.append({"paper": p["title"], **d})
+            for d in p["datasets"]:
+                if d.get("grounded") is False:
+                    all_ungrounded.append({"paper": p["title"], "dataset": d["name"], "evidence_text": d["evidence_text"]})
+        if all_dropped or all_ungrounded:
+            audit_path = out_dir / f"{slug}_audit.jsonl"
+            with audit_path.open("w", encoding="utf-8") as fh:
+                for item in all_dropped:
+                    fh.write(json.dumps({"type": "dropped", **item}, ensure_ascii=False) + "\n")
+                for item in all_ungrounded:
+                    fh.write(json.dumps({"type": "ungrounded_evidence", **item}, ensure_ascii=False) + "\n")
+            typer.echo(f"  Audit log: {audit_path.name} ({len(all_dropped)} dropped, {len(all_ungrounded)} ungrounded)")
+
         # Sheet 1: Papers — matches manual "List of Papers" sheet
         papers_path = out_dir / f"{slug}_papers.csv"
         with papers_path.open("w", newline="", encoding="utf-8") as fh:

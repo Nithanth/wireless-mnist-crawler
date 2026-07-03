@@ -321,3 +321,105 @@ def test_refresh_skips_cache_read_but_writes_fresh_result(mock_url, mock_bib, mo
     r4 = _router_with_identity("google", "flash-1")
     DatasetExtractor(router=r4, cache=cache, conn=None).extract(**kwargs)
     assert r4.complete.call_count == 0
+
+
+def test_within_paper_dedup():
+    """Near-duplicate datasets from same paper are merged."""
+    from wireless_taxonomy.analyze.dataset_extractor import _parse_dataset_records
+
+    raw = [
+        {"name": "WiFi CSI Gesture Dataset", "relationship_type": "introduced",
+         "modalities": ["CSI"], "osi_layers": ["L1"], "confidence": "high",
+         "evidence_text": "We collected WiFi CSI.", "availability": None,
+         "availability_notes": "", "availability_url": "",
+         "collection_environment": "Physical Lab Testbed", "known_users": []},
+        {"name": "WiFi CSI Gesture Data", "relationship_type": "introduced",
+         "modalities": ["CSI"], "osi_layers": ["L1"], "confidence": "high",
+         "evidence_text": "WiFi gesture data.", "availability": None,
+         "availability_notes": "", "availability_url": "",
+         "collection_environment": "Physical Lab Testbed", "known_users": []},
+    ]
+    records, dropped = _parse_dataset_records(raw)
+    assert len(records) == 1
+    # Longer name wins
+    assert records[0].name == "WiFi CSI Gesture Dataset"
+    assert len(dropped) == 1
+    assert dropped[0].reason == "dedup_merged"
+
+
+def test_different_relationships_not_deduped():
+    """Same name but different relationship_type are NOT merged."""
+    from wireless_taxonomy.analyze.dataset_extractor import _parse_dataset_records
+
+    raw = [
+        {"name": "CRAWDAD WiFi Dataset", "relationship_type": "introduced",
+         "modalities": ["WiFi"], "osi_layers": ["L2"], "confidence": "high",
+         "evidence_text": "We release CRAWDAD.", "availability": True,
+         "availability_notes": "", "availability_url": "",
+         "collection_environment": "Real World Deployment", "known_users": []},
+        {"name": "CRAWDAD WiFi Dataset", "relationship_type": "reused",
+         "modalities": ["WiFi"], "osi_layers": ["L2"], "confidence": "high",
+         "evidence_text": "We use CRAWDAD.", "availability": True,
+         "availability_notes": "", "availability_url": "",
+         "collection_environment": "Real World Deployment", "known_users": []},
+    ]
+    records, dropped = _parse_dataset_records(raw)
+    assert len(records) == 2
+    assert len(dropped) == 0
+
+
+def test_dropped_records_tracked():
+    """Low confidence and garbage names are tracked in dropped list."""
+    from wireless_taxonomy.analyze.dataset_extractor import _parse_dataset_records
+
+    raw = [
+        {"name": "5G Trace Dataset", "relationship_type": "reused",
+         "modalities": ["5G"], "osi_layers": ["L3"], "confidence": "low",
+         "evidence_text": "trace data", "availability": None,
+         "availability_notes": "", "availability_url": "",
+         "collection_environment": "Unknown", "known_users": []},
+        {"name": "our data", "relationship_type": "reused",
+         "modalities": [], "osi_layers": [], "confidence": "high",
+         "evidence_text": "we use our data", "availability": None,
+         "availability_notes": "", "availability_url": "",
+         "collection_environment": "Unknown", "known_users": []},
+        {"name": "Widar 3.0", "relationship_type": "reused",
+         "modalities": ["WiFi CSI"], "osi_layers": ["L1"], "confidence": "high",
+         "evidence_text": "We evaluate on Widar.", "availability": True,
+         "availability_notes": "", "availability_url": "https://example.com",
+         "collection_environment": "Physical Lab Testbed", "known_users": []},
+    ]
+    records, dropped = _parse_dataset_records(raw)
+    assert len(records) == 1
+    assert records[0].name == "Widar 3.0"
+    assert len(dropped) == 2
+    reasons = {d.reason for d in dropped}
+    assert "low_confidence" in reasons
+    assert "garbage_name" in reasons or "garbage_name_exact" in reasons
+
+
+def test_evidence_grounding():
+    """Evidence grounding check flags fabricated evidence."""
+    from wireless_taxonomy.analyze.dataset_extractor import DatasetRecord, _ground_evidence
+
+    source = (
+        "We collected 5G NR traces across 12 routes in New York City over "
+        "3 months using commercial smartphones connected to T-Mobile."
+    )
+    ds_grounded = DatasetRecord(
+        name="5G NYC Traces", relationship_type="introduced",
+        modalities=["5G NR"], osi_layers=["L1"], availability=True,
+        availability_notes="", availability_url="", confidence="high",
+        collection_environment="Real World Deployment", known_users=[],
+        evidence_text="We collected 5G NR traces across 12 routes in New York City over 3 months.",
+    )
+    ds_fabricated = DatasetRecord(
+        name="Indoor WiFi Localization Data", relationship_type="introduced",
+        modalities=["WiFi"], osi_layers=["L1"], availability=None,
+        availability_notes="", availability_url="", confidence="medium",
+        collection_environment="Physical Lab Testbed", known_users=[],
+        evidence_text="We deployed 50 Raspberry Pi access points across a university library for indoor localization.",
+    )
+    _ground_evidence([ds_grounded, ds_fabricated], source)
+    assert ds_grounded.grounded is True
+    assert ds_fabricated.grounded is False

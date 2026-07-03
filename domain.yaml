@@ -1,0 +1,244 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# domain.yaml — Domain configuration for the taxonomy assembler
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This file documents the current wireless-specific choices that are hardcoded
+# in the codebase. When the tool is generalized for arbitrary research domains,
+# this file becomes the single source of truth that drives classification,
+# extraction, and reporting — no code changes needed to switch domains.
+#
+# STATUS: spec-only (not yet wired into code). Serves as the contract for the
+# domain-config refactor.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: wireless-datasets
+description: >
+  Taxonomy of datasets used and introduced in wireless networking research
+  papers across top systems/networking venues.
+version: 1
+
+# ─── Classification ─────────────────────────────────────────────────────────
+# The first-pass filter: does this paper belong to the domain?
+classification:
+  question: "Does this paper involve wireless or mobile networking?"
+  labels: [yes, maybe, no]
+  pass_filter: [yes, maybe]  # what advances to extraction (max recall)
+
+  # Domain keyword sets for the fast keyword pre-filter
+  # (bypasses LLM for obvious matches/non-matches)
+  primary_terms:
+    - 5g
+    - 6g
+    - 802.11
+    - antenna
+    - backscatter
+    - base station
+    - beamforming
+    - bluetooth
+    - cellular
+    - channel state information
+    - csi
+    - lora
+    - lorawan
+    - lte
+    - mac layer
+    - mimo
+    - mmwave
+    - ofdm
+    - phy
+    - radio
+    - ran
+    - rf
+    - rssi
+    - rsrp
+    - rsrq
+    - satellite
+    - sinr
+    - spectrum
+    - uwb
+    - wi-fi
+    - wifi
+    - wireless
+    - zigbee
+
+  # Terms that indicate general networking (used for disambiguation)
+  adjacent_terms:
+    - bandwidth
+    - congestion
+    - datacenter
+    - edge
+    - internet
+    - latency
+    - middlebox
+    - network
+    - packet
+    - routing
+    - sdn
+    - tcp
+    - traffic
+    - transport protocol
+    - wan
+
+  # Prompt template (full text sent to LLM)
+  # Variables: {paper_json}, {context_note}
+  prompt_template: |
+    You screen one research paper to decide if it is a WIRELESS / wireless-networking paper.
+    {context_note}
+
+    Wireless covers (non-exhaustive):
+    - Cellular: 4G/LTE, 5G/NR, 6G, RAN, base stations, O-RAN, small cells, HetNets
+    - Wi-Fi / 802.11: any variant (ax, be, ad, ay), WLAN, access points
+    - Millimeter-wave (mmWave), sub-THz, terahertz communications
+    - MIMO, massive MIMO, beamforming, antenna design, phased arrays
+    - RF / spectrum: channel modeling, CSI, RSSI, SINR, propagation, spectrum sharing
+    - IoT wireless: LoRa, LPWAN, Zigbee, Bluetooth/BLE, UWB, RFID, NFC, backscatter
+    - Satellite / non-terrestrial networks: LEO, GEO, direct-to-cell
+    - Wireless sensing: radar, WiFi sensing, RF sensing, localization, positioning
+
+    NOT wireless (even if they mention "network"):
+    - Wired-only datacenter networking, CDN, DNS, BGP (unless wireless last-mile)
+    - Pure ML/CV/NLP with no wireless component
+    - Pure security with no wireless-specific focus
+    - Optical fiber, undersea cables
+
+    Paper: {paper_json}
+
+    Respond ONLY with JSON: {"label": "yes"|"no"|"maybe", "confidence": "high"|"medium"|"low", "evidence": "<brief reason>"}
+
+# ─── Extraction ──────────────────────────────────────────────────────────────
+# What structured information to extract from each paper that passes classification.
+extraction:
+  # The output schema — each field becomes a column in the datasets CSV
+  schema:
+    name:
+      type: string
+      required: true
+      description: "Proper dataset name (searchable, distinctive)"
+
+    relationship_type:
+      type: enum
+      values: [introduced, reused, extended, compared_against, unclear]
+      description: "Paper's relationship to the dataset"
+
+    modalities:
+      type: list
+      item_type: string
+      description: "Data types (e.g. '5G NR traces', 'WiFi CSI', 'PCAP')"
+
+    osi_layers:
+      type: list
+      item_type: enum
+      values: [L1, L2, L3, L4, L5, L6, L7]
+      description: "OSI layers the dataset covers"
+
+    availability:
+      type: bool_nullable
+      description: "true=public, false=restricted, null=unknown"
+
+    availability_url:
+      type: url
+      description: "Exact URL from paper (empty if none — never guess)"
+
+    availability_notes:
+      type: string
+      description: "Verbatim sentence about access/license from paper"
+
+    collection_environment:
+      type: enum
+      values:
+        - Physical Lab Testbed
+        - Real World Deployment
+        - Simulation
+        - Crowdsourced
+        - Unknown
+
+    known_users:
+      type: list
+      item_type: string
+      max_items: 5
+      description: "Other papers that use this dataset ([] if unsure)"
+
+    confidence:
+      type: enum
+      values: [high, medium, low]
+
+    evidence_text:
+      type: string
+      description: "One sentence quoting/paraphrasing the paper"
+
+  # What NOT to extract (anti-hallucination guardrails)
+  exclusions:
+    - "Generic ML benchmarks (ImageNet, MNIST, CIFAR) unless applied to domain data"
+    - "Software tools, simulators, or libraries (ns-3, MATLAB, PyTorch)"
+    - "Synthetic data generated on-the-fly without a persistent shareable artifact"
+    - "Figure or table references"
+    - "Bare technical terms without context"
+    - "Data mentioned only in passing without detail"
+
+# ─── Venues ──────────────────────────────────────────────────────────────────
+# DBLP keys and year ranges to crawl
+venues:
+  - key: conf/nsdi
+    name: NSDI
+    open_access: true  # USENIX → free PDFs
+  - key: conf/sigcomm
+    name: SIGCOMM
+    open_access: false  # ACM → OA resolution needed
+  - key: conf/imc
+    name: IMC
+    open_access: false
+  - key: conf/icc
+    name: ICC
+    open_access: false  # IEEE → OA resolution needed
+  # Future:
+  # - key: conf/mobicom
+  #   name: MobiCom
+  # - key: conf/mobisys
+  #   name: MobiSys
+  # - key: conf/infocom
+  #   name: INFOCOM
+
+years: "2022:2025"
+
+# ─── Sources ─────────────────────────────────────────────────────────────────
+sources:
+  - type: dblp
+    description: "Primary paper list source"
+  # Future:
+  # - type: semantic_scholar
+  # - type: arxiv_list
+
+# ─── PDF Acquisition ─────────────────────────────────────────────────────────
+# Provider waterfall order (tried in sequence until one succeeds)
+pdf_providers:
+  - usenix          # Free for USENIX venues
+  - openalex        # OA index
+  - semantic_scholar
+  - arxiv
+  - unpaywall
+  - core
+  - brave_search    # Web search fallback (paid)
+  - google_cse      # Web search fallback (paid)
+
+max_pdf_bytes: 15728640  # 15 MB
+
+# ─── Report ──────────────────────────────────────────────────────────────────
+# Columns for the summary report (auto-derived from extraction schema in v2)
+report:
+  paper_columns:
+    - Paper Title
+    - Authors
+    - Conference
+    - Year
+    - Datasets
+    - Bibtex Citation Key
+  dataset_columns:
+    - Dataset Name
+    - Bibtex Citation Key
+    - OSI Layer (L1-L7)
+    - Modality(ies)
+    - Availability (Open? Y/N)
+    - Availability URL
+    - Annotations on Availability
+    - Collection Environment
+    - Number of Papers using Dataset

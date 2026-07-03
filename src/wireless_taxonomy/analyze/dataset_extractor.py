@@ -44,6 +44,15 @@ class DatasetRecord:
     known_users: list[str]
     confidence: str  # "high", "medium", or "low"
     evidence_text: str
+    grounded: bool | None = None  # None = not checked, True/False = checked
+
+
+@dataclass
+class DroppedRecord:
+    """A dataset record that was filtered out, with reason."""
+    name: str
+    reason: str  # e.g. "low_confidence", "garbage_name", "dedup_merged"
+    raw: dict
 
 
 @dataclass
@@ -60,6 +69,7 @@ class DatasetExtractionResult:
     extraction_source: str
     error: str | None = None
     model_version: str = ""
+    dropped: list[DroppedRecord] | None = None
 
 
 _BROWSER_UA = (
@@ -104,9 +114,10 @@ def _pdf_matches_title(pdf_bytes: bytes, expected_title: str) -> bool:
     return _title_words_in_text(expected_title, text)
 
 
-# 13 MB raw ≈ 17.3 MB base64 — fits Gemini's 20 MB inline-request limit with
-# room for the prompt. Larger files are rejected rather than truncated.
-_MAX_PDF_BYTES = 1024 * 1024 * 13
+# 15 MB raw ≈ 20 MB base64 — fits Gemini's inline-data limit (20 MB) with the
+# prompt sent separately in the request. Larger files are rejected rather than
+# truncated.
+_MAX_PDF_BYTES = 1024 * 1024 * 15
 
 
 def _fetch_pdf_bytes(
@@ -605,7 +616,24 @@ class DatasetExtractor:
                     datasets=[], extraction_source=extraction_source, error=str(exc),
                 )
 
-        datasets = _parse_dataset_records(parsed.get("datasets") or [])
+        datasets, dropped = _parse_dataset_records(parsed.get("datasets") or [])
+
+        # Evidence grounding: verify evidence_text has word overlap with source.
+        source_text_for_grounding = ""
+        if pdf_bytes:
+            try:
+                import io
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(pdf_bytes))
+                source_text_for_grounding = " ".join(
+                    (page.extract_text() or "") for page in reader.pages[:15]
+                )[:60000]
+            except Exception:
+                pass
+        if not source_text_for_grounding and abstract:
+            source_text_for_grounding = abstract
+        if source_text_for_grounding:
+            _ground_evidence(datasets, source_text_for_grounding)
 
         # Verify availability URLs the LLM found in the paper text via live HTTP check.
         # Paper-stated availability is ground truth; live check upgrades null -> bool.
@@ -631,6 +659,7 @@ class DatasetExtractor:
             doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
             datasets=datasets, extraction_source=extraction_source,
             model_version=model_version,
+            dropped=dropped or None,
         )
 
     def _load_cached_pdf(self, paper_id: int, pdf_url: str) -> bytes | None:
@@ -643,12 +672,13 @@ class DatasetExtractor:
         self, cached: dict, paper_id: int, title: str, authors: str,
         venue: str, year: int, doi: str, bibtex_key: str, bibtex: str, extraction_source: str,
     ) -> DatasetExtractionResult:
-        datasets = _parse_dataset_records(cached.get("datasets") or [])
+        datasets, dropped = _parse_dataset_records(cached.get("datasets") or [])
         return DatasetExtractionResult(
             paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
             doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
             datasets=datasets, extraction_source=cached.get("source", extraction_source),
             model_version=cached.get("model_version", "unknown-cached"),
+            dropped=dropped or None,
         )
 
 
@@ -719,8 +749,92 @@ def _looks_like_authored_name(name: str) -> bool:
     return bool(re.match(r"^[A-Z][a-z]+\d{4}-", name))
 
 
-def _parse_dataset_records(raw: list[Any]) -> list[DatasetRecord]:
+def _ground_evidence(datasets: list[DatasetRecord], source_text: str) -> None:
+    """Check each dataset's evidence_text against the source document.
+
+    Sets ``ds.grounded = True`` if >40% of distinctive evidence words appear
+    in the source text, ``False`` otherwise. Skips entries with no evidence.
+    This is a cheap word-overlap heuristic (no LLM call, no cost).
+    """
+    _STOP = {"the", "a", "an", "is", "are", "was", "were", "of", "in", "to",
+             "for", "and", "or", "that", "this", "with", "from", "by", "on", "it"}
+    source_words = set(re.sub(r"[^a-z0-9]+", " ", source_text.lower()).split())
+    for ds in datasets:
+        if not ds.evidence_text:
+            ds.grounded = None
+            continue
+        ev_words = set(re.sub(r"[^a-z0-9]+", " ", ds.evidence_text.lower()).split())
+        ev_words -= _STOP
+        if len(ev_words) < 3:
+            ds.grounded = None  # too short to check meaningfully
+            continue
+        hits = sum(1 for w in ev_words if w in source_words)
+        ds.grounded = (hits / len(ev_words)) >= 0.4
+
+
+def _name_tokens(name: str) -> set[str]:
+    """Normalized word tokens for name similarity comparison."""
+    return set(re.sub(r"[^a-z0-9]+", " ", name.lower()).split()) - {
+        "dataset", "data", "traces", "measurements", "set", "the", "a", "of", "for",
+    }
+
+
+def _name_similarity(a: str, b: str) -> float:
+    """Jaccard similarity over normalized name tokens."""
+    ta, tb = _name_tokens(a), _name_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _dedup_within_paper(records: list[DatasetRecord]) -> tuple[list[DatasetRecord], list[DroppedRecord]]:
+    """Merge near-duplicate datasets extracted from the same paper.
+
+    Two records are merged if they have the same relationship_type and
+    >0.7 name similarity. The longer-named (more descriptive) record wins;
+    the shorter is logged as a dropped duplicate.
+    """
+    if len(records) <= 1:
+        return records, []
+    kept: list[DatasetRecord] = []
+    dropped: list[DroppedRecord] = []
+    used = [False] * len(records)
+    for i, ri in enumerate(records):
+        if used[i]:
+            continue
+        best = ri
+        for j in range(i + 1, len(records)):
+            if used[j]:
+                continue
+            rj = records[j]
+            if ri.relationship_type != rj.relationship_type:
+                continue
+            if _name_similarity(ri.name, rj.name) > 0.7:
+                used[j] = True
+                # Keep the longer/more descriptive name
+                if len(rj.name) > len(best.name):
+                    dropped.append(DroppedRecord(
+                        name=best.name, reason="dedup_merged",
+                        raw={"merged_into": rj.name},
+                    ))
+                    best = rj
+                else:
+                    dropped.append(DroppedRecord(
+                        name=rj.name, reason="dedup_merged",
+                        raw={"merged_into": best.name},
+                    ))
+        kept.append(best)
+    return kept, dropped
+
+
+def _parse_dataset_records(raw: list[Any]) -> tuple[list[DatasetRecord], list[DroppedRecord]]:
+    """Parse and validate LLM extraction output into DatasetRecords.
+
+    Returns (accepted_records, dropped_records) so callers can audit what
+    was filtered and why.
+    """
     records: list[DatasetRecord] = []
+    dropped: list[DroppedRecord] = []
     for item in raw:
         if not isinstance(item, dict):
             continue
@@ -735,6 +849,7 @@ def _parse_dataset_records(raw: list[Any]) -> list[DatasetRecord]:
         # Filtering: reject low-confidence datasets. Both introduced and
         # reused require at least "medium" confidence.
         if confidence not in _PASS_CONFIDENCE:
+            dropped.append(DroppedRecord(name=name, reason="low_confidence", raw=item))
             continue
 
         # Name quality filtering depends on relationship type:
@@ -746,11 +861,14 @@ def _parse_dataset_records(raw: list[Any]) -> list[DatasetRecord]:
             if not _looks_like_authored_name(name):
                 lower = name.lower().strip()
                 if lower.startswith(("figure ", "fig.", "fig ", "table ")):
+                    dropped.append(DroppedRecord(name=name, reason="garbage_name_figure_ref", raw=item))
                     continue
                 if lower in _GARBAGE_EXACT:
+                    dropped.append(DroppedRecord(name=name, reason="garbage_name_exact", raw=item))
                     continue
         else:
             if _is_garbage_name(name):
+                dropped.append(DroppedRecord(name=name, reason="garbage_name", raw=item))
                 continue
 
         modalities = [str(m).strip() for m in (item.get("modalities") or []) if str(m).strip()]
@@ -771,7 +889,12 @@ def _parse_dataset_records(raw: list[Any]) -> list[DatasetRecord]:
             availability_url=avail_url, collection_environment=env,
             known_users=known_users, confidence=confidence, evidence_text=evidence,
         ))
-    return records
+
+    # Within-paper deduplication
+    records, dedup_drops = _dedup_within_paper(records)
+    dropped.extend(dedup_drops)
+
+    return records, dropped
 
 
 def _record_to_dict(r: DatasetRecord) -> dict[str, Any]:
