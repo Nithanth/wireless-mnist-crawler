@@ -574,7 +574,8 @@ class Pipeline:
                     if cache is not None:
                         cache.save()
                     print(
-                        f"\n  Checkpoint saved after {i - 1}/{n_total} papers. "
+                        f"\n  💳 {error}\n"
+                        f"  💾 Checkpoint saved after {i - 1}/{n_total} papers. "
                         "Re-run after reloading credits to resume.",
                         file=sys.stderr,
                     )
@@ -647,7 +648,8 @@ class Pipeline:
                     if cache is not None:
                         cache.save()
                     print(
-                        f"\n  Checkpoint saved after {idx - 1}/{n_extract} papers. "
+                        f"\n  💳 {error}\n"
+                        f"  💾 Checkpoint saved after {idx - 1}/{n_extract} papers. "
                         "Re-run after reloading credits to resume.",
                         file=sys.stderr,
                     )

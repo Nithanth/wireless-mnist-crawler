@@ -198,7 +198,10 @@ def test_metadata_cache_oa_roundtrip(tmp_path: Path) -> None:
     assert reloaded.stats()["oa"] == 2
     assert reloaded.get_oa(None, "10.1/x") == reloaded.get_oa("A Wireless Paper", None)
 
-def test_web_search_provider_appended_only_when_enabled() -> None:
+def test_web_search_provider_appended_only_when_enabled(monkeypatch) -> None:
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_CSE_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_CSE_ID", raising=False)
     resolver = OpenAccessResolver(fetch_json=lambda url: {}, fetch_text=lambda url: "")
     assert "llm_web_search" not in resolver.providers
     resolver_ws = OpenAccessResolver(
@@ -328,6 +331,7 @@ def test_web_search_prefers_google_cse_when_configured(monkeypatch) -> None:
 
 
 def test_web_search_falls_back_to_llm_without_cse_keys(monkeypatch) -> None:
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_CSE_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_CSE_ID", raising=False)
     resolver = OpenAccessResolver(fetch_json=lambda u: {}, fetch_text=lambda u: "", web_search=True)

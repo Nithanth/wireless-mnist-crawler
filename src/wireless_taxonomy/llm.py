@@ -213,6 +213,20 @@ def _google_complete(provider: ProviderConfig, request: LlmRequest) -> str:
 _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 _CREDIT_EXHAUSTED_STATUS = {402, 403}
 
+_SERVICE_MAP = {
+    "generativelanguage.googleapis.com": "GOOGLE GEMINI",
+    "api.openai.com": "OPENAI",
+    "api.anthropic.com": "ANTHROPIC",
+}
+
+
+def _service_from_url(url: str) -> str:
+    """Derive a human-readable service name from the API URL."""
+    for domain, name in _SERVICE_MAP.items():
+        if domain in url:
+            return name
+    return "LLM SERVICE"
+
 
 def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
     timeout = int(os.getenv("WIRELESS_TAXONOMY_LLM_TIMEOUT_SECONDS", "120"))
@@ -231,9 +245,10 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1000]
+            svc = _service_from_url(url)
             if exc.code in _CREDIT_EXHAUSTED_STATUS and _looks_like_quota(detail):
                 raise CreditExhaustedError(
-                    f"Credits/quota exhausted (HTTP {exc.code}). "
+                    f"{svc} credits/quota exhausted (HTTP {exc.code}). "
                     "Top up your account and re-run; the cache will resume where you left off."
                 ) from exc
             last_error = RuntimeError(f"HTTP {exc.code}: {detail}")
@@ -246,7 +261,7 @@ def _post_json(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[
                 retry_after = _retry_delay_seconds(exc, detail)
                 if _looks_like_daily_quota(detail):
                     last_error = CreditExhaustedError(
-                        "Daily quota exhausted (HTTP 429). "
+                        f"{svc} daily quota exhausted (HTTP 429). "
                         "Top up / wait for quota reset and re-run; the cache will resume where you left off."
                     )
             elif exc.code not in _RETRYABLE_STATUS:

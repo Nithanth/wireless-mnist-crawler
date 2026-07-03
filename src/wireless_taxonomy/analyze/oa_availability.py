@@ -1,6 +1,7 @@
 
 import os
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -157,11 +158,22 @@ class OpenAccessResolver:
                 continue
             try:
                 found = handler(title, doi, url)
-            except _WebSearchError:
-                # Search didn't run (rate limit / config) — leave the cache
-                # entry retryable rather than poisoning it as "attempted".
+            except _WebSearchError as wse:
+                # Search didn't run (rate limit / config / budget) — leave the
+                # cache entry retryable rather than poisoning it as "attempted".
                 found = None
                 web_search_attempted = False
+                msg = str(wse)
+                if "budget exhausted" in msg.lower() and not OpenAccessResolver._brave_cap_notified:
+                    OpenAccessResolver._brave_cap_notified = True
+                    print(
+                        "\n  ⚠ BRAVE SEARCH BUDGET EXHAUSTED. Papers beyond this point "
+                        "will fall through to CSE/Gemini or stay retryable. Add credits or "
+                        "increase WIRELESS_TAXONOMY_BRAVE_MAX_QUERIES to resume Brave usage.",
+                        file=sys.stderr,
+                    )
+                elif "not configured" in msg.lower() and provider == "brave_search":
+                    pass  # normal if key absent
             except CreditExhaustedError:
                 raise  # checkpoint upstream; never cache a closed verdict
             except Exception:
@@ -375,6 +387,8 @@ class OpenAccessResolver:
     # process-wide throttle keeps concurrent workers under that ceiling.
     _brave_lock = threading.Lock()
     _brave_last_call = 0.0
+    _brave_queries = 0
+    _brave_cap_notified = False
 
     @classmethod
     def _brave_throttle(cls) -> None:
@@ -384,6 +398,19 @@ class OpenAccessResolver:
             if wait > 0:
                 time.sleep(wait)
             cls._brave_last_call = time.monotonic()
+
+    @classmethod
+    def _check_brave_cap(cls) -> None:
+        max_q = int(os.getenv("WIRELESS_TAXONOMY_BRAVE_MAX_QUERIES", "3000"))
+        if max_q <= 0:
+            return
+        with cls._brave_lock:
+            cls._brave_queries += 1
+            if cls._brave_queries > max_q:
+                raise _WebSearchError(
+                    f"Brave Search query budget exhausted ({max_q}/{max_q}). "
+                    "Add BRAVE_SEARCH_API_KEY credits or increase WIRELESS_TAXONOMY_BRAVE_MAX_QUERIES."
+                )
 
     def _brave_search(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
         """Last-resort provider: Brave Search (whole-web index) finds a PDF URL.
@@ -405,6 +432,7 @@ class OpenAccessResolver:
                 {"q": query, "count": "5"}
             )
             self._brave_throttle()
+            self._check_brave_cap()
             try:
                 payload = self.fetch_json(source_url)
             except Exception as exc:
