@@ -25,6 +25,101 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.venv/bin/activate"
 
+# ── Pre-flight checks ────────────────────────────────────────────────────────
+# Verify required API keys and configuration before starting a potentially
+# multi-hour run. Fail loudly now rather than 2 hours in.
+echo "$(date '+%H:%M:%S') Running pre-flight checks..."
+python - <<'PREFLIGHT'
+import os, sys
+
+RED   = "\033[0;31m"
+GREEN = "\033[0;32m"
+YELLOW= "\033[0;33m"
+RESET = "\033[0m"
+
+ok = True
+
+def check(label, val, required=True, note=""):
+    global ok
+    if val:
+        print(f"  {GREEN}✓{RESET}  {label}: {val[:6]}{'*' * max(0, len(val)-6) if len(val) > 6 else ''}{'  ' + note if note else ''}")
+    elif required:
+        print(f"  {RED}✗{RESET}  {label}: NOT SET  ← required{('  ' + note) if note else ''}")
+        ok = False
+    else:
+        print(f"  {YELLOW}–{RESET}  {label}: not set{('  (optional: ' + note + ')') if note else ' (optional)'}")
+
+# Load .env if present
+env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(env_path):
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+
+print()
+print("  LLM")
+check("GEMINI_API_KEY (primary LLM)",
+      os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
+      required=True)
+check("WIRELESS_TAXONOMY_LLM_PROVIDER",
+      os.getenv("WIRELESS_TAXONOMY_LLM_PROVIDER", "google"),
+      required=False, note="defaults to google")
+fallbacks = os.getenv("WIRELESS_TAXONOMY_LLM_FALLBACKS", "")
+if fallbacks.strip():
+    print(f"  {YELLOW}!{RESET}  WIRELESS_TAXONOMY_LLM_FALLBACKS={fallbacks!r}  "
+          f"← fallbacks active; for a homogeneous run remove this from .env")
+else:
+    print(f"  {GREEN}✓{RESET}  WIRELESS_TAXONOMY_LLM_FALLBACKS: not set (single-model run, good)")
+
+print()
+print("  PDF / OA retrieval")
+check("UNPAYWALL_EMAIL",
+      os.getenv("UNPAYWALL_EMAIL") or os.getenv("WIRELESS_TAXONOMY_UNPAYWALL_EMAIL"),
+      required=True, note="required for Unpaywall OA lookup")
+check("BRAVE_SEARCH_API_KEY",
+      os.getenv("BRAVE_SEARCH_API_KEY"),
+      required=False, note="needed for --web-search PDF fallback")
+check("GOOGLE_CSE_API_KEY",
+      os.getenv("GOOGLE_CSE_API_KEY"),
+      required=False, note="needed for --web-search PDF fallback")
+check("GOOGLE_CSE_ID",
+      os.getenv("GOOGLE_CSE_ID"),
+      required=False, note="needed for --web-search PDF fallback")
+
+# Warn if --web-search keys are missing but caller may pass --web-search
+brave = os.getenv("BRAVE_SEARCH_API_KEY", "")
+cse_k = os.getenv("GOOGLE_CSE_API_KEY", "")
+cse_i = os.getenv("GOOGLE_CSE_ID", "")
+if not (brave or (cse_k and cse_i)):
+    print(f"  {YELLOW}!{RESET}  No web-search keys set — --web-search flag will fall back to static providers only")
+
+print()
+print("  Database")
+import pathlib
+db = pathlib.Path(os.getenv("WIRELESS_TAXONOMY_DB_PATH", "taxonomy.sqlite"))
+if db.exists():
+    size_mb = db.stat().st_size / 1_048_576
+    print(f"  {GREEN}✓{RESET}  DB: {db} ({size_mb:.1f} MB)")
+else:
+    print(f"  {YELLOW}–{RESET}  DB: {db} (will be created on first run)")
+
+print()
+if not ok:
+    print(f"  {RED}Pre-flight FAILED — fix the above before running.{RESET}")
+    sys.exit(1)
+else:
+    print(f"  {GREEN}Pre-flight passed.{RESET}")
+PREFLIGHT
+
+if [ $? -ne 0 ]; then
+  echo "Aborting."
+  exit 1
+fi
+echo ""
+
 # Defaults
 VENUES_STR="SIGCOMM,IMC,NSDI"
 YEARS_STR="2022,2023,2024"
