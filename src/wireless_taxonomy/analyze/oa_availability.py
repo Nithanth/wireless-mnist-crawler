@@ -453,6 +453,35 @@ class OpenAccessResolver:
                 return OaResult(True, "green", "", candidate, "brave_search", source_url)
         return None
 
+    # Google CSE free tier allows 100 queries/day (paid: 10k/day). A
+    # process-wide throttle + query budget mirrors the Brave controls.
+    _cse_lock = threading.Lock()
+    _cse_last_call = 0.0
+    _cse_queries = 0
+
+    @classmethod
+    def _cse_throttle(cls) -> None:
+        interval = float(os.getenv("WIRELESS_TAXONOMY_CSE_MIN_INTERVAL_SECONDS", "0.6"))
+        with cls._cse_lock:
+            wait = cls._cse_last_call + interval - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            cls._cse_last_call = time.monotonic()
+
+    @classmethod
+    def _check_cse_cap(cls) -> None:
+        max_q = int(os.getenv("WIRELESS_TAXONOMY_CSE_MAX_QUERIES", "3000"))
+        if max_q <= 0:
+            return
+        with cls._cse_lock:
+            cls._cse_queries += 1
+            if cls._cse_queries > max_q:
+                raise _WebSearchError(
+                    f"Google CSE query budget exhausted ({max_q}/{max_q}). "
+                    "Raise the daily quota in Google Cloud Console or increase "
+                    "WIRELESS_TAXONOMY_CSE_MAX_QUERIES."
+                )
+
     def _google_cse(self, title: str | None, doi: str | None, url: str | None) -> OaResult | None:
         """Last-resort provider: Google Programmable Search finds a PDF URL.
 
@@ -474,6 +503,8 @@ class OpenAccessResolver:
             source_url = "https://www.googleapis.com/customsearch/v1?" + urlencode(
                 {"key": self._cse_key, "cx": self._cse_id, "q": query, "num": "5"}
             )
+            self._cse_throttle()
+            self._check_cse_cap()
             try:
                 payload = self.fetch_json(source_url)
             except Exception as exc:

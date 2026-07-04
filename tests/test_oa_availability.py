@@ -575,3 +575,17 @@ def test_closed_verdict_searched_by_same_providers_is_not_researched(monkeypatch
     res = resolver.resolve("A Wireless Paper", "10.1/x")
     assert not res.fetchable
     assert calls == []  # served from cache; no re-search
+
+
+def test_google_cse_query_cap(monkeypatch):
+    """CSE queries beyond the budget raise a retryable _WebSearchError."""
+    from wireless_taxonomy.analyze.oa_availability import OpenAccessResolver, _WebSearchError
+    import pytest
+
+    monkeypatch.setenv("WIRELESS_TAXONOMY_CSE_MAX_QUERIES", "2")
+    OpenAccessResolver._cse_queries = 0  # reset class counter
+    OpenAccessResolver._check_cse_cap()
+    OpenAccessResolver._check_cse_cap()
+    with pytest.raises(_WebSearchError, match="budget exhausted"):
+        OpenAccessResolver._check_cse_cap()
+    OpenAccessResolver._cse_queries = 0  # clean up for other tests

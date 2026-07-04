@@ -20,7 +20,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 OSI_LAYERS = {"L1", "L2", "L3", "L4", "L5", "L6", "L7"}
@@ -264,8 +264,9 @@ def store_cached_pdf(conn, paper_id: int, pdf_url: str, pdf_bytes: bytes) -> Non
             """,
             (paper_id, pdf_url, b64, sha, now, now),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        import sys
+        print(f"  [!] failed to cache PDF for paper {paper_id}: {exc}", file=sys.stderr)
 
 
 def _make_bibtex_key(authors: str, year: int, title: str) -> str:
@@ -471,7 +472,7 @@ class DatasetExtractor:
         from wireless_taxonomy.llm import LlmRequest
 
         bibtex_key = _make_bibtex_key(authors, year, title)
-        crossref_bibtex = _fetch_crossref_bibtex(doi)
+        crossref_bibtex = self._cached_crossref_bibtex(doi)
         if crossref_bibtex:
             bibtex = re.sub(r"(@\w+\{)[^,]+,", rf"\g<1>{bibtex_key},", crossref_bibtex, count=1)
         else:
@@ -639,12 +640,12 @@ class DatasetExtractor:
         # Paper-stated availability is ground truth; live check upgrades null -> bool.
         for ds in datasets:
             if ds.availability_url:
-                ds.availability = _check_url_live(ds.availability_url)
+                ds.availability = self._cached_url_live(ds.availability_url)
             elif ds.availability is None and ds.availability_notes:
                 url_match = re.search(r'https?://\S+', ds.availability_notes)
                 if url_match:
                     ds.availability_url = url_match.group(0).rstrip('.,)')
-                    ds.availability = _check_url_live(ds.availability_url)
+                    ds.availability = self._cached_url_live(ds.availability_url)
 
         model_version = f"{response.provider}:{response.model}"
         if self.cache is not None:
@@ -661,6 +662,51 @@ class DatasetExtractor:
             model_version=model_version,
             dropped=dropped or None,
         )
+
+    def _cached_url_live(self, url: str) -> bool:
+        """URL liveness check with a 7-day disk cache.
+
+        Availability URLs rarely flip status mid-corpus; caching avoids
+        re-hitting the same GitHub/website URL for every paper that shares a
+        dataset, and makes re-runs network-free.
+        """
+        if not url:
+            return False
+        cache_key = f"urllive:{url.strip().lower()}"
+        if self.cache is not None:
+            cached = self.cache.get_llm(cache_key)
+            if cached is not None and "live" in cached:
+                try:
+                    checked = datetime.fromisoformat(cached.get("checked_at", ""))
+                    if datetime.now(timezone.utc) - checked < timedelta(days=7):
+                        return bool(cached["live"])
+                except (ValueError, TypeError):
+                    pass
+        live = _check_url_live(url)
+        if self.cache is not None:
+            self.cache.set_llm(cache_key, {
+                "live": live,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+            })
+        return live
+
+    def _cached_crossref_bibtex(self, doi: str) -> str | None:
+        """CrossRef BibTeX lookup with disk cache (keyed by DOI).
+
+        Successful lookups are cached forever (BibTeX for a DOI is immutable);
+        failures are NOT cached so transient doi.org errors stay retryable.
+        """
+        if not doi:
+            return None
+        cache_key = f"bibtex:{doi.strip().lower()}"
+        if self.cache is not None:
+            cached = self.cache.get_llm(cache_key)
+            if cached is not None and cached.get("bibtex"):
+                return str(cached["bibtex"])
+        bibtex = _fetch_crossref_bibtex(doi)
+        if bibtex and self.cache is not None:
+            self.cache.set_llm(cache_key, {"bibtex": bibtex})
+        return bibtex
 
     def _load_cached_pdf(self, paper_id: int, pdf_url: str) -> bytes | None:
         return load_cached_pdf(self.conn, paper_id, pdf_url)

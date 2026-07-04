@@ -125,11 +125,13 @@ def _model_census(entries: list[dict]) -> tuple[Counter, Counter]:
 
         for db in _glob.glob("**/taxonomy.sqlite", recursive=True):
             conn = sqlite3.connect(db)
-            for model, n in conn.execute(
-                "SELECT model_version, COUNT(*) FROM wireless_candidate_predictions GROUP BY model_version"
-            ).fetchall():
-                classification[model or "unrecorded"] += n
-            conn.close()
+            try:
+                for model, n in conn.execute(
+                    "SELECT model_version, COUNT(*) FROM wireless_candidate_predictions GROUP BY model_version"
+                ).fetchall():
+                    classification[model or "unrecorded"] += n
+            finally:
+                conn.close()
             break
     except Exception:
         pass

@@ -172,6 +172,11 @@ def register(app: typer.Typer) -> None:
         consolidated: Optional[str] = typer.Option(
             None, "--consolidated", help="Write consolidated (deduplicated) datasets CSV."
         ),
+        review_csv: Optional[str] = typer.Option(
+            None, "--review-csv",
+            help="Write human-review candidates (LLM-unsure + similarity-only pairs) to a CSV "
+                 "with a blank 'decision' column (merge/keep) for manual annotation.",
+        ),
     ) -> None:
         """Post-merge entity resolution: flag datasets that are likely the same.
 
@@ -276,6 +281,29 @@ def register(app: typer.Typer) -> None:
                 typer.echo(f"       mod={m.a.modalities[:60]}  osi={m.a.osi_layers}  env={m.a.environment}")
                 typer.echo(f"    B: {m.b.name}  [{', '.join(m.b.bibtex_keys)}]")
                 typer.echo(f"       mod={m.b.modalities[:60]}  osi={m.b.osi_layers}  env={m.b.environment}")
+
+        # Human-review CSV: everything that is NOT auto-merged, with a blank
+        # decision column the reviewer fills in (merge / keep).
+        review_candidates = llm_unsure + sim_matches
+        if review_csv and review_candidates:
+            rp = Path(review_csv)
+            rp.parent.mkdir(parents=True, exist_ok=True)
+            with rp.open("w", newline="", encoding="utf-8") as fh:
+                writer = _csv.writer(fh)
+                writer.writerow([
+                    "decision (merge/keep)", "confidence", "method", "reason",
+                    "name_a", "bibtex_keys_a", "modalities_a", "osi_a", "env_a", "url_a",
+                    "name_b", "bibtex_keys_b", "modalities_b", "osi_b", "env_b", "url_b",
+                ])
+                for m in sorted(review_candidates, key=lambda m: -m.confidence):
+                    writer.writerow([
+                        "", f"{m.confidence:.2f}", m.method, m.reason,
+                        m.a.name, ", ".join(m.a.bibtex_keys), m.a.modalities, m.a.osi_layers, m.a.environment, m.a.availability_url,
+                        m.b.name, ", ".join(m.b.bibtex_keys), m.b.modalities, m.b.osi_layers, m.b.environment, m.b.availability_url,
+                    ])
+            typer.echo(f"\nReview CSV: {rp} ({len(review_candidates)} pairs to review)")
+        elif review_csv:
+            typer.echo("\nNo review candidates — nothing written to --review-csv.")
 
         total = len(url_matches) + len(llm_yes) + len(llm_unsure) + len(sim_matches)
         typer.echo(f"\nTotal: {total} candidates")

@@ -27,8 +27,9 @@ def register(app: typer.Typer) -> None:
         outputs) and produces:
           master_papers.csv, master_bibtex.csv, master_datasets.csv, master_raw.json
 
-        With --min-corpus-reuse=2 (the default), only datasets referenced by at
-        least 2 papers in the merged corpus survive into master_datasets.csv.
+        The default --min-corpus-reuse=1 keeps every extracted dataset. Pass
+        --min-corpus-reuse=2 to keep only datasets referenced by at least 2
+        papers in the merged corpus (cross-paper reuse).
         """
         src = Path(results_dir)
         dst = Path(out)

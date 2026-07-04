@@ -423,3 +423,57 @@ def test_evidence_grounding():
     _ground_evidence([ds_grounded, ds_fabricated], source)
     assert ds_grounded.grounded is True
     assert ds_fabricated.grounded is False
+
+
+def test_crossref_bibtex_is_cached():
+    """CrossRef BibTeX lookups hit the network once, then serve from cache."""
+    from unittest.mock import patch as _patch
+
+    cache = _DictCache()
+    ext = DatasetExtractor(router=_mock_router(), cache=cache, conn=None)
+    with _patch(
+        "wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex",
+        return_value="@inproceedings{x2024y, title={T}}",
+    ) as fetch:
+        assert ext._cached_crossref_bibtex("10.1234/abc") is not None
+        assert ext._cached_crossref_bibtex("10.1234/abc") is not None
+        assert fetch.call_count == 1  # second call served from cache
+
+    # Failures are NOT cached (stay retryable)
+    cache2 = _DictCache()
+    ext2 = DatasetExtractor(router=_mock_router(), cache=cache2, conn=None)
+    with _patch(
+        "wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex",
+        return_value=None,
+    ) as fetch2:
+        assert ext2._cached_crossref_bibtex("10.9999/fail") is None
+        assert ext2._cached_crossref_bibtex("10.9999/fail") is None
+        assert fetch2.call_count == 2  # retried, not cached
+
+
+def test_url_liveness_is_cached_with_ttl():
+    """URL live checks are cached; stale entries re-check."""
+    from unittest.mock import patch as _patch
+
+    cache = _DictCache()
+    ext = DatasetExtractor(router=_mock_router(), cache=cache, conn=None)
+    with _patch(
+        "wireless_taxonomy.analyze.dataset_extractor._check_url_live",
+        return_value=True,
+    ) as check:
+        assert ext._cached_url_live("https://example.com/data") is True
+        assert ext._cached_url_live("https://example.com/data") is True
+        assert check.call_count == 1  # cached
+
+    # Expired entry (8 days old) triggers a fresh check
+    from datetime import datetime, timedelta, timezone
+    key = "urllive:https://example.com/data"
+    cache.d[key]["checked_at"] = (
+        datetime.now(timezone.utc) - timedelta(days=8)
+    ).isoformat()
+    with _patch(
+        "wireless_taxonomy.analyze.dataset_extractor._check_url_live",
+        return_value=False,
+    ) as check2:
+        assert ext._cached_url_live("https://example.com/data") is False
+        assert check2.call_count == 1
