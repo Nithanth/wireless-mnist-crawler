@@ -132,6 +132,28 @@ def register(app: typer.Typer) -> None:
                 if not yes and not typer.confirm("Continue with mixed-model corpus?", default=False):
                     raise typer.Exit(1)
 
+            # Snapshot before mutating — always reversible
+            snap = corpus_obj.snapshot()
+            if snap:
+                typer.echo(f"Snapshot: {snap.stem} (rollback with: wt corpus rollback {snap.stem})")
+
+        # ── Pre-flight: verify LLM API key is configured ──────────────
+        try:
+            from wireless_taxonomy.config import load_settings as _pf_settings
+            from wireless_taxonomy.llm import LlmRouter as _pf_Router
+
+            _pf_provider = _pf_Router(_pf_settings(db).llm).select_provider()
+            if not _pf_provider.api_key_configured:
+                typer.echo(
+                    f"ERROR: No API key configured for {_pf_provider.provider}. "
+                    f"Set {_pf_provider.api_key_env} in .env",
+                    err=True,
+                )
+                raise typer.Exit(1)
+        except RuntimeError as exc:
+            typer.echo(f"ERROR: {exc}", err=True)
+            raise typer.Exit(1)
+
         # ── Per-stage model overrides ─────────────────────────────────────
         cls_settings = parse_model_override(classify_model) if classify_model else None
         ext_settings = parse_model_override(extract_model) if extract_model else None
