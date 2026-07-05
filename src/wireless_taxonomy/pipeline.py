@@ -484,6 +484,42 @@ class Pipeline:
         summary = summarize(papers)
         return {"venue": venue, "year": year, **summary, "papers": papers}
 
+    def check_coverage_ready(self, venue: str, year: int) -> dict:
+        """Check whether fetch-coverage has been run for a venue/year.
+
+        Returns a dict with:
+          ready: bool — True if OA resolution has been done
+          total_papers: int — papers ingested
+          papers_with_pdf: int — papers with a known PDF URL
+          papers_with_oa: int — papers with any OA attempt recorded
+        """
+        ci_row = self.conn.execute(
+            """SELECT ci.id FROM conference_instances ci
+               JOIN venues v ON v.id = ci.venue_id
+               WHERE LOWER(v.name) = LOWER(?) AND ci.year = ?""",
+            (venue, year),
+        ).fetchone()
+        if ci_row is None:
+            return {"ready": False, "total_papers": 0, "papers_with_pdf": 0, "papers_with_oa": 0}
+        ci_id = ci_row["id"]
+        total = self.conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE conference_instance_id = ?", (ci_id,)
+        ).fetchone()[0]
+        with_pdf = self.conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE conference_instance_id = ? AND pdf_url IS NOT NULL AND pdf_url != ''",
+            (ci_id,),
+        ).fetchone()[0]
+        with_oa = self.conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE conference_instance_id = ? AND oa_attempted_at IS NOT NULL",
+            (ci_id,),
+        ).fetchone()[0]
+        return {
+            "ready": with_oa > 0,
+            "total_papers": total,
+            "papers_with_pdf": with_pdf,
+            "papers_with_oa": with_oa,
+        }
+
     def extract_datasets_conference(
         self,
         venue: str,
@@ -500,6 +536,8 @@ class Pipeline:
         refresh_titles: set[str] | None = None,
         verbose: bool = False,
         retry_failed: bool = False,
+        classify_settings=None,
+        extract_settings=None,
     ) -> dict:
         """Extract dataset records from every fetchable paper in a venue/year.
 
@@ -571,8 +609,9 @@ class Pipeline:
             from wireless_taxonomy.llm import LlmRouter as _LlmRouter
             from wireless_taxonomy.parallel import parallel_map
 
+            _cls_settings = classify_settings or self.settings.llm
             classifier = LlmCandidateClassifier(
-                self.settings.llm, router=_LlmRouter(self.settings.llm), cache=cache
+                _cls_settings, router=_LlmRouter(_cls_settings), cache=cache
             )
             # Pre-fetch and cache raw PDF bytes so Gemini receives the full
             # native PDF (tables, figures, layout intact — best extraction
@@ -727,8 +766,9 @@ class Pipeline:
             )
 
         effective_cache = None if fresh else cache
+        _ext_settings = extract_settings or self.settings.llm
         extractor = extractor or DatasetExtractor(
-            router=LlmRouter(self.settings.llm),
+            router=LlmRouter(_ext_settings),
             cache=effective_cache,
             conn=self.conn,
         )
@@ -890,7 +930,23 @@ class Pipeline:
                 d["usage_count"] = corpus_counts.get(d["name"], 1)
                 d["usage_sources"] = {"corpus": corpus_counts.get(d["name"], 1)}
 
-        self._complete_run(run_id, f"Extracted datasets for {len(results)} papers in {venue} {year}.")
+        # Re-extraction can change which datasets a paper claims; delete
+        # dataset rows that no longer have any claim referencing them so they
+        # don't linger as orphans in exports and reuse counts.
+        with transaction(self.conn):
+            orphans = self.conn.execute(
+                """
+                DELETE FROM datasets WHERE id NOT IN (
+                    SELECT DISTINCT dataset_id FROM paper_analysis_dataset_claims
+                    WHERE dataset_id IS NOT NULL
+                )
+                """
+            ).rowcount
+        if orphans:
+            print(f"  ── Cleaned up {orphans} orphaned dataset row(s) ──", file=sys.stderr)
+
+        with transaction(self.conn):
+            self._complete_run(run_id, f"Extracted datasets for {len(results)} papers in {venue} {year}.")
         total_datasets = sum(len(r["datasets"]) for r in results)
         total_dropped = sum(len(r.get("dropped") or []) for r in results)
         total_ungrounded = sum(

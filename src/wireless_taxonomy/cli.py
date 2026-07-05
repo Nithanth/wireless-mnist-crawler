@@ -1,6 +1,7 @@
 """Wireless paper classification + dataset extraction CLI.
 
-Entry point: `wireless-taxonomy` (via pyproject.toml) or
+Entry point: `wt` (via pyproject.toml). The legacy name `wireless-taxonomy`
+still works as an alias. The module can also be run as
 `python -m wireless_taxonomy.cli`.
 
 Command implementations live in `wireless_taxonomy/commands/`.
@@ -73,7 +74,10 @@ _patch_typer_click_compat()
 app = typer.Typer(
     help=(
         "Wireless MNIST Crawler — dataset extraction pipeline for wireless networking papers.\n\n"
-        "Typical workflow (or just run ./run_batch.sh):\n"
+        "Quick start:\n"
+        "  wt run --venues SIGCOMM,NSDI --years 2022:2025 --workers 6\n\n"
+        "The 'run' command orchestrates all stages in order. Individual stages\n"
+        "are also available for fine-grained control:\n"
         "  1. fetch-coverage    Resolve open-access PDF URLs for a venue/year.\n"
         "  2. extract-datasets  Classify papers + extract datasets from PDFs.\n"
         "  3. merge-results     Combine per-venue CSVs into master files.\n"
@@ -86,7 +90,7 @@ app = typer.Typer(
 )
 
 # Advanced subgroup — internal tooling, not part of the primary workflow.
-# Accessible via: wireless-taxonomy advanced <command>
+# Accessible via: wt advanced <command>
 advanced = typer.Typer(
     help="Internal tooling: cache management, DB pruning, LLM config.",
     no_args_is_help=True,
@@ -95,7 +99,7 @@ app.add_typer(advanced, name="advanced")
 
 # ── Register commands (import after app is defined to avoid circular deps) ────
 
-from wireless_taxonomy.commands import admin, cache, classify, corpus_cmd, coverage, eval, extract, merge, reconcile, report  # noqa: E402
+from wireless_taxonomy.commands import admin, cache, classify, corpus_cmd, coverage, eval, extract, merge, reconcile, report, run  # noqa: E402
 from wireless_taxonomy.commands._shared import parse_venue_years as _parse_venue_years  # noqa: F401 (re-exported for tests)
 
 # Primary workflow commands
@@ -103,6 +107,7 @@ classify.register(app)
 eval.register(app)
 coverage.register(app)
 extract.register(app)
+run.register(app)
 merge.register(app)
 reconcile.register(app)
 report.register(app)

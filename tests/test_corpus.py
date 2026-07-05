@@ -13,6 +13,20 @@ from wireless_taxonomy.corpus import (
 )
 
 
+class TestNameValidation:
+    def test_path_traversal_rejected(self, tmp_path: Path) -> None:
+        for bad in ("../evil", "a/b", "a\\b", ".hidden", " spaced", "sp ace"):
+            try:
+                Corpus(bad, tmp_path)
+                raise AssertionError(f"expected ValueError for {bad!r}")
+            except ValueError:
+                pass
+
+    def test_valid_names_accepted(self, tmp_path: Path) -> None:
+        for good in ("corpus_v1", "mobicom-2025", "a.b.c", "V2"):
+            Corpus(good, tmp_path)  # no raise
+
+
 class TestAutoNaming:
     def test_first_corpus_is_v1(self, tmp_path: Path) -> None:
         c = resolve_corpus(None, create=True, root=tmp_path)
@@ -125,6 +139,51 @@ class TestSnapshots:
         for _ in range(MAX_SNAPSHOTS + 3):
             c.snapshot()
         assert len(c.list_snapshots()) == MAX_SNAPSHOTS
+
+
+class TestAdoptLegacy:
+    def test_adopt_moves_db_and_results(self, tmp_path: Path) -> None:
+        from wireless_taxonomy.corpus import adopt_legacy
+
+        legacy_db = tmp_path / "taxonomy.sqlite"
+        legacy_db.write_text("legacy db")
+        legacy_results = tmp_path / "results"
+        legacy_results.mkdir()
+        (legacy_results / "a_datasets.csv").write_text("data")
+
+        root = tmp_path / "corpora"
+        c = adopt_legacy("wireless_v1", db_path=legacy_db,
+                         results_path=legacy_results,
+                         model_identity="google/gemini-2.5-flash", root=root)
+
+        assert c.db_path.read_text() == "legacy db"
+        assert (c.results_dir / "a_datasets.csv").read_text() == "data"
+        assert not legacy_db.exists()  # moved, not copied
+        assert c.model_identity() == "google/gemini-2.5-flash"
+        assert active_corpus(root).name == "wireless_v1"
+
+    def test_adopt_existing_corpus_fails(self, tmp_path: Path) -> None:
+        from wireless_taxonomy.corpus import adopt_legacy
+
+        root = tmp_path / "corpora"
+        resolve_corpus("wireless_v1", create=True, root=root)
+        legacy_db = tmp_path / "taxonomy.sqlite"
+        legacy_db.write_text("x")
+        try:
+            adopt_legacy("wireless_v1", db_path=legacy_db, root=root)
+            raise AssertionError("expected FileExistsError")
+        except FileExistsError:
+            pass
+
+    def test_adopt_no_legacy_db_fails(self, tmp_path: Path) -> None:
+        from wireless_taxonomy.corpus import adopt_legacy
+
+        try:
+            adopt_legacy("x", db_path=tmp_path / "missing.sqlite",
+                         root=tmp_path / "corpora")
+            raise AssertionError("expected FileNotFoundError")
+        except FileNotFoundError:
+            pass
 
 
 class TestListCorpora:

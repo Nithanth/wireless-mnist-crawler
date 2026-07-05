@@ -40,8 +40,9 @@ pip install -e ".[xlsx]"
 Run via the installed entrypoint or the module directly (used below):
 
 ```bash
-wireless-taxonomy --help
+wt --help
 PYTHONPATH=src python3 -m wireless_taxonomy.cli --help
+# The legacy name `wireless-taxonomy` is also installed as an alias.
 ```
 
 ### 1. `classify` — loop a conference and label every paper

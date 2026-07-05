@@ -19,6 +19,7 @@ def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
 
     @_adv.command("llm-config")
     def llm_config(db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
+        """Show configured LLM providers, models, and API key status."""
         settings = load_settings(db)
         typer.echo(f"Primary provider: {settings.llm.primary_provider}")
         fallbacks = ", ".join(settings.llm.fallback_providers) if settings.llm.fallback_providers else "(none)"
@@ -223,7 +224,7 @@ def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
                  "Repeat to purge multiple. All LLM cache entries whose "
                  "extracted datasets contain any of these substrings are removed.",
         ),
-        cache_file: str = typer.Option(".wt_cache.json", "--cache"),
+        cache_file: str = typer.Option(".wt_cache.json", "--cache-path", "--cache"),
         dry_run: bool = typer.Option(False, "--dry-run", help="Print what would be removed without writing."),
     ) -> None:
         """Surgically purge LLM extraction cache entries by dataset name.
@@ -237,24 +238,23 @@ def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
           purge-cache -d "MovieLens" -d "OpenWeatherMap"
           purge-cache -d "census" --dry-run
         """
-        import json
         import pathlib
+
+        from wireless_taxonomy.analyze.cache import MetadataCache
 
         path = pathlib.Path(cache_file)
         if not path.exists():
             typer.echo(f"Cache file not found: {cache_file}", err=True)
             raise typer.Exit(1)
 
-        cache_data = json.loads(path.read_text())
-        llm_cache = cache_data.get("llm", {})
+        c = MetadataCache(path)
         needles = [n.lower() for n in dataset_name]
 
-        removed = 0
-        matched_names: list[str] = []
-        for key in list(llm_cache.keys()):
+        doomed: list[tuple[str, str]] = []  # (cache_key, matched dataset name)
+        for key in list(c.llm.keys()):
             if not key.startswith("de:"):
                 continue
-            val = llm_cache[key]
+            val = c.get_llm(key)
             datasets = val.get("datasets", []) if isinstance(val, dict) else []
             hit = next(
                 (ds.get("name", "") for ds in datasets
@@ -262,24 +262,23 @@ def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
                 None,
             )
             if hit:
-                matched_names.append(hit)
-                if not dry_run:
-                    del llm_cache[key]
-                removed += 1
+                doomed.append((key, hit))
 
         if dry_run:
-            typer.echo(f"[dry-run] Would remove {removed} cache entries:")
-            for n in matched_names:
+            typer.echo(f"[dry-run] Would remove {len(doomed)} cache entries:")
+            for _, n in doomed:
                 typer.echo(f"  {n}")
         else:
-            path.write_text(json.dumps(cache_data))
-            typer.echo(f"Purged {removed} cache entries containing: {', '.join(dataset_name)}")
+            for key, _ in doomed:
+                c.delete_llm(key)
+            c.save()  # atomic write via tempfile + os.replace
+            typer.echo(f"Purged {len(doomed)} cache entries containing: {', '.join(dataset_name)}")
             typer.echo("Re-run extract-datasets for affected venues to get fresh extractions.")
 
     @app.command("fill-availability")  # primary — user-facing
     def fill_availability(
         db: str = typer.Option("taxonomy.sqlite", "--db"),
-        cache_file: str = typer.Option(".wt_cache.json", "--cache"),
+        cache_file: str = typer.Option(".wt_cache.json", "--cache-path", "--cache"),
         limit: int = typer.Option(0, "--limit", help="Max datasets to process (0 = all)."),
         dry_run: bool = typer.Option(False, "--dry-run", help="Print candidates without making LLM calls."),
         relationship: str = typer.Option(

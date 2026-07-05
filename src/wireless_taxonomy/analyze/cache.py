@@ -65,7 +65,16 @@ class MetadataCache:
         assert self.path is not None
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError) as exc:
+            # A corrupt cache silently starting empty would re-spend API
+            # credits without the user knowing — warn loudly instead.
+            import sys
+            print(
+                f"WARNING: cache file {self.path} is corrupt or unreadable "
+                f"({exc.__class__.__name__}: {exc}). Starting with an empty "
+                f"cache — previously cached results will be re-fetched.",
+                file=sys.stderr,
+            )
             return
         if isinstance(data, dict):
             abstracts = data.get("abstracts")
@@ -87,10 +96,11 @@ class MetadataCache:
     # -- abstracts -----------------------------------------------------------
 
     def get_abstract(self, title: str | None, doi: str | None) -> dict[str, str] | None:
-        for key in (_doi_key(doi), _title_key(title)):
-            if key and key in self.abstracts:
-                return self.abstracts[key]
-        return None
+        with self._lock:
+            for key in (_doi_key(doi), _title_key(title)):
+                if key and key in self.abstracts:
+                    return self.abstracts[key]
+            return None
 
     def set_abstract(self, title: str | None, doi: str | None, value: dict[str, str]) -> None:
         with self._lock:
@@ -105,8 +115,9 @@ class MetadataCache:
     # -- DOIs ----------------------------------------------------------------
 
     def get_doi(self, title: str | None) -> dict[str, str] | None:
-        key = _title_key(title)
-        return self.dois.get(key) if key else None
+        with self._lock:
+            key = _title_key(title)
+            return self.dois.get(key) if key else None
 
     def set_doi(self, title: str | None, value: dict[str, str]) -> None:
         with self._lock:
@@ -118,10 +129,11 @@ class MetadataCache:
     # -- open-access availability --------------------------------------------
 
     def get_oa(self, title: str | None, doi: str | None) -> dict[str, Any] | None:
-        for key in (_doi_key(doi), _title_key(title)):
-            if key and key in self.oa:
-                return self.oa[key]
-        return None
+        with self._lock:
+            for key in (_doi_key(doi), _title_key(title)):
+                if key and key in self.oa:
+                    return self.oa[key]
+            return None
 
     def set_oa(self, title: str | None, doi: str | None, value: dict[str, Any]) -> None:
         with self._lock:
@@ -164,7 +176,8 @@ class MetadataCache:
     # -- LLM labels ----------------------------------------------------------
 
     def get_llm(self, key: str) -> dict[str, Any] | None:  # noqa: D401
-        return self.llm.get(key) if key else None
+        with self._lock:
+            return self.llm.get(key) if key else None
 
     def set_llm(self, key: str, value: dict[str, Any]) -> None:
         with self._lock:
@@ -172,16 +185,26 @@ class MetadataCache:
                 self.llm[key] = value
                 self.dirty = True
 
+    def delete_llm(self, key: str) -> bool:
+        """Thread-safe removal of one LLM entry. Returns True if it existed."""
+        with self._lock:
+            if key in self.llm:
+                del self.llm[key]
+                self.dirty = True
+                return True
+            return False
+
     def llm_model_census(self) -> dict[str, int]:
         """Count LLM entries grouped by the model_version recorded inside them.
 
         Entries with no recorded model (legacy) count under ``unrecorded``.
         """
-        census: dict[str, int] = {}
-        for entry in self.llm.values():
-            model = str(entry.get("model_version") or "unrecorded")
-            census[model] = census.get(model, 0) + 1
-        return census
+        with self._lock:
+            census: dict[str, int] = {}
+            for entry in self.llm.values():
+                model = str(entry.get("model_version") or "unrecorded")
+                census[model] = census.get(model, 0) + 1
+            return census
 
     def gc_llm(self, keep_model: str, drop_unrecorded: bool = False) -> int:
         """Remove LLM entries whose recorded model does NOT match ``keep_model``.
@@ -256,4 +279,5 @@ class MetadataCache:
             return count
 
     def stats(self) -> dict[str, int]:
-        return {"abstracts": len(self.abstracts), "dois": len(self.dois), "llm": len(self.llm), "oa": len(self.oa), "dataset_usage": len(self.dataset_usage)}
+        with self._lock:
+            return {"abstracts": len(self.abstracts), "dois": len(self.dois), "llm": len(self.llm), "oa": len(self.oa), "dataset_usage": len(self.dataset_usage)}

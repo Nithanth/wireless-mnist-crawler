@@ -41,12 +41,20 @@ SNAPSHOTS_DIR = "snapshots"
 MAX_SNAPSHOTS = 5
 
 _AUTO_NAME_RE = re.compile(r"^corpus_v(\d+)$")
+# Corpus names become directory names — restrict to a safe charset so a name
+# like "../../etc" or "my corpus" can't traverse paths or break shell scripts.
+_VALID_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-.]*$")
 
 
 class Corpus:
     """Handle to one corpus directory with path helpers and metadata."""
 
     def __init__(self, name: str, root: Path = CORPORA_DIR) -> None:
+        if not _VALID_NAME_RE.match(name):
+            raise ValueError(
+                f"Invalid corpus name '{name}': use letters, digits, underscores, "
+                f"hyphens, and dots only (must start with a letter or digit)."
+            )
         self.name = name
         self.dir = root / name
 
@@ -83,17 +91,33 @@ class Corpus:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    def record_run(self, model_identity: str, venues_years: str) -> None:
-        """Append a run record and set the model identity if unset."""
+    def record_run(
+        self,
+        model_identity: str,
+        venues_years: str,
+        classify_model: str | None = None,
+        extract_model: str | None = None,
+    ) -> None:
+        """Append a run record and set the model identity if unset.
+
+        When per-stage models are used, ``classify_model`` and
+        ``extract_model`` record which model was used for each stage so
+        the corpus metadata is a faithful record of what built it.
+        """
         meta = self.read_meta()
         meta.setdefault("name", self.name)
         meta.setdefault("created_at", _now())
         meta.setdefault("model_identity", model_identity)
-        meta.setdefault("runs", []).append({
+        run_entry: dict = {
             "at": _now(),
             "model_identity": model_identity,
             "venues_years": venues_years,
-        })
+        }
+        if classify_model:
+            run_entry["classify_model"] = classify_model
+        if extract_model:
+            run_entry["extract_model"] = extract_model
+        meta.setdefault("runs", []).append(run_entry)
         self.write_meta(meta)
 
     def model_identity(self) -> str:
@@ -179,9 +203,18 @@ def active_corpus(root: Path = CORPORA_DIR) -> Corpus | None:
     if active_path.exists():
         name = active_path.read_text(encoding="utf-8").strip()
         if name:
-            c = Corpus(name, root)
-            if c.exists():
+            try:
+                c = Corpus(name, root)
+            except ValueError:
+                c = None
+            if c is not None and c.exists():
                 return c
+            import sys
+            print(
+                f"WARNING: {active_path} references corpus '{name}' which no "
+                f"longer exists — ignoring it. Set a valid one with: corpus use <name>",
+                file=sys.stderr,
+            )
     return None
 
 
@@ -219,6 +252,45 @@ def resolve_corpus(
     c.results_dir.mkdir(parents=True, exist_ok=True)
     c.write_meta({"name": auto, "created_at": _now()})
     set_active(auto, root)
+    return c
+
+
+def adopt_legacy(
+    name: str,
+    db_path: Path = Path("taxonomy.sqlite"),
+    results_path: Path = Path("src/results"),
+    model_identity: str = "",
+    root: Path = CORPORA_DIR,
+) -> Corpus:
+    """Adopt the legacy repo-root layout (taxonomy.sqlite + src/results/) into
+    a named corpus under corpora/<name>/.
+
+    The DB and result files are MOVED (not copied) so there is exactly one
+    source of truth afterwards.  The new corpus becomes active.  Raises
+    FileExistsError if the corpus already exists, FileNotFoundError if there
+    is no legacy DB to adopt.
+    """
+    c = Corpus(name, root)
+    if c.exists():
+        raise FileExistsError(f"Corpus '{name}' already exists — choose another name.")
+    if not db_path.exists():
+        raise FileNotFoundError(f"No legacy DB found at {db_path} — nothing to adopt.")
+
+    c.dir.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(db_path), str(c.db_path))
+
+    c.results_dir.mkdir(parents=True, exist_ok=True)
+    if results_path.is_dir():
+        for item in sorted(results_path.iterdir()):
+            shutil.move(str(item), str(c.results_dir / item.name))
+
+    c.write_meta({
+        "name": name,
+        "created_at": _now(),
+        "model_identity": model_identity,
+        "adopted_from": {"db": str(db_path), "results": str(results_path)},
+    })
+    set_active(name, root)
     return c
 
 

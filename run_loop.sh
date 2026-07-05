@@ -1,20 +1,39 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Batch extraction: fetch-coverage → extract-datasets (wireless-only) per venue/year
+# run_loop.sh — the full extraction loop for a set of conferences and years.
+#
+# Pipeline per venue/year:  fetch-coverage → extract-datasets (wireless-only)
+# Then once at the end:     merge-results → report
 #
 # Usage:
-#   ./run_batch.sh                                    # defaults: SIGCOMM,IMC,NSDI × 2022-2024
-#   ./run_batch.sh --venues "NSDI,IMC" --years "2024,2025"
-#   ./run_batch.sh --venues "MobiCom" --years "2022:2025"
-#   ./run_batch.sh --fresh                            # clear old results + LLM cache
-#   ./run_batch.sh --fresh-results                    # archive old results only
-#   ./run_batch.sh --fresh-llm                        # clear LLM cache only
-#   ./run_batch.sh --verbose                          # show per-paper classification lines
+#   ./run_loop.sh --venues "SIGCOMM,IMC,NSDI" --years 2024
+#   ./run_loop.sh --venues "NSDI,IMC" --years "2024,2025"       # comma list
+#   ./run_loop.sh --venues "MobiCom" --years "2022:2025"        # inclusive range
 #
-# The corpus is INCREMENTAL: run once for your initial set, then run again
-# with new --venues/--years to grow it. Re-run `merge-results` afterward to
-# recompute cross-corpus dataset reuse across the full union.
+# Inputs:
+#   --venues "A,B,C"    Conference names, comma-separated (default: SIGCOMM,IMC,NSDI)
+#   --years  "Y[,Y|:Y]" Years: single, comma list, or START:END range (default: 2022,2023,2024)
+#   --corpus NAME       Corpus to run inside (corpora/<NAME>/). Without this flag
+#                       the active corpus is reused, or corpus_v1 is auto-created
+#                       (legacy repo-root layout used if corpora/ doesn't exist).
+#   --workers N         Thread parallelism for PDF fetch + LLM calls (default: 6)
+#   --web-search        Enable Brave/Google-CSE PDF discovery fallback
+#   --verbose           Per-paper classification output
+#   --fresh             Archive old results AND clear LLM cache (full redo)
+#   --fresh-results     Archive old result CSVs only
+#   --fresh-llm         Clear LLM cache only (papers re-classified + re-extracted)
+#   --retry-failed      Retry PDF downloads that previously failed
+#
+# The corpus is INCREMENTAL: run once for your initial set, then run again with
+# new --venues/--years to grow it. Already-resolved papers are never re-fetched
+# or re-extracted (content-addressed cache); only new work costs anything.
+#
+# Model safety: if the corpus was built with a different LLM than currently
+# configured, the run stops with a warning before any work happens.
+#
+# A DB snapshot is taken before each run (corpora/<name>/snapshots/) —
+# roll back anytime with:  wireless-taxonomy corpus rollback <stamp>
 #
 # Logs: every run is tee'd to logs/YYYYMMDD_HHMMSS.log  (stdout + stderr).
 
@@ -175,7 +194,7 @@ done
 # Legacy mode (no corpora/ dir, no --corpus flag): repo-root layout unchanged.
 DB_PATH="taxonomy.sqlite"
 RESULTS_DIR="./src/results"
-CORPUS_FLAG=""
+CORPUS_ARGS=()
 if [[ -n "$CORPUS" || -d "corpora" ]]; then
   CORPUS_INFO=$(python - "$CORPUS" <<'CORPUS_RESOLVE'
 import sys
@@ -203,12 +222,17 @@ print(snap.name if snap else "-")
 print(warning)
 CORPUS_RESOLVE
 )
+  if [ $? -ne 0 ] || [ -z "$CORPUS_INFO" ]; then
+    echo "Corpus resolution failed (invalid name?). Aborting."
+    exit 1
+  fi
   CORPUS_NAME=$(echo "$CORPUS_INFO" | sed -n 1p)
   DB_PATH=$(echo "$CORPUS_INFO" | sed -n 2p)
   RESULTS_DIR=$(echo "$CORPUS_INFO" | sed -n 3p)
   SNAPSHOT=$(echo "$CORPUS_INFO" | sed -n 4p)
   MODEL_WARNING=$(echo "$CORPUS_INFO" | sed -n '5,$p')
-  CORPUS_FLAG="--corpus $CORPUS_NAME"
+  # Corpus names are validated (no spaces/slashes) so array expansion is safe.
+  CORPUS_ARGS=(--corpus "$CORPUS_NAME")
   echo "Corpus: $CORPUS_NAME  (db: $DB_PATH)"
   if [[ "$SNAPSHOT" != "-" ]]; then
     echo "Snapshot taken: $SNAPSHOT  (rollback with: corpus rollback <stamp>)"
@@ -216,9 +240,15 @@ CORPUS_RESOLVE
   if [[ "$MODEL_WARNING" != "-" ]]; then
     echo ""
     echo "⚠️  $MODEL_WARNING"
+    if [[ ! -t 0 ]]; then
+      # Non-interactive (CI / piped): fail safe, never mix models silently.
+      echo "Non-interactive session — aborting. Start a new corpus with:"
+      echo "  ./run_loop.sh --corpus <new-name> ..."
+      exit 1
+    fi
     read -r -p "Continue with mixed-model corpus? [y/N] " REPLY
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
-      echo "Aborted. Start a new corpus with: ./run_batch.sh --corpus <new-name> ..."
+      echo "Aborted. Start a new corpus with: ./run_loop.sh --corpus <new-name> ..."
       exit 1
     fi
   fi
@@ -327,7 +357,7 @@ for VENUE in "${VENUES[@]}"; do
       --venue "$VENUE" --years "$YEAR" \
       --oa-json "$COV_JSON" \
       --workers "$WORKERS" \
-      --out "$RESULTS_DIR" --db "$DB_PATH" --yes $CORPUS_FLAG $EXTRACT_FRESH_FLAG $RETRY_FAILED_FLAG $VERBOSE_FLAG; then
+      --out "$RESULTS_DIR" --db "$DB_PATH" --yes ${CORPUS_ARGS[@]+"${CORPUS_ARGS[@]}"} $EXTRACT_FRESH_FLAG $RETRY_FAILED_FLAG $VERBOSE_FLAG; then
       echo "  $(ts) ✗ extract-datasets FAILED for ${VENUE} ${YEAR}"
       FAILED+=("${VENUE}_${YEAR}")
       COMPLETED+=("${VENUE}_${YEAR}:FAILED")
@@ -366,7 +396,7 @@ echo ""
 # Reconciliation is intentionally run separately for the hero run — it can be
 # slow/expensive at corpus scale and is not needed after every incremental batch.
 # Run it manually when the full corpus is collected:
-#   wireless-taxonomy reconcile-datasets \
+#   wt reconcile-datasets \
 #     --csv ./src/results/master_datasets.csv \
 #     --json ./src/results/master_raw.json \
 #     --out ./src/results/reconcile_report.json

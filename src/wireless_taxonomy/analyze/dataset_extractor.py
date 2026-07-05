@@ -139,9 +139,6 @@ def abstract_dataset_tier(abstract: str) -> str:
     return "none"
 
 
-def abstract_has_dataset_signal(abstract: str) -> bool:
-    """Backwards-compatible shim — True if any tier matches."""
-    return abstract_dataset_tier(abstract) != "none"
 RELATIONSHIP_TYPES = {"introduced", "reused", "extended", "compared_against", "unclear"}
 
 

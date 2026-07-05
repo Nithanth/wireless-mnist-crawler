@@ -42,6 +42,63 @@ def parse_venue_years(entries: list[str]) -> list[tuple[str, str]]:
     return parsed
 
 
+def parse_model_override(spec: str):
+    """Parse a ``provider/model`` string into an LlmSettings override.
+
+    Only the specified provider is configured; others are left unconfigured
+    so the router uses exactly the requested model.  Raises BadParameter
+    if the format is wrong.
+
+    Example: ``google/gemini-2.0-flash`` → LlmSettings with google primary.
+    """
+    import os
+
+    from wireless_taxonomy.config import LlmSettings, ProviderConfig
+
+    parts = spec.strip().split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise typer.BadParameter(
+            f"Model override must be provider/model (e.g. google/gemini-2.0-flash), got {spec!r}."
+        )
+    provider_name, model_name = parts[0].strip().lower(), parts[1].strip()
+    valid = {"openai", "anthropic", "google"}
+    if provider_name not in valid:
+        raise typer.BadParameter(f"Provider must be one of {', '.join(sorted(valid))}, got {provider_name!r}.")
+
+    key_env_map = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "google": "GEMINI_API_KEY"}
+    key_env = key_env_map[provider_name]
+    # For google, also check GOOGLE_API_KEY
+    if provider_name == "google":
+        api_key_configured = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+    else:
+        api_key_configured = bool(os.getenv(key_env))
+
+    override = ProviderConfig(
+        provider=provider_name,  # type: ignore[arg-type]
+        model=model_name,
+        api_key_env=key_env,
+        api_key_configured=api_key_configured,
+    )
+    # Build a full LlmSettings so the router works — only the target provider
+    # is configured; the rest are stubs so the router doesn't pick them.
+    providers = {}
+    for p in valid:
+        if p == provider_name:
+            providers[p] = override
+        else:
+            providers[p] = ProviderConfig(
+                provider=p,  # type: ignore[arg-type]
+                model="",
+                api_key_env=key_env_map[p],
+                api_key_configured=False,
+            )
+    return LlmSettings(
+        primary_provider=provider_name,  # type: ignore[arg-type]
+        fallback_providers=(),
+        providers=providers,
+    )
+
+
 def pct(count: int, total: int) -> float:
     return round(100.0 * count / total, 1) if total else 0.0
 

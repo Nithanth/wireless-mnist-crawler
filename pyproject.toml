@@ -29,6 +29,8 @@ acm = [
 ]
 
 [project.scripts]
+wt = "wireless_taxonomy.cli:app"
+# Backward-compatible alias for the original long entrypoint name.
 wireless-taxonomy = "wireless_taxonomy.cli:app"
 
 [tool.setuptools.packages.find]

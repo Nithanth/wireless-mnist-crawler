@@ -21,7 +21,7 @@ def register(app: typer.Typer) -> None:
     def corpus_cmd(
         action: str = typer.Argument(
             "status",
-            help="Action: status | list | new | use | snapshots | rollback",
+            help="Action: status | list | new | use | adopt | snapshots | rollback",
         ),
         name: Optional[str] = typer.Argument(
             None,
@@ -40,12 +40,16 @@ def register(app: typer.Typer) -> None:
           list                List all corpora.
           new [name]          Create (and switch to) a new corpus.
           use <name>          Switch the active corpus.
+          adopt [name]        Migrate the legacy repo-root layout (taxonomy.sqlite
+                              + src/results/) into a named corpus. Default name:
+                              corpus_v1. One-time migration; files are moved.
           snapshots           List rollback snapshots for the active corpus.
           rollback <stamp>    Restore the active corpus DB from a snapshot.
 
         \b
         Examples:
           corpus status
+          corpus adopt wireless_v1    # migrate existing work into a corpus
           corpus new                  # creates corpus_v2 (auto-named)
           corpus new mobicom_2025     # explicit name
           corpus use corpus_v1
@@ -86,7 +90,11 @@ def register(app: typer.Typer) -> None:
                 typer.echo(f"{marker} {c.name:<20} model={model}  created={meta.get('created_at', '?')}")
 
         elif action == "new":
-            c = resolve_corpus(name or next_auto_name(), create=True)
+            try:
+                c = resolve_corpus(name or next_auto_name(), create=True)
+            except ValueError as exc:
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(1)
             set_active(c.name)
             typer.echo(f"Created and switched to corpus: {c.name}")
             typer.echo(f"  DB:      {c.db_path}")
@@ -96,12 +104,46 @@ def register(app: typer.Typer) -> None:
             if not name:
                 typer.echo("Usage: corpus use <name>", err=True)
                 raise typer.Exit(1)
-            c = Corpus(name)
+            try:
+                c = Corpus(name)
+            except ValueError as exc:
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(1)
             if not c.exists():
                 typer.echo(f"Corpus '{name}' does not exist. See: corpus list", err=True)
                 raise typer.Exit(1)
             set_active(name)
             typer.echo(f"Active corpus: {name}")
+
+        elif action == "adopt":
+            from wireless_taxonomy.corpus import adopt_legacy
+            from wireless_taxonomy.corpus import next_auto_name as _next
+
+            adopt_name = name or _next()
+            # Record the current model so the model-change guard works from day one.
+            model_identity = ""
+            try:
+                from wireless_taxonomy.config import load_settings
+                from wireless_taxonomy.llm import LlmRouter
+
+                p = LlmRouter(load_settings("taxonomy.sqlite").llm).select_provider()
+                model_identity = f"{p.provider}/{p.model}"
+            except Exception:
+                pass
+            typer.echo("This will MOVE taxonomy.sqlite and src/results/* into "
+                       f"corpora/{adopt_name}/ (one-time migration).")
+            typer.confirm("Proceed?", abort=True)
+            try:
+                c = adopt_legacy(adopt_name, model_identity=model_identity)
+            except (FileExistsError, FileNotFoundError, ValueError) as exc:
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(1)
+            typer.echo(f"Adopted legacy data into corpus: {c.name}")
+            typer.echo(f"  DB:      {c.db_path}")
+            typer.echo(f"  Results: {c.results_dir}")
+            typer.echo(f"  Model:   {model_identity or '(unknown)'}")
+            typer.echo(f"\n'{c.name}' is now the active corpus. Future runs of "
+                       "./run_loop.sh automatically use it.")
 
         elif action == "snapshots":
             c = active_corpus()
@@ -135,7 +177,7 @@ def register(app: typer.Typer) -> None:
 
         else:
             typer.echo(
-                f"Unknown action '{action}'. Use: status | list | new | use | snapshots | rollback",
+                f"Unknown action '{action}'. Use: status | list | new | use | adopt | snapshots | rollback",
                 err=True,
             )
             raise typer.Exit(1)

@@ -26,6 +26,16 @@ def register(app: typer.Typer) -> None:
         wireless_only: bool = typer.Option(True, "--wireless-only/--all-papers", help="Only extract datasets from papers classified as wireless (yes+maybe for max recall). Use --all-papers to process every paper."),
         workers: int = typer.Option(1, "--workers", min=1, max=16, help="Thread parallelism for PDF fetch + LLM stages. Results are identical to a sequential run; 4-8 is a good default for paid API tiers."),
         verbose: bool = typer.Option(False, "--verbose", help="Print one line per paper during classification (default: rolling count only)."),
+        classify_model: Optional[str] = typer.Option(
+            None, "--classify-model",
+            help="Override the LLM model for the classification stage only (e.g. google/gemini-2.0-flash). "
+                 "Format: provider/model. Cheaper models work well here.",
+        ),
+        extract_model: Optional[str] = typer.Option(
+            None, "--extract-model",
+            help="Override the LLM model for the dataset extraction stage only (e.g. google/gemini-2.5-flash). "
+                 "Format: provider/model. More capable models produce better results here.",
+        ),
         db: str = typer.Option("taxonomy.sqlite", "--db"),
         corpus: str = typer.Option(
             None, "--corpus",
@@ -59,7 +69,11 @@ def register(app: typer.Typer) -> None:
             from wireless_taxonomy.corpus import check_model_compatibility, resolve_corpus
             from wireless_taxonomy.llm import LlmRouter as _Router
 
-            corpus_obj = resolve_corpus(corpus, create=True)
+            try:
+                corpus_obj = resolve_corpus(corpus, create=True)
+            except ValueError as exc:
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(1)
             db = str(corpus_obj.db_path)
             out = str(corpus_obj.results_dir)
 
@@ -76,6 +90,11 @@ def register(app: typer.Typer) -> None:
                     raise typer.Exit(1)
             if corpus_obj is not None and current_model:
                 corpus_obj.record_run(current_model, f"{venue} {years}")
+
+        # ── Per-stage model overrides ─────────────────────────────────────
+        from wireless_taxonomy.commands._shared import parse_model_override
+        classify_settings = parse_model_override(classify_model) if classify_model else None
+        extract_settings = parse_model_override(extract_model) if extract_model else None
 
         from wireless_taxonomy.analyze.cache import MetadataCache
         metadata_cache = MetadataCache(".wt_cache.json")
@@ -100,6 +119,22 @@ def register(app: typer.Typer) -> None:
 
         all_results: list[dict] = []
         pipeline = make_pipeline(db)
+
+        # ── Prerequisite check: warn if fetch-coverage hasn't been run ────
+        for yr in year_list:
+            cov = pipeline.check_coverage_ready(venue, yr)
+            if cov["total_papers"] > 0 and not cov["ready"]:
+                typer.echo(
+                    f"\nWARNING: fetch-coverage has not been run for {venue} {yr}.\n"
+                    f"  {cov['total_papers']} papers ingested but 0 have OA/PDF resolution.\n"
+                    f"  Extraction will fall back to abstract-only (poor quality).\n"
+                    f"  Run first:  wt fetch-coverage --venue {venue} --years {yr}\n",
+                    err=True,
+                )
+                if not yes and not typer.confirm("Continue without PDF coverage?", default=False):
+                    pipeline.close()
+                    raise typer.Exit(1)
+
         try:
             for year in year_list:
                 typer.echo(f"\n[{venue} {year}] Extracting datasets...")
@@ -116,6 +151,8 @@ def register(app: typer.Typer) -> None:
                     refresh_titles=set(refresh_paper) if refresh_paper else None,
                     verbose=verbose,
                     retry_failed=retry_failed,
+                    classify_settings=classify_settings,
+                    extract_settings=extract_settings,
                 )
                 all_results.append(result)
                 typer.echo(

@@ -133,7 +133,7 @@ def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
             except Exception:
                 model_identity = ""
 
-            removed = 0
+            doomed_keys: list[str] = []
             for paper in papers:
                 artifacts = conn.execute(
                     "SELECT content_sha256 FROM paper_text_artifacts WHERE paper_id = ?",
@@ -146,10 +146,11 @@ def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
                 for h in hashes:
                     for mid in (model_identity, ""):
                         key = _extraction_cache_key(paper["id"], h, mid)
-                        if c.llm.pop(key, None) is not None:
-                            removed += 1
+                        if c.get_llm(key) is not None:
+                            doomed_keys.append(key)
             conn.close()
 
+            removed = len(doomed_keys)
             if removed == 0:
                 typer.echo(f"No cached extraction entries found for {venue} {year}.")
                 raise typer.Exit()
@@ -157,7 +158,8 @@ def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
                 f"Remove {removed} cached extraction entries for {venue} {year}? "
                 f"(next run re-extracts those papers)", abort=True,
             )
-            c.dirty = True
+            for key in doomed_keys:
+                c.delete_llm(key)
             c.save()
             typer.echo(f"Purged {removed} extraction cache entries for {venue} {year}.")
             typer.echo(f"Re-run: extract-datasets --venue {venue} --years {year}")
