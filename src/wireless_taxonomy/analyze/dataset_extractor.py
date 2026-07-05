@@ -12,8 +12,11 @@ For each paper we:
 """
 
 
+import contextlib
 import hashlib
+import io as _io
 import json
+import os
 import re
 import time
 import urllib.error
@@ -25,6 +28,120 @@ from typing import Any
 
 OSI_LAYERS = {"L1", "L2", "L3", "L4", "L5", "L6", "L7"}
 COLLECTION_ENVS = {"Physical Lab Testbed", "Real World Deployment", "Simulation"}
+
+# ── Possible-non-wireless audit signal ───────────────────────────────────────
+# The prompt tells the LLM to skip auxiliary non-wireless datasets (census,
+# weather, social media, etc.).  As a lightweight backstop we flag records
+# that look suspicious — L7-only OSI layers AND dataset name contains no
+# wireless keyword — into the per-run audit log for human review.
+# We never hard-drop on this signal: the LLM may assign L7 to entirely
+# legitimate wireless datasets (HTTP/QUIC performance, DNS, streaming QoE).
+_WIRELESS_NAME_RE = re.compile(
+    r"\b(wireless|cellular|wifi|wi-fi|5g|4g|lte|nr\b|lora|bluetooth|ble|"
+    r"satellite|spectrum|rf\b|signal|channel|network|packet|trace|throughput|"
+    r"latency|rtt|rssi|csi|snr|pcap|measurement|deployment|mmwave|radar|"
+    r"backscatter|mimo|antenna|basestation|handover|mobility)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_non_wireless(name: str, osi_layers: list[str]) -> bool:
+    """Return True if the record is suspicious: all OSI layers are L7 (or
+    none assigned) AND the dataset name contains no wireless keyword.
+    Used only for audit flagging — never for hard filtering.
+    """
+    if osi_layers and set(osi_layers) != {"L7"}:
+        return False  # has sub-L7 layers → almost certainly wireless
+    return not bool(_WIRELESS_NAME_RE.search(name))
+
+
+# ── Abstract-only extraction pre-filter ──────────────────────────────────────
+# When we only have abstract+title (no PDF), we require the abstract to contain
+# at least one dataset-indicative phrase before spending an LLM call.  This
+# blocks the dominant hallucination pattern where the model invents a dataset
+# name from generic phrases like "we evaluated using data from an operator."
+#
+# Two tiers:
+#   STRONG — explicit dataset language; almost certainly worth an LLM call.
+#   WEAK   — data collection described but no explicit name; skip unless STRONG
+#            also matches or a proper-noun dataset name is visible.
+#
+# Papers that pass neither tier get extraction_source="skipped_abstract_no_dataset"
+# and return an empty dataset list with zero LLM cost.
+# ── Tier 1: Named dataset signal ─────────────────────────────────────────────
+# The abstract explicitly names a dataset/corpus/benchmark — justifies a full
+# LLM extraction call (name + availability + metadata are all extractable).
+_ABSTRACT_NAMED_DATASET_RE = re.compile(
+    r"""
+    \b(
+        datasets?  |  corpora?  |  benchmarks?  |
+        # Data release / open access
+        publicly[\s-]available  |  openly[\s-]available  |  open[\s-]access[\s-]data  |
+        we[\s]release  |  we[\s]open.source  |
+        data[\s](?:is[\s])?available[\s]at  |  available[\s]at[\s]https?  |
+        # Explicit "the X dataset/corpus/benchmark" phrasing
+        the[\s]\w+[\s](?:dataset|corpus|benchmark|traces|measurements)  |
+        (?:evaluated?|tested?)[\s]on[\s]the[\s]\w+  |
+        using[\s]the[\s]\w+[\s](?:dataset|corpus|benchmark)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# ── Tier 2: Collection signal ─────────────────────────────────────────────────
+# The abstract describes real data collection but doesn't name a dataset.
+# Papers in this tier likely have unnamed/proprietary data — the PDF (if ever
+# available) is the right extraction source.  Skip the LLM for now; return
+# extraction_source="skipped_abstract_collection_only" so the paper is
+# retried automatically when a PDF becomes available.
+_ABSTRACT_COLLECTION_RE = re.compile(
+    r"""
+    \b(
+        measurement[\s]campaign  |  field[\s]measurement  |  field[\s]trial  |
+        field[\s]study  |  field[\s]experiment  |
+        real[\s-]world[\s](?:trace|measurement|deployment|experiment)  |
+        packet[\s]trace  |  network[\s]trace  |  traffic[\s]trace  |
+        passively[\s]collect  |  passive[\s]measurement  |  passive[\s]monitor  |
+        we[\s]collect  |  we[\s]gathered  |  we[\s]captured  |  we[\s]recorded  |
+        data[\s]collect  |  traces[\s]collect  |  logs[\s]collect  |
+        we[\s]fabricate  |  (?:is[\s])?prototype[d]?  |  we[\s]prototype  |
+        validate[\s].*(?:via|through|using)[\s].*experiment  |
+        annotation[\s]of[\s]data  |  annotated[\s]data  |  labeled[\s]data  |
+        testbed  |  test-bed  |
+        channel[\s]measurement  |  channel[\s]sounding  |
+        rf[\s]measurement  |  spectrum[\s]measurement  |
+        city[\s-]scale[\s]measurement  |  large[\s-]scale[\s]measurement  |
+        (?:million|thousand)[\s]users  |
+        design[,\s]+implementation[,\s]+and[\s]evaluation
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def abstract_dataset_tier(abstract: str) -> str:
+    """Classify the abstract into one of three tiers:
+
+    - ``"named"``      — explicit dataset name present → full LLM extraction
+    - ``"collection"`` — describes data collection but no dataset name →
+                         skip LLM (retry when PDF available)
+    - ``"none"``       — no data signal at all → skip
+
+    The distinction prevents the model from inventing dataset names for papers
+    that only say "we evaluated using data from an operator" (no public name).
+    """
+    if not abstract:
+        return "none"
+    if _ABSTRACT_NAMED_DATASET_RE.search(abstract):
+        return "named"
+    if _ABSTRACT_COLLECTION_RE.search(abstract):
+        return "collection"
+    return "none"
+
+
+def abstract_has_dataset_signal(abstract: str) -> bool:
+    """Backwards-compatible shim — True if any tier matches."""
+    return abstract_dataset_tier(abstract) != "none"
 RELATIONSHIP_TYPES = {"introduced", "reused", "extended", "compared_against", "unclear"}
 
 
@@ -93,6 +210,27 @@ def _title_words_in_text(title: str, text: str, threshold: float = 0.6) -> bool:
     return hits / len(title_words) >= threshold
 
 
+@contextlib.contextmanager
+def _quiet_pypdf():
+    """Suppress pypdf's chatty stderr warnings about malformed PDFs.
+
+    pypdf writes directly to stderr (not via Python's warnings module) when it
+    encounters common PDF quirks from IEEE/ACM submission systems — duplicate
+    font tables, wrong cross-reference offsets, etc.  The warnings are harmless;
+    pypdf still extracts text correctly.  We redirect stderr to /dev/null only
+    for the duration of PdfReader construction so the pipeline output stays clean.
+    """
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_fd = os.dup(2)  # save real stderr fd
+    try:
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        os.dup2(saved_fd, 2)  # restore stderr
+        os.close(saved_fd)
+        os.close(devnull_fd)
+
+
 def _pdf_matches_title(pdf_bytes: bytes, expected_title: str) -> bool:
     """Verify fetched PDF is the expected paper by checking its first pages.
 
@@ -101,12 +239,11 @@ def _pdf_matches_title(pdf_bytes: bytes, expected_title: str) -> bool:
     pass, since a false rejection loses full text for the whole paper.
     """
     try:
-        import io
-
         from pypdf import PdfReader
 
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        text = " ".join((page.extract_text() or "") for page in reader.pages[:2])
+        with _quiet_pypdf():
+            reader = PdfReader(_io.BytesIO(pdf_bytes))
+            text = " ".join((page.extract_text() or "") for page in reader.pages[:2])
     except Exception:
         return True
     if len(text.strip()) < 200:
@@ -129,20 +266,53 @@ def _fetch_pdf_bytes(
     """Download a PDF and return raw bytes for native LLM attachment.
 
     Robustness guarantees:
+    - rewrites known landing-page URLs (HAL, etc.) to direct PDF links;
     - retries transient network errors with backoff;
     - rejects files larger than ``max_bytes`` instead of returning silently
       truncated (corrupt) bytes;
     - when ``expected_title`` is given, rejects PDFs whose first pages don't
       contain the title (wrong-paper guard for title-search OA providers).
+    - hard wall-clock deadline of 30s total per attempt — prevents silent stalls
+      where a server accepts the TCP connection but never (or very slowly) sends
+      data, which defeats socket-level timeouts.
     """
+    # Rewrite landing-page URLs to direct PDF links where possible.
+    pdf_url = _rewrite_landing_page_url(pdf_url) or ""
+    if not pdf_url:
+        return None
+
+    # Wall-clock deadline per attempt — prevents silent stalls where a server
+    # accepts the TCP connection but never (or very slowly) sends data, which
+    # defeats socket-level timeouts.  Uses a daemon thread + Future so it works
+    # correctly from both the main thread and worker threads (SIGALRM is
+    # main-thread-only and would silently break parallel prefetch workers).
+    import concurrent.futures as _cf
+
+    _TOTAL_TIMEOUT = 30  # seconds per attempt
+
+    def _do_download(url: str, mb: int) -> bytes:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": _BROWSER_UA, "Accept": "application/pdf,*/*"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.read(mb + 1)
+
     for attempt in range(attempts):
         try:
-            req = urllib.request.Request(
-                pdf_url,
-                headers={"User-Agent": _BROWSER_UA, "Accept": "application/pdf,*/*"},
-            )
-            with urllib.request.urlopen(req, timeout=25) as r:
-                raw = r.read(max_bytes + 1)
+            # Do NOT use the executor as a context manager — its __exit__
+            # blocks until all submitted threads finish, so a hung r.read()
+            # would make the timeout meaningless.  Instead use a module-level
+            # executor and just abandon the future; the daemon thread will
+            # eventually die on its own (or when the process exits).
+            _ex = _cf.ThreadPoolExecutor(max_workers=1)
+            fut = _ex.submit(_do_download, pdf_url, max_bytes)
+            _ex.shutdown(wait=False)  # don't block; let daemon thread run free
+            try:
+                raw = fut.result(timeout=_TOTAL_TIMEOUT)
+            except _cf.TimeoutError:
+                fut.cancel()
+                raise TimeoutError("PDF download timed out")
         except urllib.error.HTTPError as exc:
             if exc.code in (408, 429, 500, 502, 503, 504) and attempt < attempts - 1:
                 time.sleep(1.5 * (2 ** attempt))
@@ -189,7 +359,53 @@ def _is_acm_blocked(url: str) -> bool:
     downloads. Treating them as blocked avoids wasting time fetching HTML
     landing pages and keeps the extraction_source honest.
     """
-    return "dl.acm.org" in url or "doi.org/10.1145" in url
+    return (
+        "dl.acm.org" in url
+        or "doi.org/10.1145" in url
+        or "doi.org/10.1109/" in url
+        or "ieeexplore.ieee.org" in url
+    )
+
+
+def _rewrite_landing_page_url(url: str) -> str | None:
+    """Attempt to convert a known landing-page URL to a direct PDF URL.
+
+    Several OA providers store record/landing page URLs rather than direct
+    PDF links. This function recognises the patterns and rewrites them.
+    Returns the rewritten URL, or None if the URL should be skipped entirely
+    (e.g. IEEE paywalled DOIs).
+
+    Patterns handled:
+    - hal.science/hal-XXXXX           → hal.science/hal-XXXXX/document
+      (HAL serves the PDF when Accept: application/pdf is sent; the /document
+      path also triggers content-negotiation more reliably)
+    - *.handle.net/handle/...         → try /bitstream/... discovery via HTML
+      DSpace handles are landing pages; we skip them (too complex to reliably
+      extract bitstream URLs without scraping).
+    - figshare.com/articles/*/NNN     → figshare API download URL
+    - doi.org/10.1109/...             → ieeexplore.ieee.org (paywalled) → skip
+    - doi.org/10.1145/...             → already caught by _is_acm_blocked
+    """
+    import re as _re
+    # HAL: https://hal.science/hal-XXXXXXX  (no extension → landing page)
+    hal_m = _re.match(r"^(https://hal\.science/hal-\d+)/?$", url)
+    if hal_m:
+        return hal_m.group(1) + "/document"
+    # HAL archives-ouvertes.fr (legacy)
+    hal_old = _re.match(r"^(https://(?:hal|tel|halshs|medihal)\.archives-ouvertes\.fr/[^/]+)/?$", url)
+    if hal_old:
+        return hal_old.group(1) + "/document"
+    # doi.org resolving to IEEE (paywalled) — skip
+    if "doi.org/10.1109/" in url or "ieeexplore.ieee.org" in url:
+        return None
+    # Handle.net resolver and DSpace repos — always serve HTML landing pages
+    # and are extremely slow; no reliable way to extract the bitstream URL
+    # without scraping. Skip entirely to avoid 90s stall per paper.
+    if "handle.net" in url or "/handle/" in url:
+        return None
+    # Bare doi.org links (not ACM/IEEE) — let the downloader try; it may
+    # redirect to an open repo.  Return unchanged.
+    return url
 
 
 def _fetch_crossref_bibtex(doi: str, attempts: int = 3) -> str | None:
@@ -246,6 +462,56 @@ def load_cached_pdf(conn, paper_id: int, pdf_url: str) -> bytes | None:
     return None
 
 
+def load_cached_pdf_text(conn, paper_id: int, pdf_url: str) -> str | None:
+    """Return pre-extracted PDF text from paper_text_artifacts if cached.
+
+    Cheaper than load_cached_pdf: stores plain text (~50KB) instead of
+    base64-encoded PDF bytes (~10MB), and avoids a second pypdf extraction
+    pass at classification/extraction time.
+    """
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT content_text, source_type FROM paper_text_artifacts "
+            "WHERE paper_id = ? AND source_url = ? AND fetch_status = 'ok' LIMIT 1",
+            (paper_id, pdf_url),
+        ).fetchone()
+        if row and row["content_text"] and row["source_type"] == "pdf_text":
+            return row["content_text"]
+    except Exception:
+        pass
+    return None
+
+
+def store_cached_pdf_text(conn, paper_id: int, pdf_url: str, pdf_text: str) -> None:
+    """Persist pre-extracted PDF plain text into paper_text_artifacts.
+
+    Preferred over store_cached_pdf for the prefetch stage: stores ~50KB of
+    text instead of ~10MB of base64 bytes, and makes re-runs instant because
+    text is ready without re-downloading or re-extracting the PDF.
+    """
+    if conn is None:
+        return
+    if not pdf_text or not pdf_text.strip():
+        return
+    try:
+        sha = hashlib.sha256(pdf_text.encode("utf-8", errors="replace")).hexdigest()
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO paper_text_artifacts
+              (paper_id, source_type, source_url, fetch_status,
+               content_text, content_sha256, fetched_at, created_at)
+            VALUES (?, 'pdf_text', ?, 'ok', ?, ?, ?, ?)
+            """,
+            (paper_id, pdf_url, pdf_text, sha, now, now),
+        )
+    except Exception as exc:
+        import sys
+        print(f"  [!] failed to cache PDF text for paper {paper_id}: {exc}", file=sys.stderr)
+
+
 def store_cached_pdf(conn, paper_id: int, pdf_url: str, pdf_bytes: bytes) -> None:
     """Persist raw PDF bytes into paper_text_artifacts as base64 for lossless round-trip."""
     if conn is None:
@@ -267,6 +533,68 @@ def store_cached_pdf(conn, paper_id: int, pdf_url: str, pdf_bytes: bytes) -> Non
     except Exception as exc:
         import sys
         print(f"  [!] failed to cache PDF for paper {paper_id}: {exc}", file=sys.stderr)
+
+
+def store_cached_pdf_failure(conn, paper_id: int, pdf_url: str, error_message: str = "") -> None:
+    """Record a download failure in paper_text_artifacts (fetch_status='failed').
+
+    On re-runs, papers with a recorded failure are skipped automatically unless
+    --retry-failed is passed. This means a fixed download bug can be surfaced
+    selectively without re-attempting every paper in the corpus.
+    """
+    if conn is None:
+        return
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO paper_text_artifacts
+              (paper_id, source_type, source_url, fetch_status,
+               content_text, content_sha256, error_message, fetched_at, created_at)
+            VALUES (?, 'pdf_b64', ?, 'failed', '', '', ?, ?, ?)
+            """,
+            (paper_id, pdf_url, error_message[:500], now, now),
+        )
+    except Exception as exc:
+        import sys
+        print(f"  [!] failed to record PDF failure for paper {paper_id}: {exc}", file=sys.stderr)
+
+
+def load_cached_pdf_failed(conn, paper_id: int, pdf_url: str) -> bool:
+    """Return True if a previous download attempt for this paper+url was recorded as failed.
+
+    Used by the prefetch stage to skip known-bad URLs unless --retry-failed
+    clears the failure record first.
+    """
+    if conn is None:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM paper_text_artifacts "
+            "WHERE paper_id = ? AND source_url = ? AND fetch_status = 'failed' LIMIT 1",
+            (paper_id, pdf_url),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
+def clear_cached_pdf_failures(conn, paper_id: int, pdf_url: str) -> None:
+    """Remove failure records for a paper+url so the next prefetch retries it.
+
+    Called when --retry-failed is passed, scoped to papers whose download
+    previously failed. Does not touch successful downloads or OA resolution.
+    """
+    if conn is None:
+        return
+    try:
+        conn.execute(
+            "DELETE FROM paper_text_artifacts WHERE paper_id = ? AND source_url = ? AND fetch_status = 'failed'",
+            (paper_id, pdf_url),
+        )
+    except Exception as exc:
+        import sys
+        print(f"  [!] failed to clear PDF failure for paper {paper_id}: {exc}", file=sys.stderr)
 
 
 def _make_bibtex_key(authors: str, year: int, title: str) -> str:
@@ -331,7 +659,20 @@ Extract TWO kinds of datasets:
     The name should be generic enough that another paper referencing the same
     data would plausibly use the same or very similar name.
 
-DO NOT extract:
+ONLY extract datasets that measure wireless or networking phenomena directly:
+- RF/signal measurements (RSSI, SNR, CSI, spectrum, channel impulse response, IQ samples)
+- Network performance traces (throughput, latency, packet loss, RTT, PCAP)
+- Cellular/WiFi/satellite/IoT protocol data (RRC, NAS, LTE, 5G NR, LoRa logs)
+- Wireless system deployment data (base station locations, coverage maps, link budgets)
+- Sensor network or IoT measurement traces (when the sensing medium is wireless)
+
+DO NOT extract auxiliary/contextual datasets the paper uses as inputs but which
+do not measure wireless phenomena — even if used by a wireless paper:
+- Demographic, census, population, or socioeconomic data
+- Weather, climate, or environmental data (temperature, rain, wind)
+- Social media, news, or text corpora
+- Geographic/map data not specifically measuring wireless coverage
+- Financial, economic, or government administrative data
 - Generic ML benchmarks (ImageNet, MNIST, CIFAR) unless applied to wireless data
 - Software tools, simulators, or libraries (ns-3, MATLAB, PyTorch)
 - Synthetic data generated on-the-fly without a persistent shareable artifact
@@ -412,10 +753,18 @@ Return ONLY valid JSON — no markdown, no explanation outside the JSON.
 def _extraction_cache_key(paper_id: int, text_hash: str, model_identity: str = "") -> str:
     """Content-addressed extraction key, scoped to the model that produced it.
 
-    ``model_identity`` ties the cached extraction to the provider/model chain,
-    so switching models re-runs extraction (clean A/B experiments) instead of
-    silently serving another model's output. Passing "" yields the legacy v1
-    key, kept for cache migration of pre-model-scoped entries.
+    Two components ensure cache correctness:
+    - ``text_hash``      — the paper content (PDF bytes or abstract text)
+    - ``model_identity`` — provider/model chain; switching models forces
+      a fresh extraction rather than serving a different model's output.
+
+    Prompt changes do NOT automatically invalidate the cache — this is
+    intentional.  Wholesale prompt invalidation would re-extract every
+    paper ($1-3+ per prompt edit).  Instead, use the admin purge-cache
+    command to surgically clear entries containing specific dataset names
+    when a prompt change is known to affect a small subset of papers.
+
+    Passing model_identity="" yields the legacy v1 key for cache migration.
     """
     if model_identity:
         digest = hashlib.sha256(
@@ -459,15 +808,18 @@ class DatasetExtractor:
         pdf_url: str | None,
         abstract: str | None,
         pdf_bytes: bytes | None = None,
+        pdf_text: str | None = None,
         refresh: bool = False,
     ) -> DatasetExtractionResult:
         """Extract dataset records for one paper.
 
         ``pdf_bytes`` may be supplied by the caller (e.g. pre-fetched by the
-        pipeline) — this skips the internal SQLite/network fetch, which lets
-        ``extract`` run safely in a worker thread without touching the DB
-        connection. ``refresh`` skips the cache read (but still writes the
-        fresh result), forcing re-extraction of this one paper.
+        pipeline) to send the PDF natively to the LLM (best quality — tables
+        and figures are preserved).  ``pdf_text`` may be supplied instead when
+        only pre-extracted plain text is available (good quality — prose and
+        captions intact, but tables/figures lost).  If neither is provided the
+        extractor falls back to the DB cache, then the network, then abstract.
+        ``refresh`` skips the cache read (but still writes the fresh result).
         """
         from wireless_taxonomy.llm import LlmRequest
 
@@ -483,38 +835,86 @@ class DatasetExtractor:
 
         if pdf_bytes:
             extraction_source = "pdf"
+        elif pdf_text:
+            # Pre-extracted plain text — good quality but no tables/figures.
+            extraction_source = "pdf_text"
         elif pdf_url and not _is_acm_blocked(pdf_url):
-            # Check DB text cache before hitting the network
+            # Check DB cache before hitting the network — prefer raw bytes
+            # (native LLM attachment) but accept pre-extracted text if that's
+            # what was stored during prefetch.
             pdf_bytes = self._load_cached_pdf(paper_id, pdf_url)
             if not pdf_bytes:
+                pdf_text = self._load_cached_pdf_text(paper_id, pdf_url)
+            if not pdf_bytes and not pdf_text:
                 pdf_bytes = _fetch_pdf_bytes(pdf_url, expected_title=title)
                 if pdf_bytes:
                     self._store_cached_pdf(paper_id, pdf_url, pdf_bytes)
             if pdf_bytes:
                 extraction_source = "pdf"
+            elif pdf_text:
+                extraction_source = "pdf_text"
 
-        if not pdf_bytes and not (abstract or "").strip():
-            # Neither full text nor abstract: extraction would be pure guesswork
-            # (hallucination) and a wasted LLM call. Return an empty result.
+        if not pdf_bytes and not pdf_text and not (abstract or "").strip():
+            # No full text and no abstract: extraction would be pure guesswork.
             return DatasetExtractionResult(
                 paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
                 doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
                 datasets=[], extraction_source="skipped_no_text",
             )
 
-        if not pdf_bytes:
+        if not pdf_bytes and not pdf_text:
+            # ── Abstract-only two-tier pre-filter ─────────────────────────
+            # Tier "none": no dataset language at all → skip, no LLM call.
+            # Tier "collection": describes data collection but no named
+            #   dataset → the data is private/unnamed; skip and wait for PDF.
+            # Tier "named": abstract explicitly names a dataset/corpus →
+            #   proceed with a strict LLM call (name + availability only).
+            #
+            # This eliminates hallucinated dataset names for papers that only
+            # say "we evaluated using data from an operator" — the dominant
+            # source of fabricated entries in abstract-only extraction.
+            tier = abstract_dataset_tier(abstract or "")
+            if tier == "none":
+                return DatasetExtractionResult(
+                    paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
+                    doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
+                    datasets=[], extraction_source="skipped_abstract_no_dataset",
+                )
+            if tier == "collection":
+                # Data collection is described but no dataset is named.
+                # Skip the LLM — unnamed/proprietary data cannot be reliably
+                # extracted from an abstract without inventing a name.
+                # The paper will be retried automatically if a PDF becomes available.
+                return DatasetExtractionResult(
+                    paper_id=paper_id, title=title, authors=authors, venue=venue, year=year,
+                    doi=doi, bibtex_key=bibtex_key, bibtex=bibtex,
+                    datasets=[], extraction_source="skipped_abstract_collection_only",
+                )
+            # tier == "named": abstract explicitly names a dataset.
             extraction_source = "abstract"
             text_section = (
                 f"\nPaper text (abstract only — full text unavailable):\n---\n{abstract[:8000]}\n---\n"
-                "\nSTRICT ABSTRACT MODE: you only have the abstract, not the paper. "
-                "Extract a dataset ONLY if the abstract EXPLICITLY describes it — a named "
-                "dataset, or a clearly stated data collection with concrete specifics "
-                "(what was measured, where/how). Papers of this type usually use data, but "
-                "you must NOT infer or invent datasets the paper 'probably' has: if the "
-                'abstract does not explicitly describe one, return {"datasets": []}.\n'
+                "\nSTRICT ABSTRACT MODE: you only have the abstract, not the full paper.\n"
+                "Rules:\n"
+                "1. Extract a dataset ONLY if the abstract contains its EXPLICIT NAME — "
+                "a proper noun like 'DeepSense 6G', 'MNIST', 'Ookla Speedtest', etc.\n"
+                "2. If the abstract only says 'we collected data', 'we measured', or "
+                "'we used data from an operator/provider' WITHOUT naming the dataset, "
+                "return {\"datasets\": []}. Do NOT invent a name.\n"
+                "3. Do NOT infer datasets from paper topic or domain knowledge. Only "
+                "extract what is explicitly named in the abstract text above.\n"
+                "4. For each named dataset: fill in availability (Y/N + URL if stated). "
+                "Leave OSI layers, modalities, and collection environment blank — they "
+                "will be filled from the full PDF if available.\n"
+                "5. If in doubt, return {\"datasets\": []}.\n"
             )
+        elif pdf_text and not pdf_bytes:
+            # Pre-extracted text: prose and captions intact; tables/figures lost.
+            text_section = f"\nPaper text (extracted from PDF):\n---\n{pdf_text[:120_000]}\n---\n"
 
-        content_hash = hashlib.sha256((pdf_bytes or (abstract or title).encode())).hexdigest()[:16]
+        content_hash = hashlib.sha256(
+            pdf_bytes or (pdf_text or abstract or title).encode()
+        ).hexdigest()[:16]
         model_identity = self._model_identity()
         cache_key = _extraction_cache_key(paper_id, content_hash, model_identity)
 
@@ -623,12 +1023,12 @@ class DatasetExtractor:
         source_text_for_grounding = ""
         if pdf_bytes:
             try:
-                import io
                 from pypdf import PdfReader
-                reader = PdfReader(io.BytesIO(pdf_bytes))
-                source_text_for_grounding = " ".join(
-                    (page.extract_text() or "") for page in reader.pages[:15]
-                )[:60000]
+                with _quiet_pypdf():
+                    reader = PdfReader(_io.BytesIO(pdf_bytes))
+                    source_text_for_grounding = " ".join(
+                        (page.extract_text() or "") for page in reader.pages[:15]
+                    )[:60000]
             except Exception:
                 pass
         if not source_text_for_grounding and abstract:
@@ -710,6 +1110,9 @@ class DatasetExtractor:
 
     def _load_cached_pdf(self, paper_id: int, pdf_url: str) -> bytes | None:
         return load_cached_pdf(self.conn, paper_id, pdf_url)
+
+    def _load_cached_pdf_text(self, paper_id: int, pdf_url: str) -> str | None:
+        return load_cached_pdf_text(self.conn, paper_id, pdf_url)
 
     def _store_cached_pdf(self, paper_id: int, pdf_url: str, pdf_bytes: bytes) -> None:
         store_cached_pdf(self.conn, paper_id, pdf_url, pdf_bytes)
@@ -929,6 +1332,20 @@ def _parse_dataset_records(raw: list[Any]) -> tuple[list[DatasetRecord], list[Dr
             env = "Real World Deployment"
         known_users = [str(u).strip() for u in (item.get("known_users") or []) if str(u).strip()][:5]
         evidence = str(item.get("evidence_text") or "").strip()
+
+        # Audit flag for possible non-wireless auxiliary datasets.
+        # The prompt instructs the LLM to skip these, but as a lightweight
+        # backstop we tag suspicious records for human review.  We never
+        # hard-drop here — a downstream human reviews the audit log.
+        if _looks_non_wireless(name, osi):
+            dropped.append(DroppedRecord(
+                name=name, reason="possible_non_wireless", raw={**item, "_note": (
+                    "L7-only OSI layers and no wireless keyword in dataset name. "
+                    "Review audit log to confirm or discard."
+                )},
+            ))
+            # Fall through — record is still accepted; audit entry is advisory only.
+
         records.append(DatasetRecord(
             name=name, relationship_type=rel, modalities=modalities, osi_layers=osi,
             availability=availability, availability_notes=avail_notes,

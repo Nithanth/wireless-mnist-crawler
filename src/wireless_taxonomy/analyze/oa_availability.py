@@ -39,6 +39,14 @@ def _is_acm_blocked(url: str) -> bool:
 # repository/preprint, bronze = free-to-read on the publisher site w/o a license).
 _OA_STATUSES = {"gold", "green", "hybrid", "bronze", "diamond"}
 
+# Per-paper TTL for cached negative ("closed") verdicts. Positive results are
+# cached indefinitely (a found PDF URL stays found); negatives are retried
+# after this many days in case the paper has since appeared in an OA repo or
+# become findable via web search. This is what makes coverage per-paper
+# monotonic: each re-run only spends network/API budget on papers whose
+# negative verdict has gone stale.
+_OA_NEGATIVE_TTL_DAYS = float(os.getenv("WIRELESS_TAXONOMY_OA_NEGATIVE_TTL_DAYS", "14"))
+
 
 @dataclass(frozen=True)
 class OaResult:
@@ -87,7 +95,12 @@ class OpenAccessResolver:
         self.fetch_json = fetch_json or _default_fetch_json
         self.fetch_text = fetch_text or _default_fetch_text
         self.cache = cache
-        self._mailto = (os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip()
+        self._mailto = (
+            os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL")
+            or os.getenv("WIRELESS_TAXONOMY_UNPAYWALL_EMAIL")
+            or os.getenv("UNPAYWALL_EMAIL")
+            or ""
+        ).strip()
         self._cse_key = (os.getenv("GOOGLE_CSE_API_KEY") or "").strip()
         self._cse_id = (os.getenv("GOOGLE_CSE_ID") or "").strip()
         self._core_key = (os.getenv("CORE_API_KEY") or "").strip()
@@ -128,19 +141,38 @@ class OpenAccessResolver:
         if self.cache is not None:
             cached = self.cache.get_oa(title, doi)
             if cached is not None:
-                # A cached "closed" verdict is stale if web search is now
-                # enabled and either (a) it was never web-searched, or (b) it
-                # was searched with a different provider set (e.g. the old
-                # Gemini grounding) — re-resolve so the new providers get a
-                # chance at papers the old search missed.
-                stale_closed = (
-                    has_web_search
-                    and not cached.get("fetchable")
-                    and (
-                        not cached.get("web_search_attempted")
-                        or cached.get("web_search_providers", []) != ws_providers
-                    )
-                )
+                # Positive verdicts (a found PDF URL) are cached indefinitely.
+                # Negative ("closed") verdicts go stale and get retried when:
+                #   1. web search is enabled now but wasn't attempted before
+                #      (or was attempted with a different provider set), OR
+                #   2. the verdict is older than _OA_NEGATIVE_TTL_DAYS —
+                #      papers appear on arXiv/repos over time, so stale
+                #      negatives deserve a fresh pass through the waterfall.
+                # Legacy entries without searched_at are honoured as fresh to
+                # avoid re-searching the entire cache on first upgrade.
+                stale_closed = False
+                if not cached.get("fetchable"):
+                    import time as _time
+                    searched_at = cached.get("searched_at")
+                    if searched_at is None:
+                        # Legacy entry — predates the timestamp field. We don't
+                        # know its age. Honour it unconditionally: these entries
+                        # already went through the free waterfall and came back
+                        # closed. Re-searching them with Brave every run wastes
+                        # paid quota on papers almost certainly still closed.
+                        # The TTL clock will start the next time this entry is
+                        # naturally re-written (e.g. provider set changes).
+                        stale_closed = False
+                    else:
+                        expired = (_time.time() - searched_at) / 86400 > _OA_NEGATIVE_TTL_DAYS
+                        if has_web_search:
+                            already_web_searched = (
+                                cached.get("web_search_attempted")
+                                and cached.get("web_search_providers", []) == ws_providers
+                            )
+                            stale_closed = expired or not already_web_searched
+                        else:
+                            stale_closed = expired
                 if not stale_closed:
                     return OaResult(
                         bool(cached.get("fetchable")),
@@ -186,6 +218,7 @@ class OpenAccessResolver:
                 if "dl.acm.org" not in (found.pdf_url or ""):
                     break
         if self.cache is not None:
+            import time as _time
             self.cache.set_oa(
                 title,
                 doi,
@@ -198,6 +231,10 @@ class OpenAccessResolver:
                     "source_url": result.source_url,
                     "web_search_attempted": web_search_attempted,
                     "web_search_providers": ws_providers if web_search_attempted else [],
+                    # Timestamp for negative-result TTL — lets us skip re-searching
+                    # papers already confirmed closed with the current provider set,
+                    # avoiding wasted Brave/CSE queries on re-runs.
+                    "searched_at": _time.time(),
                 },
             )
         return result

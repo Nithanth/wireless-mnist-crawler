@@ -10,10 +10,13 @@ set -uo pipefail
 #   ./run_batch.sh --fresh                            # clear old results + LLM cache
 #   ./run_batch.sh --fresh-results                    # archive old results only
 #   ./run_batch.sh --fresh-llm                        # clear LLM cache only
+#   ./run_batch.sh --verbose                          # show per-paper classification lines
 #
 # The corpus is INCREMENTAL: run once for your initial set, then run again
 # with new --venues/--years to grow it. Re-run `merge-results` afterward to
 # recompute cross-corpus dataset reuse across the full union.
+#
+# Logs: every run is tee'd to logs/YYYYMMDD_HHMMSS.log  (stdout + stderr).
 
 # Prevent macOS from sleeping while this script runs (display + idle + disk + system).
 # caffeinate is killed automatically when this script exits.
@@ -24,6 +27,18 @@ fi
 # Activate the project venv (package is pip-installed in editable mode).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/.venv/bin/activate"
+
+# ── Logging setup ─────────────────────────────────────────────────────────────
+# Tee everything (stdout + stderr) to a timestamped log file so you can inspect
+# a completed or failed run without relying on scrollback.
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/$(date '+%Y%m%d_%H%M%S').log"
+# Redirect both stdout and stderr through tee into the log file, preserving
+# terminal output in real time.
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "Logging to: $LOG_FILE"
+echo ""
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
 # Verify required API keys and configuration before starting a potentially
@@ -76,8 +91,10 @@ else:
 
 print()
 print("  PDF / OA retrieval")
-check("UNPAYWALL_EMAIL",
-      os.getenv("UNPAYWALL_EMAIL") or os.getenv("WIRELESS_TAXONOMY_UNPAYWALL_EMAIL"),
+check("Unpaywall email (any alias)",
+      os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL")
+      or os.getenv("WIRELESS_TAXONOMY_UNPAYWALL_EMAIL")
+      or os.getenv("UNPAYWALL_EMAIL"),
       required=True, note="required for Unpaywall OA lookup")
 check("BRAVE_SEARCH_API_KEY",
       os.getenv("BRAVE_SEARCH_API_KEY"),
@@ -126,24 +143,87 @@ YEARS_STR="2022,2023,2024"
 FRESH_RESULTS=false
 FRESH_LLM=false
 EXTRACT_FRESH_FLAG=""
+RETRY_FAILED_FLAG=""
 WORKERS=6
 WEB_SEARCH_FLAG=""
+VERBOSE_FLAG=""
+CORPUS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --venues)        VENUES_STR="$2"; shift 2 ;;
     --years)         YEARS_STR="$2"; shift 2 ;;
     --workers)       WORKERS="$2"; shift 2 ;;
+    --corpus)        CORPUS="$2"; shift 2 ;;
     --web-search)    WEB_SEARCH_FLAG="--web-search"; shift ;;
+    --verbose)       VERBOSE_FLAG="--verbose"; shift ;;
     --fresh)         FRESH_RESULTS=true; FRESH_LLM=true; shift ;;
     --fresh-results) FRESH_RESULTS=true; shift ;;
     --fresh-llm)     FRESH_LLM=true; shift ;;
+    --retry-failed)  RETRY_FAILED_FLAG="--retry-failed"; shift ;;
     *)
       echo "Unknown flag: $1"
-      echo "Usage: $0 [--venues \"NSDI,IMC\"] [--years \"2022:2025\"] [--workers N] [--web-search] [--fresh | --fresh-results | --fresh-llm]"
+      echo "Usage: $0 [--venues \"NSDI,IMC\"] [--years \"2022:2025\"] [--corpus NAME] [--workers N] [--web-search] [--fresh | --fresh-results | --fresh-llm] [--retry-failed]"
       exit 1 ;;
   esac
 done
+
+# ── Corpus resolution ────────────────────────────────────────────────────────
+# If corpora/ exists (or --corpus was given), operate inside a versioned
+# corpus directory: corpora/<name>/{taxonomy.sqlite, results/, snapshots/}.
+# Without --corpus the active corpus is reused (or corpus_v1 auto-created).
+# Legacy mode (no corpora/ dir, no --corpus flag): repo-root layout unchanged.
+DB_PATH="taxonomy.sqlite"
+RESULTS_DIR="./src/results"
+CORPUS_FLAG=""
+if [[ -n "$CORPUS" || -d "corpora" ]]; then
+  CORPUS_INFO=$(python - "$CORPUS" <<'CORPUS_RESOLVE'
+import sys
+from wireless_taxonomy.corpus import check_model_compatibility, resolve_corpus
+
+name = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
+c = resolve_corpus(name, create=True)
+snap = c.snapshot()
+
+# Model compatibility check — happens ONCE here at batch start.
+current_model = ""
+try:
+    from wireless_taxonomy.config import load_settings
+    from wireless_taxonomy.llm import LlmRouter
+    p = LlmRouter(load_settings(str(c.db_path)).llm).select_provider()
+    current_model = f"{p.provider}/{p.model}"
+except Exception:
+    pass
+warning = check_model_compatibility(c, current_model) or "-"
+
+print(c.name)
+print(c.db_path)
+print(c.results_dir)
+print(snap.name if snap else "-")
+print(warning)
+CORPUS_RESOLVE
+)
+  CORPUS_NAME=$(echo "$CORPUS_INFO" | sed -n 1p)
+  DB_PATH=$(echo "$CORPUS_INFO" | sed -n 2p)
+  RESULTS_DIR=$(echo "$CORPUS_INFO" | sed -n 3p)
+  SNAPSHOT=$(echo "$CORPUS_INFO" | sed -n 4p)
+  MODEL_WARNING=$(echo "$CORPUS_INFO" | sed -n '5,$p')
+  CORPUS_FLAG="--corpus $CORPUS_NAME"
+  echo "Corpus: $CORPUS_NAME  (db: $DB_PATH)"
+  if [[ "$SNAPSHOT" != "-" ]]; then
+    echo "Snapshot taken: $SNAPSHOT  (rollback with: corpus rollback <stamp>)"
+  fi
+  if [[ "$MODEL_WARNING" != "-" ]]; then
+    echo ""
+    echo "⚠️  $MODEL_WARNING"
+    read -r -p "Continue with mixed-model corpus? [y/N] " REPLY
+    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+      echo "Aborted. Start a new corpus with: ./run_batch.sh --corpus <new-name> ..."
+      exit 1
+    fi
+  fi
+  echo ""
+fi
 
 # Parse venues (comma-separated)
 IFS=',' read -ra VENUES <<< "$VENUES_STR"
@@ -179,7 +259,6 @@ fmt_dur() {
 
 # ── Archive old results ──────────────────────────────────
 if [ "$FRESH_RESULTS" = true ]; then
-  RESULTS_DIR="./src/results"
   if ls "$RESULTS_DIR"/*_papers.csv "$RESULTS_DIR"/*_datasets.csv "$RESULTS_DIR"/*_bibtex.csv "$RESULTS_DIR"/*_raw.json "$RESULTS_DIR"/master_*.csv "$RESULTS_DIR"/master_*.json 2>/dev/null | head -1 > /dev/null 2>&1; then
     ARCHIVE_DIR="$RESULTS_DIR/archive_$(date +%Y%m%d_%H%M%S)"
     mkdir -p "$ARCHIVE_DIR"
@@ -220,11 +299,20 @@ for VENUE in "${VENUES[@]}"; do
     echo "│ $(ts) Starting..."
     echo "└──────────────────────────────────────────────"
 
-    echo "  $(ts) Step 1/2: fetch-coverage — finding OA PDF URLs..."
+    COV_JSON="cov_${VENUE}_${YEAR}.json"
+    # fetch-coverage always runs, but it is per-paper incremental:
+    #   - papers with a cached PDF URL resolve instantly from the cache
+    #   - papers with a cached negative verdict newer than the per-paper TTL
+    #     (WIRELESS_TAXONOMY_OA_NEGATIVE_TTL_DAYS, default 14d) also skip
+    #   - only papers with STALE negative verdicts hit the network/API again
+    # So a fully cached venue takes seconds, and each run monotonically
+    # improves coverage as stale negatives get retried. The JSON is rewritten
+    # each run with the union of everything known.
+    echo "  $(ts) Step 1/2: fetch-coverage — resolving OA PDF URLs (cached papers skip instantly)..."
     if ! python -m wireless_taxonomy.cli fetch-coverage \
       --venue "$VENUE" --years "$YEAR" \
       --workers "$WORKERS" $WEB_SEARCH_FLAG \
-      --json "cov_${VENUE}_${YEAR}.json"; then
+      --json "$COV_JSON"; then
       echo "  $(ts) ✗ fetch-coverage FAILED for ${VENUE} ${YEAR} — skipping extraction"
       FAILED+=("${VENUE}_${YEAR}")
       COMPLETED+=("${VENUE}_${YEAR}:FAILED")
@@ -237,9 +325,9 @@ for VENUE in "${VENUES[@]}"; do
     echo "         (wireless-only filter → LLM classification → dataset extraction)"
     if ! python -m wireless_taxonomy.cli extract-datasets \
       --venue "$VENUE" --years "$YEAR" \
-      --oa-json "cov_${VENUE}_${YEAR}.json" \
+      --oa-json "$COV_JSON" \
       --workers "$WORKERS" \
-      --out ./src/results $EXTRACT_FRESH_FLAG; then
+      --out "$RESULTS_DIR" --db "$DB_PATH" --yes $CORPUS_FLAG $EXTRACT_FRESH_FLAG $RETRY_FAILED_FLAG $VERBOSE_FLAG; then
       echo "  $(ts) ✗ extract-datasets FAILED for ${VENUE} ${YEAR}"
       FAILED+=("${VENUE}_${YEAR}")
       COMPLETED+=("${VENUE}_${YEAR}:FAILED")
@@ -272,7 +360,7 @@ done
 
 echo ""
 echo "$(ts) Merging all results into master CSVs..."
-python -m wireless_taxonomy.cli merge-results --dir ./src/results --out ./src/results
+python -m wireless_taxonomy.cli merge-results --dir "$RESULTS_DIR" --out "$RESULTS_DIR"
 
 echo ""
 # Reconciliation is intentionally run separately for the hero run — it can be
@@ -289,8 +377,8 @@ echo "$(ts) Skipping reconciliation in batch mode (run separately for final corp
 echo ""
 echo "$(ts) Generating corpus report..."
 python -m wireless_taxonomy.cli report \
-  --dir ./src/results --cov-dir . \
-  --out ./src/results/master_report.md \
+  --dir "$RESULTS_DIR" --cov-dir . \
+  --out "$RESULTS_DIR/master_report.md" \
   || echo "$(ts) ✗ report generation failed (re-run manually)"
 
 END_TIME=$(date +%s)
@@ -301,7 +389,7 @@ echo "╔═══════════════════════�
 echo "║  ALL ${TOTAL} LOOPS DONE                           ║"
 echo "║  Total time: $(fmt_dur "$TOTAL_TIME")                  "
 echo "║  Finished: $(date)"
-echo "║  Results in: ./src/results/                  "
+echo "║  Results in: $RESULTS_DIR/                  "
 echo "║  Master files: master_papers.csv,            "
 echo "║    master_datasets.csv, master_bibtex.csv    "
 if [ ${#FAILED[@]} -gt 0 ]; then

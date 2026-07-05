@@ -18,13 +18,22 @@ def register(app: typer.Typer) -> None:
         out: str = typer.Option(".", "--out", help="Output directory for the 3 CSV sheets + raw JSON."),
         oa_json: Optional[str] = typer.Option(None, "--oa-json", help="Glob path to cov_*.json files from fetch-coverage to reuse known PDF URLs."),
         fresh: bool = typer.Option(False, "--fresh", help="Ignore LLM cache and re-extract all papers. PDF text cache in the DB is still reused."),
+        retry_failed: bool = typer.Option(False, "--retry-failed", help="Retry PDF downloads that previously failed (e.g. after fixing a download bug). Only affects papers with a recorded failure; all other papers are unaffected."),
         refresh_paper: list[str] = typer.Option(
             [], "--refresh-paper",
             help="Force re-classify + re-extract just this paper (exact title, case/punctuation-insensitive); repeatable. Cache is refreshed for these papers only.",
         ),
         wireless_only: bool = typer.Option(True, "--wireless-only/--all-papers", help="Only extract datasets from papers classified as wireless (yes+maybe for max recall). Use --all-papers to process every paper."),
         workers: int = typer.Option(1, "--workers", min=1, max=16, help="Thread parallelism for PDF fetch + LLM stages. Results are identical to a sequential run; 4-8 is a good default for paid API tiers."),
+        verbose: bool = typer.Option(False, "--verbose", help="Print one line per paper during classification (default: rolling count only)."),
         db: str = typer.Option("taxonomy.sqlite", "--db"),
+        corpus: str = typer.Option(
+            None, "--corpus",
+            help="Corpus name (corpora/<name>/). Overrides --db and --out with the "
+                 "corpus's own DB and results dir, checks model compatibility, and "
+                 "records the run in corpus metadata.",
+        ),
+        yes: bool = typer.Option(False, "--yes", "-y", help="Skip interactive confirmations (e.g. model-change warning)."),
     ) -> None:
         """Run the full dataset-extraction loop for a venue and year range.
 
@@ -42,6 +51,31 @@ def register(app: typer.Typer) -> None:
         """
         year_list = parse_years(years)
         year_tag = years.replace(":", "-")
+
+        # ── Corpus resolution + model-change guard ───────────────────────────
+        corpus_obj = None
+        if corpus:
+            from wireless_taxonomy.config import load_settings as _load_settings
+            from wireless_taxonomy.corpus import check_model_compatibility, resolve_corpus
+            from wireless_taxonomy.llm import LlmRouter as _Router
+
+            corpus_obj = resolve_corpus(corpus, create=True)
+            db = str(corpus_obj.db_path)
+            out = str(corpus_obj.results_dir)
+
+            try:
+                _provider = _Router(_load_settings(db).llm).select_provider()
+                current_model = f"{_provider.provider}/{_provider.model}"
+            except Exception:
+                current_model = ""
+            warning = check_model_compatibility(corpus_obj, current_model)
+            if warning:
+                typer.echo(f"\nWARNING: {warning}\n", err=True)
+                if not yes and not typer.confirm("Continue with mixed-model corpus?", default=False):
+                    typer.echo("Aborted. Create a new corpus with: corpus new")
+                    raise typer.Exit(1)
+            if corpus_obj is not None and current_model:
+                corpus_obj.record_run(current_model, f"{venue} {years}")
 
         from wireless_taxonomy.analyze.cache import MetadataCache
         metadata_cache = MetadataCache(".wt_cache.json")
@@ -80,6 +114,8 @@ def register(app: typer.Typer) -> None:
                     wireless_only=wireless_only,
                     workers=workers,
                     refresh_titles=set(refresh_paper) if refresh_paper else None,
+                    verbose=verbose,
+                    retry_failed=retry_failed,
                 )
                 all_results.append(result)
                 typer.echo(

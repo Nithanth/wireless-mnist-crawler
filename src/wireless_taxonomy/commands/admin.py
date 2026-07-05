@@ -1,6 +1,9 @@
-"""Admin commands: llm-config, corpus-status, prune."""
+"""Admin commands: llm-config, corpus-status, prune, fill-availability."""
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import sqlite3
 from typing import Optional
 
@@ -9,8 +12,12 @@ import typer
 from wireless_taxonomy.config import load_settings
 
 
-def register(app: typer.Typer) -> None:
-    @app.command("llm-config")
+def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
+    # Internal commands go on the advanced subapp if provided, else fall back
+    # to the main app (for backwards compatibility in tests).
+    _adv = advanced if advanced is not None else app
+
+    @_adv.command("llm-config")
     def llm_config(db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
         settings = load_settings(db)
         typer.echo(f"Primary provider: {settings.llm.primary_provider}")
@@ -20,7 +27,7 @@ def register(app: typer.Typer) -> None:
             key_status = "configured" if provider.api_key_configured else f"missing {provider.api_key_env}"
             typer.echo(f"- {provider.provider}: model={provider.model}, key={key_status}")
 
-    @app.command("corpus-status")
+    @app.command("corpus-status")  # primary — user-facing
     def corpus_status(db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
         """Show what's in the corpus: venues, years, paper counts, extraction status."""
         from wireless_taxonomy.db import connect
@@ -83,7 +90,7 @@ def register(app: typer.Typer) -> None:
 
         conn.close()
 
-    @app.command("prune")
+    @_adv.command("prune")
     def prune(
         venue: Optional[str] = typer.Option(None, "--venue", help="Venue to prune (e.g. SIGCOMM). Required unless --run-id is given."),
         year: Optional[int] = typer.Option(None, "--year", help="Year to prune. Required unless --run-id is given."),
@@ -207,3 +214,255 @@ def register(app: typer.Typer) -> None:
                 typer.echo(f"  {table}: {count} rows")
         typer.echo("\nDone. Re-run extract-datasets to regenerate.")
         conn.close()
+
+    @_adv.command("purge-cache")
+    def purge_cache(
+        dataset_name: list[str] = typer.Option(
+            ..., "--dataset", "-d",
+            help="Dataset name substring to purge (case-insensitive). "
+                 "Repeat to purge multiple. All LLM cache entries whose "
+                 "extracted datasets contain any of these substrings are removed.",
+        ),
+        cache_file: str = typer.Option(".wt_cache.json", "--cache"),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Print what would be removed without writing."),
+    ) -> None:
+        """Surgically purge LLM extraction cache entries by dataset name.
+
+        \b
+        Use this after a prompt change that affects a known set of dataset
+        names — cheaper than re-extracting every paper.
+
+        \b
+        Examples:
+          purge-cache -d "MovieLens" -d "OpenWeatherMap"
+          purge-cache -d "census" --dry-run
+        """
+        import json
+        import pathlib
+
+        path = pathlib.Path(cache_file)
+        if not path.exists():
+            typer.echo(f"Cache file not found: {cache_file}", err=True)
+            raise typer.Exit(1)
+
+        cache_data = json.loads(path.read_text())
+        llm_cache = cache_data.get("llm", {})
+        needles = [n.lower() for n in dataset_name]
+
+        removed = 0
+        matched_names: list[str] = []
+        for key in list(llm_cache.keys()):
+            if not key.startswith("de:"):
+                continue
+            val = llm_cache[key]
+            datasets = val.get("datasets", []) if isinstance(val, dict) else []
+            hit = next(
+                (ds.get("name", "") for ds in datasets
+                 if any(needle in (ds.get("name") or "").lower() for needle in needles)),
+                None,
+            )
+            if hit:
+                matched_names.append(hit)
+                if not dry_run:
+                    del llm_cache[key]
+                removed += 1
+
+        if dry_run:
+            typer.echo(f"[dry-run] Would remove {removed} cache entries:")
+            for n in matched_names:
+                typer.echo(f"  {n}")
+        else:
+            path.write_text(json.dumps(cache_data))
+            typer.echo(f"Purged {removed} cache entries containing: {', '.join(dataset_name)}")
+            typer.echo("Re-run extract-datasets for affected venues to get fresh extractions.")
+
+    @app.command("fill-availability")  # primary — user-facing
+    def fill_availability(
+        db: str = typer.Option("taxonomy.sqlite", "--db"),
+        cache_file: str = typer.Option(".wt_cache.json", "--cache"),
+        limit: int = typer.Option(0, "--limit", help="Max datasets to process (0 = all)."),
+        dry_run: bool = typer.Option(False, "--dry-run", help="Print candidates without making LLM calls."),
+        relationship: str = typer.Option(
+            "all", "--relationship",
+            help="Which relationship types to process: 'introduced', 'reused', or 'all'.",
+        ),
+    ) -> None:
+        """Fill unknown availability for datasets using a targeted second-pass LLM call.
+
+        \b
+        For each dataset whose availability is unknown AND whose source paper has
+        a PDF in the cache, sends a short focused prompt to the LLM asking only
+        about availability.  Much cheaper than a full re-extraction.
+
+        \b
+        Examples:
+          fill-availability                         # all unknown, all types
+          fill-availability --relationship introduced
+          fill-availability --limit 20 --dry-run
+        """
+        from wireless_taxonomy.analyze.cache import MetadataCache
+        from wireless_taxonomy.analyze.dataset_extractor import _check_url_live
+        from wireless_taxonomy.db import connect
+        from wireless_taxonomy.llm import LlmRequest, LlmRouter
+
+        settings = load_settings(db)
+        conn = connect(db)
+        conn.row_factory = sqlite3.Row
+        cache = MetadataCache(cache_file)
+        router = LlmRouter(settings.llm)
+
+        # ── Candidate query ───────────────────────────────────────────────────
+        # We need: dataset id/name, the paper that introduced/claimed it, and
+        # the paper's PDF text artifact.  We only attempt papers with a
+        # successfully fetched PDF — abstract-only papers already had their best
+        # shot at extraction.
+        rel_filter = ""
+        if relationship == "introduced":
+            rel_filter = "AND c.relationship_type = 'introduced'"
+        elif relationship == "reused":
+            rel_filter = "AND c.relationship_type = 'reused'"
+
+        rows = conn.execute(f"""
+            SELECT DISTINCT
+                d.id        AS dataset_id,
+                d.canonical_name,
+                p.id        AS paper_id,
+                p.title,
+                p.abstract,
+                pta.content_text AS pdf_text
+            FROM datasets d
+            JOIN paper_analysis_dataset_claims c ON c.dataset_id = d.id
+            JOIN papers p ON p.id = c.paper_id
+            LEFT JOIN paper_text_artifacts pta
+                   ON pta.paper_id = p.id AND pta.fetch_status = 'ok'
+            WHERE d.availability_status = 'unknown'
+              {rel_filter}
+            ORDER BY d.canonical_name
+        """).fetchall()
+
+        if not rows:
+            typer.echo("No unknown-availability datasets with PDF text found.")
+            conn.close()
+            return
+
+        candidates = list(rows)
+        if limit and limit > 0:
+            candidates = candidates[:limit]
+
+        typer.echo(f"Found {len(candidates)} unknown-availability datasets to process.")
+        if dry_run:
+            for r in candidates:
+                src = "PDF" if r["pdf_text"] else "abstract"
+                typer.echo(f"  [{src}] {r['canonical_name']} (paper: {r['title'][:50]})")
+            conn.close()
+            return
+
+        # ── Focused availability prompt ───────────────────────────────────────
+        _AVAIL_PROMPT = (
+            "You are a research data curator. Given the text of a research paper, "
+            "determine whether the dataset named below is publicly available.\n\n"
+            "Dataset name: {dataset_name}\n"
+            "Paper title: {title}\n\n"
+            "Paper text:\n---\n{text}\n---\n\n"
+            "Answer in JSON only:\n"
+            '{{"available": true|false|null, '
+            '"url": "<exact URL from paper or empty string>", '
+            '"notes": "<one sentence from the paper about availability or empty string>"}}\n\n'
+            "Rules:\n"
+            "- available=true only if the paper explicitly states the dataset is publicly downloadable.\n"
+            "- available=false if the paper says restricted, proprietary, or available only on request.\n"
+            "- available=null if the paper says nothing about availability.\n"
+            "- url must be copied verbatim from the paper — do NOT guess or construct URLs.\n"
+            "Return ONLY the JSON object, no markdown."
+        )
+
+        updated = 0
+        skipped = 0
+        errors = 0
+
+        for r in candidates:
+            dataset_id = r["dataset_id"]
+            dataset_name = r["canonical_name"]
+            paper_id = r["paper_id"]
+            title = r["title"] or ""
+            text = r["pdf_text"] or r["abstract"] or ""
+
+            if not text:
+                skipped += 1
+                continue
+
+            # Cache key: scoped to dataset name + paper content so prompt
+            # tweaks don't silently serve stale answers.
+            text_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+            name_hash = hashlib.sha256(dataset_name.encode()).hexdigest()[:8]
+            cache_key = f"fa:v1:{name_hash}:{paper_id}:{text_hash}"
+
+            cached = cache.get_llm(cache_key)
+            if cached is None:
+                prompt = _AVAIL_PROMPT.format(
+                    dataset_name=dataset_name,
+                    title=title,
+                    text=text[:80_000],
+                )
+                try:
+                    response = router.complete(
+                        LlmRequest(
+                            task="fill_availability",
+                            schema_name="AvailabilityCheck",
+                            prompt=prompt,
+                            metadata={"dataset_id": dataset_id, "paper_id": paper_id},
+                        )
+                    )
+                    parsed = response.parsed
+                    if not isinstance(parsed, dict):
+                        raise ValueError(f"Non-dict response: {response.content[:200]}")
+                except Exception as exc:
+                    typer.echo(f"  ERROR {dataset_name[:40]}: {exc}", err=True)
+                    errors += 1
+                    continue
+                cache.set_llm(cache_key, parsed)
+            else:
+                parsed = cached
+
+            raw_avail = parsed.get("available")
+            url = str(parsed.get("url") or "").strip()
+            notes = str(parsed.get("notes") or "").strip()
+
+            # Live-check any URL the LLM found
+            if url:
+                is_live = _check_url_live(url)
+                avail_status = "open" if is_live else (
+                    "open" if raw_avail is True else "unknown"
+                )
+            elif raw_avail is True:
+                avail_status = "open"
+            elif raw_avail is False:
+                avail_status = "closed"
+            else:
+                skipped += 1
+                continue  # Still unknown — don't write anything
+
+            # Update datasets table
+            conn.execute(
+                """UPDATE datasets
+                   SET availability_status = ?,
+                       availability_url    = COALESCE(NULLIF(?, ''), availability_url),
+                       availability_notes  = COALESCE(NULLIF(?, ''), availability_notes)
+                   WHERE id = ?""",
+                (avail_status, url or None, notes or None, dataset_id),
+            )
+            # Update all claims for this dataset
+            conn.execute(
+                "UPDATE paper_analysis_dataset_claims SET availability_status = ? WHERE dataset_id = ?",
+                (avail_status, dataset_id),
+            )
+            conn.commit()
+
+            src = "PDF" if r["pdf_text"] else "abstract"
+            url_disp = f" → {url[:50]}" if url else ""
+            typer.echo(f"  [{avail_status.upper():7}] [{src}] {dataset_name[:45]}{url_disp}")
+            updated += 1
+
+        typer.echo(
+            f"\nDone: {updated} updated, {skipped} still unknown, {errors} errors."
+        )

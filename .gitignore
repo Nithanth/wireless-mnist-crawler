@@ -30,6 +30,7 @@ src/evidence/
 src/results/
 cov_*.json
 batch_output.log
+logs/
 
 # macOS
 .DS_Store

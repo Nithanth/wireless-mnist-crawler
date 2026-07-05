@@ -8,7 +8,9 @@ from wireless_taxonomy.analyze.dataset_extractor import (
     DatasetExtractor,
     _fetch_pdf_bytes,
     _is_acm_blocked,
+    _looks_non_wireless,
     _title_words_in_text,
+    abstract_dataset_tier,
 )
 
 
@@ -63,21 +65,79 @@ def test_text_fallback_on_pdf_rejection(mock_url, mock_bib, mock_fetch):
 @patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=None)
 @patch("wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex", return_value=None)
 @patch("wireless_taxonomy.analyze.dataset_extractor._check_url_live", return_value=None)
-def test_abstract_only_no_fallback_needed(mock_url, mock_bib, mock_fetch):
-    """When there's no PDF, extraction uses abstract directly (no fallback)."""
+def test_abstract_only_named_dataset_calls_llm(mock_url, mock_bib, mock_fetch):
+    """When there's no PDF but the abstract names a dataset, the LLM is called."""
     router = _mock_router(fail_with_pdf=False)
     extractor = DatasetExtractor(router=router, cache=None, conn=None)
 
     result = extractor.extract(
         paper_id=2, title="Abstract Paper", authors="Jones, A.",
         venue="SIGCOMM", year=2023, doi="", pdf_url=None,
-        abstract="We measured 5G network performance.",
+        abstract="We evaluate on the Ookla Speedtest dataset collected from 5G deployments.",
     )
 
     assert not result.error
     assert result.extraction_source == "abstract"
     assert router.complete.call_count == 1
     assert router.complete.call_args_list[0][0][0].pdf_bytes is None
+
+
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._check_url_live", return_value=None)
+def test_abstract_tier_none_skips_llm(mock_url, mock_bib, mock_fetch):
+    """Tier 'none': abstract with no dataset language → skipped, zero LLM calls."""
+    router = _mock_router(fail_with_pdf=False)
+    extractor = DatasetExtractor(router=router, cache=None, conn=None)
+
+    result = extractor.extract(
+        paper_id=99, title="Aurora System", authors="Smith, J.",
+        venue="IMC", year=2022, doi="", pdf_url=None,
+        abstract="We implemented and evaluated our system using data from a large cellular operator.",
+    )
+
+    assert result.extraction_source == "skipped_abstract_no_dataset"
+    assert result.datasets == []
+    assert router.complete.call_count == 0
+
+
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._check_url_live", return_value=None)
+def test_abstract_tier_collection_skips_llm(mock_url, mock_bib, mock_fetch):
+    """Tier 'collection': abstract describes data collection but no named dataset →
+    skipped without LLM call (unnamed/proprietary data cannot be reliably extracted)."""
+    router = _mock_router(fail_with_pdf=False)
+    extractor = DatasetExtractor(router=router, cache=None, conn=None)
+
+    result = extractor.extract(
+        paper_id=101, title="ProTrack System", authors="Chen, X.",
+        venue="ICC", year=2022, doi="", pdf_url=None,
+        abstract="The system passively collects wireless packets from WiFi-enabled devices "
+                 "by wireless scanners deployed in the region.",
+    )
+
+    assert result.extraction_source == "skipped_abstract_collection_only"
+    assert result.datasets == []
+    assert router.complete.call_count == 0
+
+
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._fetch_crossref_bibtex", return_value=None)
+@patch("wireless_taxonomy.analyze.dataset_extractor._check_url_live", return_value=None)
+def test_abstract_tier_named_calls_llm(mock_url, mock_bib, mock_fetch):
+    """Tier 'named': abstract explicitly names a dataset → LLM is called."""
+    router = _mock_router(fail_with_pdf=False)
+    extractor = DatasetExtractor(router=router, cache=None, conn=None)
+
+    result = extractor.extract(
+        paper_id=100, title="DeepSense Paper", authors="Lee, K.",
+        venue="NSDI", year=2024, doi="", pdf_url=None,
+        abstract="We evaluate our approach on the DeepSense 6G dataset collected from real deployments.",
+    )
+
+    assert result.extraction_source == "abstract"
+    assert router.complete.call_count == 1
 
 
 @patch("wireless_taxonomy.analyze.dataset_extractor._fetch_pdf_bytes", return_value=b"%PDF-1.4 fake" * 10)
@@ -100,6 +160,108 @@ def test_text_fallback_short_extraction_returns_error(mock_url, mock_bib, mock_f
     assert result.datasets == []
 
 
+class TestAbstractDatasetTier:
+    """Unit tests for abstract_dataset_tier() without going through the extractor."""
+
+    def test_none_tier_empty(self):
+        assert abstract_dataset_tier("") == "none"
+
+    def test_none_tier_no_signal(self):
+        # Generic system paper with no data language
+        assert abstract_dataset_tier(
+            "We propose a new scheduling algorithm for 5G RAN slicing and evaluate performance."
+        ) == "none"
+
+    def test_none_tier_operator_data_unnamed(self):
+        # "data from an operator" — no named dataset, no collection description
+        assert abstract_dataset_tier(
+            "We implemented and evaluated Aurora using data from a very large LTE and 5G cellular service provider."
+        ) == "none"
+
+    def test_collection_tier_passive_collection(self):
+        assert abstract_dataset_tier(
+            "The system passively collects wireless broadcasting packets from WiFi-enabled devices."
+        ) == "collection"
+
+    def test_collection_tier_fabricate(self):
+        assert abstract_dataset_tier(
+            "We fabricate the metasurface and validate its performance via extensive experiments."
+        ) == "collection"
+
+    def test_collection_tier_field_measurement(self):
+        assert abstract_dataset_tier(
+            "We conduct a field measurement campaign across 12 cities."
+        ) == "collection"
+
+    def test_named_tier_explicit_dataset_word(self):
+        assert abstract_dataset_tier(
+            "We evaluate on the DeepSense 6G dataset."
+        ) == "named"
+
+    def test_named_tier_publicly_available(self):
+        assert abstract_dataset_tier(
+            "The collected traces are publicly available at https://example.org."
+        ) == "named"
+
+    def test_named_tier_benchmark(self):
+        assert abstract_dataset_tier(
+            "We compare against three standard benchmarks including MNIST."
+        ) == "named"
+
+    def test_named_beats_collection(self):
+        # When both tiers match, named wins
+        assert abstract_dataset_tier(
+            "We collect traces and release them as a publicly available dataset."
+        ) == "named"
+
+
+class TestLooksNonWireless:
+    """Unit tests for the possible_non_wireless audit flag helper."""
+
+    # Should flag as suspicious (L7-only + no wireless name keyword)
+    def test_census_data(self):
+        assert _looks_non_wireless("US Census Bureau Dataset", ["L7"])
+
+    def test_weather_data(self):
+        assert _looks_non_wireless("OpenWeatherMap Weather Data", ["L7"])
+
+    def test_crime_data(self):
+        assert _looks_non_wireless("UK Metropolitan Police Crime Dataset", ["L7"])
+
+    def test_social_media(self):
+        # "Social Network Posts" — "network" triggers the wireless keyword check,
+        # so this is a known false-negative for the heuristic.  The prompt is the
+        # primary defense; the audit flag is best-effort only.
+        assert not _looks_non_wireless("Nextdoor Social Network Posts Dataset", ["L7"])
+
+    def test_social_media_no_network_word(self):
+        assert _looks_non_wireless("Nextdoor Social Posts Dataset", ["L7"])
+
+    def test_no_osi_and_no_wireless_name(self):
+        assert _looks_non_wireless("Generic Survey Responses", [])
+
+    # Should NOT flag (has sub-L7 layers → almost certainly wireless)
+    def test_l3_l7_kept(self):
+        assert not _looks_non_wireless("GEO SatCom Traffic Measurements", ["L3", "L7"])
+
+    def test_l1_kept(self):
+        assert not _looks_non_wireless("5G NR Channel Measurements", ["L1"])
+
+    # Should NOT flag (wireless keyword in name, even if L7-only)
+    def test_l7_with_wireless_name(self):
+        assert not _looks_non_wireless("5G Video Streaming QoE Dataset", ["L7"])
+
+    def test_l7_with_network_name(self):
+        assert not _looks_non_wireless("Network Latency Traces", ["L7"])
+
+    def test_l7_throughput(self):
+        assert not _looks_non_wireless("WiFi Throughput Measurements", ["L7"])
+
+    # Mixed: L7-only but wireless name → not flagged
+    def test_quic_performance(self):
+        assert not _looks_non_wireless("QUIC Packet Capture Dataset", ["L7"])
+
+
 class TestAcmBlocked:
     def test_direct_acm_url(self):
         assert _is_acm_blocked("https://dl.acm.org/doi/pdf/10.1145/123")
@@ -113,8 +275,13 @@ class TestAcmBlocked:
     def test_usenix_not_blocked(self):
         assert not _is_acm_blocked("https://www.usenix.org/system/files/nsdi24-paper.pdf")
 
-    def test_non_acm_doi_not_blocked(self):
-        assert not _is_acm_blocked("https://doi.org/10.1109/TWC.2024.123")
+    def test_ieee_doi_blocked(self):
+        # doi.org/10.1109 resolves to ieeexplore which is paywalled
+        assert _is_acm_blocked("https://doi.org/10.1109/TWC.2024.123")
+
+    def test_non_ieee_non_acm_doi_not_blocked(self):
+        # A random non-IEEE, non-ACM DOI should pass through to the downloader
+        assert not _is_acm_blocked("https://doi.org/10.1038/s41586-024-12345")
 
 
 class TestTitleWordsInText:
@@ -217,12 +384,12 @@ def test_abstract_only_prompt_uses_strict_mode(mock_url, mock_bib, mock_fetch):
     result = extractor.extract(
         paper_id=11, title="Some 5G Paper", authors="Doe, J.",
         venue="ICC", year=2024, doi="", pdf_url=None,
-        abstract="We propose a scheduling algorithm for 5G RAN slicing.",
+        abstract="We collected a dataset of 5G RAN slicing measurements from a real-world deployment.",
     )
     assert result.extraction_source == "abstract"
     prompt = router.complete.call_args[0][0].prompt
     assert "STRICT ABSTRACT MODE" in prompt
-    assert "EXPLICITLY" in prompt
+    assert "EXPLICIT" in prompt
 
 
 class _DictCache:

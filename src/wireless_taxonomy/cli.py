@@ -72,32 +72,47 @@ _patch_typer_click_compat()
 
 app = typer.Typer(
     help=(
-        "Wireless paper classification + dataset extraction CLI.\n\n"
-        "Commands:\n"
-        "  classify          Classify papers as wireless (yes/maybe/no) for a venue/year.\n"
-        "  eval              DB-free snapshot eval of classified CSV vs gold sheet.\n"
-        "  fetch-coverage    Report OA full-text availability per venue/year.\n"
-        "  extract-datasets  Full pipeline: classify → fetch PDF → extract datasets → CSV.\n"
-        "  merge-results     Combine per-venue/year CSVs into master files.\n"
-        "  cache             Inspect or clear the LLM/API cache.\n"
-        "  llm-config        Show configured LLM providers and models."
-    )
+        "Wireless MNIST Crawler — dataset extraction pipeline for wireless networking papers.\n\n"
+        "Typical workflow (or just run ./run_batch.sh):\n"
+        "  1. fetch-coverage    Resolve open-access PDF URLs for a venue/year.\n"
+        "  2. extract-datasets  Classify papers + extract datasets from PDFs.\n"
+        "  3. merge-results     Combine per-venue CSVs into master files.\n"
+        "  4. fill-availability Fill unknown dataset availability via targeted LLM pass.\n"
+        "  5. reconcile-datasets Deduplicate datasets across the corpus.\n"
+        "  6. report            Generate a corpus summary report.\n\n"
+        "Use 'advanced' subcommand for cache management and internal tooling."
+    ),
+    no_args_is_help=True,
 )
+
+# Advanced subgroup — internal tooling, not part of the primary workflow.
+# Accessible via: wireless-taxonomy advanced <command>
+advanced = typer.Typer(
+    help="Internal tooling: cache management, DB pruning, LLM config.",
+    no_args_is_help=True,
+)
+app.add_typer(advanced, name="advanced")
 
 # ── Register commands (import after app is defined to avoid circular deps) ────
 
-from wireless_taxonomy.commands import admin, cache, classify, coverage, eval, extract, merge, reconcile, report  # noqa: E402
+from wireless_taxonomy.commands import admin, cache, classify, corpus_cmd, coverage, eval, extract, merge, reconcile, report  # noqa: E402
 from wireless_taxonomy.commands._shared import parse_venue_years as _parse_venue_years  # noqa: F401 (re-exported for tests)
 
+# Primary workflow commands
 classify.register(app)
 eval.register(app)
 coverage.register(app)
 extract.register(app)
 merge.register(app)
-cache.register(app)
-admin.register(app)
 reconcile.register(app)
 report.register(app)
+corpus_cmd.register(app)
+
+# corpus-status and fill-availability are user-facing — register on main app
+admin.register(app, advanced=advanced)
+
+# cache on main app; cache-set-pdf goes to advanced
+cache.register(app, advanced=advanced)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

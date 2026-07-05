@@ -430,6 +430,7 @@ class Pipeline:
                 "source_url": result.source_url,
                 "_elapsed": elapsed,
                 "_index": i,
+                "_paper_id": row["id"],
             }
 
         papers: list[dict] = []
@@ -444,6 +445,7 @@ class Pipeline:
                 )
                 continue
             i = resolved.pop("_index")
+            paper_id = resolved.pop("_paper_id")
             elapsed = resolved.pop("_elapsed")
             if i % 10 == 0 or i == n_total:
                 print(f"  [{i}/{n_total}] resolved OA coverage", file=sys.stderr)
@@ -452,10 +454,31 @@ class Pipeline:
                     f"  [!] slow OA resolution ({elapsed:.1f}s): {resolved['title'][:60]}",
                     file=sys.stderr,
                 )
+            # Persist per-paper OA result to the DB immediately so that a crash
+            # or interrupt never loses resolved coverage. extract-datasets reads
+            # pdf_url directly from here — no JSON handoff file required.
+            # COALESCE guard: a "closed" verdict never clobbers a previously
+            # found pdf_url (found URLs are permanent; negatives are advisory).
+            self.conn.execute(
+                """UPDATE papers
+                   SET pdf_url = COALESCE(?, pdf_url),
+                       oa_status = ?, oa_attempted_at = ?, oa_provider = ?
+                   WHERE id = ?""",
+                (
+                    resolved["pdf_url"] or None,
+                    resolved["oa_status"],
+                    time.time(),
+                    resolved["provider"],
+                    paper_id,
+                ),
+            )
             papers.append(resolved)
-            if cache is not None and i % 50 == 0:
-                cache.save()
+            if i % 50 == 0:
+                self.conn.commit()
+                if cache is not None:
+                    cache.save()
 
+        self.conn.commit()
         if cache is not None:
             cache.save()
         summary = summarize(papers)
@@ -475,6 +498,8 @@ class Pipeline:
         wireless_only: bool = True,
         workers: int = 1,
         refresh_titles: set[str] | None = None,
+        verbose: bool = False,
+        retry_failed: bool = False,
     ) -> dict:
         """Extract dataset records from every fetchable paper in a venue/year.
 
@@ -502,17 +527,34 @@ class Pipeline:
         refresh_titles = {_norm_title(t) for t in (refresh_titles or set()) if _norm_title(t)}
 
         ingest_run = self.ingest(venue, year, source_type, source_value or "")
+        conference_instance_id = self._require_run(ingest_run)["conference_instance_id"]
+
+        # Build the pdf_url map BEFORE enrichment so papers with a known PDF
+        # don't trigger unnecessary abstract fetching. The DB is the primary
+        # source (written per-paper by fetch-coverage atomically as each paper
+        # resolves); the caller-supplied oa_pdf_urls (from a cov_*.json file)
+        # fills in gaps for papers whose fetch-coverage run predates the DB
+        # write path. DB always wins over JSON so a re-run of fetch-coverage
+        # with better URLs is picked up automatically.
+        from wireless_taxonomy.analyze.dataset_extractor import _is_acm_blocked
+        _db_pdf_urls: dict[str, str] = {
+            row["title"]: row["pdf_url"]
+            for row in self.conn.execute(
+                "SELECT title, pdf_url FROM papers WHERE conference_instance_id = ? AND pdf_url IS NOT NULL",
+                (conference_instance_id,),
+            ).fetchall()
+            if row["pdf_url"] and not _is_acm_blocked(row["pdf_url"])
+        }
+        oa_pdf_urls = {**(oa_pdf_urls or {}), **_db_pdf_urls}
 
         # Always resolve DOIs (needed for CrossRef BibTeX lookup).
         # Only fetch abstracts for papers that have no PDF URL and no abstract
         # already — papers with a fetchable PDF don't need it.
         if resolve_dois:
-            pdf_url_map = oa_pdf_urls or {}
-            self._enrich_for_extraction(ingest_run, pdf_url_map, cache=cache)
+            self._enrich_for_extraction(ingest_run, oa_pdf_urls, cache=cache)
 
-        conference_instance_id = self._require_run(ingest_run)["conference_instance_id"]
         rows = self.conn.execute(
-            "SELECT id, title, authors, doi, abstract FROM papers WHERE conference_instance_id = ? ORDER BY id",
+            "SELECT id, title, authors, doi, abstract, pdf_url FROM papers WHERE conference_instance_id = ? ORDER BY id",
             (conference_instance_id,),
         ).fetchall()
 
@@ -521,61 +563,93 @@ class Pipeline:
         # (cached in SQLite) so the classifier sees full text.
         if wireless_only:
             from wireless_taxonomy.analyze.candidates import LlmCandidateClassifier
-            from wireless_taxonomy.analyze.dataset_extractor import _fetch_pdf_bytes, load_cached_pdf, store_cached_pdf
+            from wireless_taxonomy.analyze.dataset_extractor import (
+                _fetch_pdf_bytes, load_cached_pdf, store_cached_pdf,
+                load_cached_pdf_text, load_cached_pdf_failed,
+                store_cached_pdf_failure, clear_cached_pdf_failures,
+            )
             from wireless_taxonomy.llm import LlmRouter as _LlmRouter
             from wireless_taxonomy.parallel import parallel_map
 
             classifier = LlmCandidateClassifier(
                 self.settings.llm, router=_LlmRouter(self.settings.llm), cache=cache
             )
-            # Pre-fetch and cache all PDFs so both classification and extraction
-            # can reuse them without re-downloading. Fetches run in worker
-            # threads (pure network I/O); SQLite reads/writes stay on this
-            # thread. Bytes are not retained — they're reloaded from the DB
-            # cache per stage, keeping memory bounded at journal scale.
+            # Pre-fetch and cache raw PDF bytes so Gemini receives the full
+            # native PDF (tables, figures, layout intact — best extraction
+            # quality). Fetches run in worker threads (pure network I/O);
+            # SQLite reads/writes stay on this thread.
             n_total = len(rows)
+
+            # If retry_failed is set, clear failure records first so the
+            # prefetch loop will attempt them again. This is how a fixed bug
+            # (e.g. timeout handling, URL rewriting) surfaces only the
+            # previously-failed papers without re-touching everything else.
+            if retry_failed:
+                for row in rows:
+                    pdf_url = oa_pdf_urls.get(row["title"])
+                    if pdf_url:
+                        clear_cached_pdf_failures(self.conn, row["id"], pdf_url)
+                self.conn.commit()
 
             def _prefetch_items():
                 for i, row in enumerate(rows, 1):
                     title = row["title"]
-                    pdf_url = (oa_pdf_urls or {}).get(title)
-                    cached = (
-                        load_cached_pdf(self.conn, row["id"], pdf_url) is not None
-                        if pdf_url else False
-                    )
-                    yield (i, row, pdf_url, cached)
+                    pdf_url = oa_pdf_urls.get(title)
+                    # Determine per-paper state without hitting the network:
+                    #   cached_ok   → already have bytes/text, skip entirely
+                    #   prev_failed → prior attempt recorded as failed; skip
+                    #                 unless retry_failed cleared the record
+                    #   neither     → needs a fresh download attempt
+                    cached_ok = prev_failed = False
+                    if pdf_url:
+                        cached_ok = (
+                            load_cached_pdf(self.conn, row["id"], pdf_url) is not None
+                            or load_cached_pdf_text(self.conn, row["id"], pdf_url) is not None
+                        )
+                        if not cached_ok:
+                            prev_failed = load_cached_pdf_failed(self.conn, row["id"], pdf_url)
+                    yield (i, row, pdf_url, cached_ok, prev_failed)
 
             def _prefetch(item):
-                _i, row, pdf_url, cached = item
-                if not pdf_url or cached:
+                _i, row, pdf_url, cached_ok, prev_failed = item
+                if not pdf_url or cached_ok or prev_failed:
                     return None
                 return _fetch_pdf_bytes(pdf_url, expected_title=row["title"])
 
             print(f"\n  ── Stage 1/3: PDF prefetch — {n_total} papers ──", file=sys.stderr)
-            n_cached = n_fetched = n_failed = n_nourl = 0
+            n_cached = n_fetched = n_failed = n_skipped = n_nourl = 0
             for item, fetched, error in parallel_map(_prefetch, _prefetch_items(), workers):
-                i, row, pdf_url, cached = item
+                i, row, pdf_url, cached_ok, prev_failed = item
                 title = row["title"]
                 if not pdf_url:
                     n_nourl += 1
-                elif cached:
+                elif cached_ok:
                     n_cached += 1
+                elif prev_failed:
+                    # Already recorded as failed on a prior run; not retrying.
+                    n_skipped += 1
                 elif fetched:
                     store_cached_pdf(self.conn, row["id"], pdf_url, fetched)
                     n_fetched += 1
                     print(f"  [{i}/{n_total}] downloaded: {title[:60]}", file=sys.stderr)
                 else:
+                    # Fresh failure — record it so the next run skips it too
+                    # (unless the caller passes retry_failed after fixing the bug).
+                    err_msg = str(error) if error else ""
+                    store_cached_pdf_failure(self.conn, row["id"], pdf_url, err_msg)
                     n_failed += 1
                     print(f"  [{i}/{n_total}] download FAILED: {title[:60]}", file=sys.stderr)
                 if i % 25 == 0 or i == n_total:
                     print(
                         f"  [{i}/{n_total}] … {n_cached} cached · {n_fetched} downloaded "
-                        f"· {n_failed} failed · {n_nourl} no PDF URL",
+                        f"· {n_failed} failed · {n_skipped} skipped (prev failed) · {n_nourl} no PDF URL",
                         file=sys.stderr,
                     )
+            self.conn.commit()
             print(
                 f"  ── Stage 1/3 done: {n_cached + n_fetched}/{n_total} papers have full text "
-                f"({n_cached} cached, {n_fetched} downloaded, {n_failed} failed, {n_nourl} no URL) ──",
+                f"({n_cached} cached, {n_fetched} downloaded, {n_failed} failed, "
+                f"{n_skipped} skipped prev-failed, {n_nourl} no URL) ──",
                 file=sys.stderr,
             )
 
@@ -594,19 +668,19 @@ class Pipeline:
                 return classifier.classify(dict(row), pdf_bytes=pdf_bytes, refresh=force)
 
             print(
-                f"\n  ── Stage 2/3: Wireless classification — {n_total} papers "
-                "([+] yes · [~] maybe · [-] no) ──",
+                f"\n  ── Stage 2/3: Wireless classification — {n_total} papers ──",
                 file=sys.stderr,
             )
             wireless_ids: set[int] = set()
+            n_yes = n_maybe = n_no = n_err = 0
             for item, pred, error in parallel_map(_classify, _classify_items(), workers):
                 i, row, _pdf = item
                 if isinstance(error, CreditExhaustedError):
                     if cache is not None:
                         cache.save()
                     print(
-                        f"\n  💳 {error}\n"
-                        f"  💾 Checkpoint saved after {i - 1}/{n_total} papers. "
+                        f"\n  [credit exhausted] {error}\n"
+                        f"  Checkpoint saved after {i - 1}/{n_total} papers. "
                         "Re-run after reloading credits to resume.",
                         file=sys.stderr,
                     )
@@ -614,13 +688,31 @@ class Pipeline:
                 if error is not None:
                     # On LLM failure, default to "maybe" for max recall rather
                     # than silently dropping the paper.
-                    print(f"  [{i}/{n_total}] [!] error: {row['title'][:55]} — {error}", file=sys.stderr)
+                    n_err += 1
+                    print(f"  [{i}/{n_total}] [!] LLM error (defaulting to maybe): {row['title'][:60]} — {error}", file=sys.stderr)
                     wireless_ids.add(row["id"])
                     continue
-                label_icon = {"yes": "+", "maybe": "~", "no": "-"}.get(pred.label, "?")
-                print(f"  [{i}/{n_total}] [{label_icon}] {pred.label}({pred.confidence}): {row['title'][:55]}", file=sys.stderr)
+                if pred.label == "yes":
+                    n_yes += 1
+                elif pred.label == "maybe":
+                    n_maybe += 1
+                else:
+                    n_no += 1
+                if verbose:
+                    label_icon = {"yes": "+", "maybe": "~", "no": "-"}.get(pred.label, "?")
+                    print(f"  [{i}/{n_total}] [{label_icon}] {pred.label}({pred.confidence}): {row['title'][:60]}", file=sys.stderr)
+                elif pred.label == "maybe":
+                    # Always surface borderline calls — useful for debugging without --verbose
+                    print(f"  [{i}/{n_total}] [~] maybe({pred.confidence}): {row['title'][:60]}", file=sys.stderr)
                 if pred.low_pass:
                     wireless_ids.add(row["id"])
+                # Rolling progress every 25 papers (non-verbose mode)
+                if not verbose and (i % 25 == 0 or i == n_total):
+                    print(
+                        f"  [{i}/{n_total}] classified: {n_yes} yes · {n_maybe} maybe · {n_no} no"
+                        + (f" · {n_err} errors" if n_err else ""),
+                        file=sys.stderr,
+                    )
                 # Save cache periodically so progress isn't lost on crash.
                 if cache is not None and i % 20 == 0:
                     cache.save()
@@ -629,8 +721,8 @@ class Pipeline:
             total_before = len(rows)
             rows = [r for r in rows if r["id"] in wireless_ids]
             print(
-                f"  ── Stage 2/3 done: {len(rows)}/{total_before} papers classified wireless "
-                "(yes+maybe, max recall) — the rest are skipped ──",
+                f"  ── Stage 2/3 done: {len(rows)}/{total_before} wireless "
+                f"({n_yes} yes, {n_maybe} maybe) — {total_before - len(rows)} skipped ──",
                 file=sys.stderr,
             )
 
@@ -703,6 +795,14 @@ class Pipeline:
                     VALUES (?, ?, ?, ?)
                     """,
                     (row["id"], result.bibtex_key, doi or None, result.bibtex),
+                )
+                # Replace previous claims for this paper with the current run's
+                # results.  Without this, every re-run appends a new set of
+                # rows (different run_id, same dataset names) producing
+                # duplicates that inflate the CSV dataset counts.
+                self.conn.execute(
+                    "DELETE FROM paper_analysis_dataset_claims WHERE paper_id = ?",
+                    (row["id"],),
                 )
                 for ds in result.datasets:
                     self.conn.execute(

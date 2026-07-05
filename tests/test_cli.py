@@ -75,10 +75,14 @@ def test_cli_help_renders_without_typer_click_compat_error() -> None:
     )
 
     assert result.returncode == 0
-    # The pruned surface is exactly three commands.
+    # Primary user-facing commands are visible at the top level.
     assert "classify" in result.stdout
     assert "eval" in result.stdout
-    assert "llm-config" in result.stdout
+    assert "fetch-coverage" in result.stdout
+    assert "extract-datasets" in result.stdout
+    assert "advanced" in result.stdout  # subgroup for internal tooling
+    # llm-config moved to advanced subgroup — not in top-level help.
+    assert "llm-config" not in result.stdout
     # Old multi-stage commands were removed in the prune.
     for gone in (
         "ingest",
@@ -99,13 +103,18 @@ def test_cli_help_renders_without_typer_click_compat_error() -> None:
 def test_classify_and_eval_in_help() -> None:
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "PYTHONPATH": str(root / "src")}
-    for cmd in ("classify", "eval", "llm-config"):
+    # Primary commands work at top level.
+    for cmd in ("classify", "eval", "fetch-coverage", "extract-datasets"):
         result = subprocess.run(
             [sys.executable, "-m", "wireless_taxonomy.cli", cmd, "--help"],
-            cwd=root,
-            env=env,
-            text=True,
-            capture_output=True,
-            check=False,
+            cwd=root, env=env, text=True, capture_output=True, check=False,
         )
         assert result.returncode == 0, f"{cmd} --help failed: {result.stderr}"
+
+    # Internal commands live under the advanced subgroup.
+    for cmd in ("llm-config", "prune", "purge-cache", "cache-set-pdf"):
+        result = subprocess.run(
+            [sys.executable, "-m", "wireless_taxonomy.cli", "advanced", cmd, "--help"],
+            cwd=root, env=env, text=True, capture_output=True, check=False,
+        )
+        assert result.returncode == 0, f"advanced {cmd} --help failed: {result.stderr}"

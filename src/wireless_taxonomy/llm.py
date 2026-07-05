@@ -116,12 +116,29 @@ def _pdf_bytes_to_text(pdf_bytes: bytes, max_chars: int = 120_000) -> str:
     """Extract plain text from PDF bytes using pypdf. Truncates to max_chars."""
     try:
         import io
+        import os
+        import contextlib
+
         from pypdf import PdfReader
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        pages = []
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            pages.append(text)
+
+        @contextlib.contextmanager
+        def _quiet():
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            saved_fd = os.dup(2)
+            try:
+                os.dup2(devnull_fd, 2)
+                yield
+            finally:
+                os.dup2(saved_fd, 2)
+                os.close(saved_fd)
+                os.close(devnull_fd)
+
+        with _quiet():
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            pages = []
+            for page in reader.pages:
+                text = page.extract_text() or ""
+                pages.append(text)
         return "\n".join(pages).strip()[:max_chars]
     except Exception:
         return ""

@@ -126,6 +126,8 @@ def test_provider_order_first_oa_wins(monkeypatch) -> None:
 
 def test_unpaywall_skipped_without_email(monkeypatch) -> None:
     monkeypatch.delenv("WIRELESS_TAXONOMY_CONTACT_EMAIL", raising=False)
+    monkeypatch.delenv("WIRELESS_TAXONOMY_UNPAYWALL_EMAIL", raising=False)
+    monkeypatch.delenv("UNPAYWALL_EMAIL", raising=False)
     up = {"is_oa": True, "best_oa_location": {"url_for_pdf": "https://u/pdf"}}
     resolver = OpenAccessResolver(
         fetch_json=_fetch_json([("unpaywall.org", up)]),
@@ -266,12 +268,19 @@ def test_web_search_accepts_verified_pdf(monkeypatch) -> None:
 
 
 def test_cached_closed_reresolved_when_web_search_enabled(tmp_path: Path) -> None:
+    """A timestamped closed entry that was never web-searched is retried when
+    web search is now enabled. Legacy entries (no searched_at) are honoured to
+    avoid burning Brave/CSE budget on papers that are almost certainly still closed."""
+    import time as _t
     path = tmp_path / "cache.json"
     cache = MetadataCache(path)
-    # Cached miss from a pre-web-search run.
+    # Cached miss with a timestamp but no web search attempted — e.g. was
+    # resolved before Brave was configured but after the timestamp field existed.
     cache.set_oa("A Paper", "10.1/x", {
         "fetchable": False, "oa_status": "closed", "license": "",
         "pdf_url": "", "provider": "none", "source_url": "",
+        "web_search_attempted": False, "web_search_providers": [],
+        "searched_at": _t.time() - 3600,  # 1 hour ago — fresh but no web search
     })
 
     calls = []
@@ -305,6 +314,33 @@ def test_cached_closed_reresolved_when_web_search_enabled(tmp_path: Path) -> Non
     n = len(calls)
     resolver.resolve("A Paper", "10.1/x")
     assert len(calls) == n
+
+
+def test_legacy_closed_entry_not_retried_with_web_search(tmp_path: Path) -> None:
+    """Legacy entries (no searched_at) are honoured unconditionally — they went
+    through the free waterfall already and re-searching with Brave every run
+    wastes paid quota on papers almost certainly still closed."""
+    path = tmp_path / "cache.json"
+    cache = MetadataCache(path)
+    # Legacy entry: no searched_at, no web_search_attempted field.
+    cache.set_oa("A Paper", "10.1/x", {
+        "fetchable": False, "oa_status": "closed", "license": "",
+        "pdf_url": "", "provider": "none", "source_url": "",
+    })
+
+    calls = []
+    resolver = OpenAccessResolver(
+        fetch_json=lambda url: (calls.append(url) or {}),
+        fetch_text=lambda url: (calls.append(url) or ""),
+        cache=cache,
+        web_search=True,
+        router=None,
+    )
+    resolver.providers = ["openalex", "llm_web_search"]
+
+    resolver._router = type("R", (), {"complete": lambda self, req: (_ for _ in ()).throw(RuntimeError())})()
+    resolver.resolve("A Paper", "10.1/x")
+    assert calls == []  # legacy entry honoured — no Brave/CSE spend
 
 
 # ── Google CSE provider ──────────────────────────────────────────────────────
@@ -536,10 +572,12 @@ def test_closed_verdict_searched_by_old_provider_is_retried_with_new(monkeypatch
     monkeypatch.setenv("WIRELESS_TAXONOMY_BRAVE_MIN_INTERVAL_SECONDS", "0")
     cache = MetadataCache(tmp_path / "c.json")
     # Simulate an old cache entry: closed, searched by the Gemini provider.
+    import time as _t
     cache.set_oa("A Wireless Paper", "10.1/x", {
         "fetchable": False, "oa_status": "closed", "license": "", "pdf_url": "",
         "provider": "none", "source_url": "",
         "web_search_attempted": True, "web_search_providers": ["llm_web_search"],
+        "searched_at": _t.time() - 3600,  # recent but different provider set
     })
 
     resolver = _brave_resolver(monkeypatch, _fetch_json([("api.search.brave.com", _BRAVE_RESULTS)]))
@@ -575,6 +613,82 @@ def test_closed_verdict_searched_by_same_providers_is_not_researched(monkeypatch
     res = resolver.resolve("A Wireless Paper", "10.1/x")
     assert not res.fetchable
     assert calls == []  # served from cache; no re-search
+
+
+def test_stale_negative_retried_without_web_search(tmp_path) -> None:
+    """A cached 'closed' verdict older than the TTL is re-resolved even when
+    web search is disabled — papers appear on arXiv/repos over time."""
+    import time as _time
+    cache = MetadataCache(tmp_path / "c.json")
+    cache.set_oa("A Wireless Paper", "10.1/x", {
+        "fetchable": False, "oa_status": "closed", "license": "", "pdf_url": "",
+        "provider": "none", "source_url": "",
+        "web_search_attempted": False, "web_search_providers": [],
+        "searched_at": _time.time() - 90 * 86400,  # 90 days old — stale
+    })
+    resolver = OpenAccessResolver(
+        fetch_json=_fetch_json([("api.openalex.org", _OPENALEX_OA)]),
+        fetch_text=lambda u: "",
+        providers=["openalex"],
+        cache=cache,
+    )
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert res.fetchable  # stale negative was retried and now found
+
+
+def test_fresh_negative_honoured_without_web_search(tmp_path) -> None:
+    """A cached 'closed' verdict within the TTL is served from cache."""
+    import time as _time
+    cache = MetadataCache(tmp_path / "c.json")
+    cache.set_oa("A Wireless Paper", "10.1/x", {
+        "fetchable": False, "oa_status": "closed", "license": "", "pdf_url": "",
+        "provider": "none", "source_url": "",
+        "web_search_attempted": False, "web_search_providers": [],
+        "searched_at": _time.time() - 3600,  # 1 hour old — fresh
+    })
+    calls = []
+
+    def counting_fetch(url):
+        calls.append(url)
+        return {}
+
+    resolver = OpenAccessResolver(
+        fetch_json=counting_fetch,
+        fetch_text=lambda u: "",
+        providers=["openalex"],
+        cache=cache,
+    )
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert not res.fetchable
+    assert calls == []  # served from cache; no network
+
+
+def test_positive_verdict_cached_indefinitely(tmp_path) -> None:
+    """A found PDF URL is never re-resolved regardless of age."""
+    import time as _time
+    cache = MetadataCache(tmp_path / "c.json")
+    cache.set_oa("A Wireless Paper", "10.1/x", {
+        "fetchable": True, "oa_status": "green", "license": "cc-by",
+        "pdf_url": "https://arxiv.org/pdf/1234.5678", "provider": "arxiv",
+        "source_url": "", "web_search_attempted": False,
+        "web_search_providers": [], "searched_at": _time.time() - 365 * 86400,
+    })
+    calls = []
+
+    def counting_fetch(url):
+        calls.append(url)
+        return {}
+
+    resolver = OpenAccessResolver(
+        fetch_json=counting_fetch,
+        fetch_text=lambda u: "",
+        providers=["openalex"],
+        cache=cache,
+    )
+    res = resolver.resolve("A Wireless Paper", "10.1/x")
+    assert res.fetchable
+    assert res.pdf_url == "https://arxiv.org/pdf/1234.5678"
+    assert calls == []  # positives never expire
 
 
 def test_google_cse_query_cap(monkeypatch):

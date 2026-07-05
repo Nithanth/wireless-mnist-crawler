@@ -89,9 +89,15 @@ def register(app: typer.Typer) -> None:
         from wireless_taxonomy.config import load_dotenv
 
         load_dotenv()  # so a .env-provided contact email enables Unpaywall (and the note below is accurate)
-        if not (_os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL") or "").strip():
+        _unpaywall_email = (
+            _os.getenv("WIRELESS_TAXONOMY_CONTACT_EMAIL")
+            or _os.getenv("WIRELESS_TAXONOMY_UNPAYWALL_EMAIL")
+            or _os.getenv("UNPAYWALL_EMAIL")
+            or ""
+        ).strip()
+        if not _unpaywall_email:
             typer.echo(
-                "note: WIRELESS_TAXONOMY_CONTACT_EMAIL not set — skipping Unpaywall "
+                "note: no Unpaywall email set — skipping Unpaywall "
                 "(the canonical OA source); using OpenAlex/Semantic Scholar/arXiv only.",
                 err=True,
             )
