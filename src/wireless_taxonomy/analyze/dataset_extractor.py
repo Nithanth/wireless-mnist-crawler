@@ -439,6 +439,21 @@ def _fetch_crossref_bibtex(doi: str, attempts: int = 3) -> str | None:
     return None
 
 
+def has_cached_pdf(conn, paper_id: int, pdf_url: str) -> bool:
+    """Check if a PDF is cached without loading the full blob."""
+    if conn is None:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM paper_text_artifacts "
+            "WHERE paper_id = ? AND source_url = ? AND fetch_status = 'ok' LIMIT 1",
+            (paper_id, pdf_url),
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False
+
+
 def load_cached_pdf(conn, paper_id: int, pdf_url: str) -> bytes | None:
     """Return raw PDF bytes from paper_text_artifacts if previously fetched."""
     if conn is None:

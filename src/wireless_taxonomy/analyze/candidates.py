@@ -166,11 +166,38 @@ class LlmCandidateClassifier:
         except Exception:
             return ""
 
-    def classify(self, paper: dict[str, Any], pdf_bytes: bytes | None = None, refresh: bool = False) -> CandidatePrediction:
+    def classify(
+        self,
+        paper: dict[str, Any],
+        pdf_bytes: bytes | None = None,
+        pdf_text: str | None = None,
+        refresh: bool = False,
+        classify_no_pdf: bool = False,
+    ) -> CandidatePrediction:
         paper_id = int(paper["id"])
         abstract = paper.get("abstract")
         used_abstract = bool(abstract and str(abstract).strip())
-        prompt = _prompt(paper, has_pdf=pdf_bytes is not None)
+
+        # --classify-no-pdf: use keyword snippets from PDF text instead of
+        # sending the full PDF. Much cheaper (~500 tokens vs ~28K) with
+        # comparable accuracy for the binary wireless/not decision.
+        snippets = ""
+        effective_pdf_bytes = pdf_bytes
+        if classify_no_pdf:
+            effective_pdf_bytes = None
+            if pdf_text:
+                snippets = extract_keyword_snippets(pdf_text)
+            elif pdf_bytes:
+                # Extract text from PDF bytes on the fly for snippet search
+                try:
+                    from wireless_taxonomy.llm import _pdf_bytes_to_text
+                    text = _pdf_bytes_to_text(pdf_bytes)
+                    if text:
+                        snippets = extract_keyword_snippets(text)
+                except Exception:
+                    pass
+
+        prompt = _prompt(paper, has_pdf=effective_pdf_bytes is not None, keyword_snippets=snippets)
         model_id = self._model_identity()
         cache_key = _llm_cache_key(self.provider_name, model_id, prompt)
         if self.cache is not None and not self.refresh and not refresh:
@@ -208,7 +235,7 @@ class LlmCandidateClassifier:
                 schema_name="WirelessCandidate",
                 prompt=prompt,
                 metadata={"paper_id": paper_id, "title": paper.get("title")},
-                pdf_bytes=pdf_bytes,
+                pdf_bytes=effective_pdf_bytes,
             )
         )
         if not isinstance(response.parsed, dict):
@@ -247,7 +274,54 @@ def _llm_cache_key(provider_name: str, model_identity: str, prompt: str) -> str:
     return f"v1:{digest}"
 
 
-def _prompt(paper: dict[str, Any], has_pdf: bool = False) -> str:
+_SNIPPET_KEYWORDS = WIRELESS_TERMS | {
+    "dataset", "measurement", "trace", "testbed", "experiment",
+    "deployment", "field trial", "data collection", "open source",
+}
+
+# Max chars of keyword snippets to include in the classify prompt
+_MAX_SNIPPET_CHARS = 3000
+
+
+def extract_keyword_snippets(pdf_text: str, max_chars: int = _MAX_SNIPPET_CHARS) -> str:
+    """Search PDF text for lines containing wireless/data keywords.
+
+    Returns a compact string of relevant snippets (deduplicated, ordered by
+    position) that give the classifier extra context without sending the full PDF.
+    """
+    if not pdf_text or len(pdf_text) < 200:
+        return ""
+    normalized = _normalize(pdf_text)
+    lines = normalized.split("\n")
+    # Score each line by keyword hits
+    scored: list[tuple[int, int, str]] = []
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if len(stripped) < 20 or len(stripped) > 500:
+            continue
+        hits = sum(1 for term in _SNIPPET_KEYWORDS if _contains_term(stripped, term))
+        if hits > 0:
+            scored.append((hits, idx, stripped))
+    # Sort by score (descending), break ties by position
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    # Collect snippets up to the char budget
+    seen: set[str] = set()
+    snippets: list[tuple[int, str]] = []
+    total = 0
+    for _hits, idx, line in scored:
+        if line in seen:
+            continue
+        if total + len(line) > max_chars:
+            break
+        seen.add(line)
+        snippets.append((idx, line))
+        total += len(line)
+    # Return in document order
+    snippets.sort(key=lambda x: x[0])
+    return "\n".join(s for _, s in snippets)
+
+
+def _prompt(paper: dict[str, Any], has_pdf: bool = False, keyword_snippets: str = "") -> str:
     paper_json = json.dumps(
         {
             "title": paper.get("title"),
@@ -255,15 +329,29 @@ def _prompt(paper: dict[str, Any], has_pdf: bool = False) -> str:
         },
         ensure_ascii=False,
     )
-    context_note = (
-        "You have the full paper PDF attached. Use ALL available content to judge."
-        if has_pdf
-        else (
+    if keyword_snippets:
+        context_note = (
+            "You have the title, abstract, and keyword-matched excerpts from the "
+            "full paper below. Use all of this to judge."
+        )
+    elif has_pdf:
+        context_note = (
+            "You have the full paper PDF attached. Use ALL available content to judge."
+        )
+    else:
+        context_note = (
             "You only see the title and abstract. When information is limited, "
             "lean toward \"maybe\" rather than \"no\" — we prefer to include "
             "borderline papers rather than miss wireless papers."
         )
-    )
+
+    snippet_section = ""
+    if keyword_snippets:
+        snippet_section = (
+            "\nKeyword-matched excerpts from the full paper text:\n---\n"
+            f"{keyword_snippets}\n---\n"
+        )
+
     return f"""
 You screen one research paper to decide if it is a WIRELESS / wireless-networking paper.
 {context_note}
@@ -317,7 +405,7 @@ Rules:
 
 Paper:
 {paper_json}
-""".strip()
+{snippet_section}""".strip()
 
 
 def _label(value: Any) -> Label:

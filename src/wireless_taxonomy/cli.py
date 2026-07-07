@@ -73,51 +73,49 @@ _patch_typer_click_compat()
 
 app = typer.Typer(
     help=(
-        "Wireless MNIST Crawler — dataset extraction pipeline for wireless networking papers.\n\n"
-        "Quick start:\n"
-        "  wt run --venues SIGCOMM,NSDI --years 2022:2025 --workers 6\n\n"
-        "The 'run' command orchestrates all stages in order. Individual stages\n"
-        "are also available for fine-grained control:\n"
-        "  1. fetch-coverage    Resolve open-access PDF URLs for a venue/year.\n"
-        "  2. extract-datasets  Classify papers + extract datasets from PDFs.\n"
-        "  3. merge-results     Combine per-venue CSVs into master files.\n"
-        "  4. fill-availability Fill unknown dataset availability via targeted LLM pass.\n"
-        "  5. reconcile-datasets Deduplicate datasets across the corpus.\n"
-        "  6. report            Generate a corpus summary report.\n\n"
-        "Use 'advanced' subcommand for cache management and internal tooling."
+        "wt — wireless dataset extraction tool\n\n"
+        "Workflow:\n"
+        "  wt init                                           # create a corpus\n"
+        "  wt add --venues SIGCOMM,NSDI --years 2022:2025   # extract data\n"
+        "  wt export                                        # reconcile + final CSVs\n"
+        "  wt status                                        # see what's in the corpus\n\n"
+        "Use `wt advanced` for cache management, individual pipeline stages, and debugging."
     ),
     no_args_is_help=True,
 )
 
-# Advanced subgroup — internal tooling, not part of the primary workflow.
-# Accessible via: wt advanced <command>
+# Advanced subgroup — individual stages, cache, DB tooling.
 advanced = typer.Typer(
-    help="Internal tooling: cache management, DB pruning, LLM config.",
+    help=(
+        "Advanced: individual pipeline stages, cache management, DB tooling.\n\n"
+        "These are the building blocks that `add` and `export` orchestrate.\n"
+        "Use them for debugging, re-running a single stage, or fine-grained control."
+    ),
     no_args_is_help=True,
 )
 app.add_typer(advanced, name="advanced")
 
 # ── Register commands (import after app is defined to avoid circular deps) ────
 
-from wireless_taxonomy.commands import admin, cache, classify, corpus_cmd, coverage, eval, extract, merge, reconcile, report, run  # noqa: E402
+from wireless_taxonomy.commands import admin, cache, classify, corpus_cmd, coverage, eval, eval_db, export, extract, merge, reconcile, report, run  # noqa: E402
 from wireless_taxonomy.commands._shared import parse_venue_years as _parse_venue_years  # noqa: F401 (re-exported for tests)
 
-# Primary workflow commands
-classify.register(app)
-eval.register(app)
-coverage.register(app)
-extract.register(app)
-run.register(app)
-merge.register(app)
-reconcile.register(app)
-report.register(app)
-corpus_cmd.register(app)
+# ── Primary commands (the 5 a user needs) ─────────────────────────────────────
+run.register(app)        # `wt add`
+export.register(app)     # `wt export`
+corpus_cmd.register(app) # `wt init`, `wt status`, `wt rollback`
 
-# corpus-status and fill-availability are user-facing — register on main app
-admin.register(app, advanced=advanced)
-
-# cache on main app; cache-set-pdf goes to advanced
-cache.register(app, advanced=advanced)
+# ── Advanced commands (individual stages + tooling) ───────────────────────────
+classify.register(advanced)
+eval.register(advanced)
+eval_db.register(advanced)
+coverage.register(advanced)
+extract.register(advanced)
+merge.register(advanced)
+reconcile.register(advanced)
+report.register(advanced)
+admin.register(advanced, advanced=advanced)
+cache.register(advanced, advanced=advanced)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

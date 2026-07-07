@@ -28,7 +28,7 @@ def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
             key_status = "configured" if provider.api_key_configured else f"missing {provider.api_key_env}"
             typer.echo(f"- {provider.provider}: model={provider.model}, key={key_status}")
 
-    @app.command("corpus-status")  # primary — user-facing
+    @_adv.command("corpus-status")
     def corpus_status(db: str = typer.Option("taxonomy.sqlite", "--db")) -> None:
         """Show what's in the corpus: venues, years, paper counts, extraction status."""
         from wireless_taxonomy.db import connect
@@ -275,7 +275,7 @@ def register(app: typer.Typer, advanced: typer.Typer | None = None) -> None:
             typer.echo(f"Purged {len(doomed)} cache entries containing: {', '.join(dataset_name)}")
             typer.echo("Re-run extract-datasets for affected venues to get fresh extractions.")
 
-    @app.command("fill-availability")  # primary — user-facing
+    @_adv.command("fill-availability")
     def fill_availability(
         db: str = typer.Option("taxonomy.sqlite", "--db"),
         cache_file: str = typer.Option(".wt_cache.json", "--cache-path", "--cache"),

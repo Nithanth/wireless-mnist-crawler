@@ -435,10 +435,10 @@ class Pipeline:
 
         papers: list[dict] = []
         items = ((i, row) for i, row in enumerate(rows, 1))
-        for item, resolved, error in parallel_map(_resolve_item, items, workers):
+        for item, resolved, error in parallel_map(_resolve_item, items, workers, task_timeout=120):
             if error is not None:
-                # Defensive: should not happen because resolve swallows exceptions,
-                # but log and continue rather than crashing a long batch.
+                # Log and skip — resolve normally swallows exceptions but
+                # timeouts and unexpected errors should not crash the batch.
                 print(
                     f"  [!] OA resolver error on paper {item[0]}/{n_total}: {error}",
                     file=sys.stderr,
@@ -505,10 +505,16 @@ class Pipeline:
         total = self.conn.execute(
             "SELECT COUNT(*) FROM papers WHERE conference_instance_id = ?", (ci_id,)
         ).fetchone()[0]
-        with_pdf = self.conn.execute(
-            "SELECT COUNT(*) FROM papers WHERE conference_instance_id = ? AND pdf_url IS NOT NULL AND pdf_url != ''",
-            (ci_id,),
-        ).fetchone()[0]
+        # Use paper_text_artifacts for real PDF coverage (pdf_url is only
+        # set by the newer fetch-coverage pipeline; legacy runs fetched PDFs
+        # without populating that column).
+        with_pdf = self.conn.execute("""
+            SELECT COUNT(DISTINCT p.id)
+            FROM papers p
+            LEFT JOIN paper_text_artifacts pta ON pta.paper_id = p.id
+            WHERE p.conference_instance_id = ?
+              AND (pta.fetch_status = 'ok' OR p.pdf_url IS NOT NULL)
+        """, (ci_id,)).fetchone()[0]
         with_oa = self.conn.execute(
             "SELECT COUNT(*) FROM papers WHERE conference_instance_id = ? AND oa_attempted_at IS NOT NULL",
             (ci_id,),
@@ -538,6 +544,7 @@ class Pipeline:
         retry_failed: bool = False,
         classify_settings=None,
         extract_settings=None,
+        classify_no_pdf: bool = False,
     ) -> dict:
         """Extract dataset records from every fetchable paper in a venue/year.
 
@@ -602,7 +609,7 @@ class Pipeline:
         if wireless_only:
             from wireless_taxonomy.analyze.candidates import LlmCandidateClassifier
             from wireless_taxonomy.analyze.dataset_extractor import (
-                _fetch_pdf_bytes, load_cached_pdf, store_cached_pdf,
+                _fetch_pdf_bytes, has_cached_pdf, load_cached_pdf, store_cached_pdf,
                 load_cached_pdf_text, load_cached_pdf_failed,
                 store_cached_pdf_failure, clear_cached_pdf_failures,
             )
@@ -639,12 +646,11 @@ class Pipeline:
                     #   prev_failed → prior attempt recorded as failed; skip
                     #                 unless retry_failed cleared the record
                     #   neither     → needs a fresh download attempt
+                    # Use has_cached_pdf (lightweight existence check) instead
+                    # of load_cached_pdf (decodes full base64 blob).
                     cached_ok = prev_failed = False
                     if pdf_url:
-                        cached_ok = (
-                            load_cached_pdf(self.conn, row["id"], pdf_url) is not None
-                            or load_cached_pdf_text(self.conn, row["id"], pdf_url) is not None
-                        )
+                        cached_ok = has_cached_pdf(self.conn, row["id"], pdf_url)
                         if not cached_ok:
                             prev_failed = load_cached_pdf_failed(self.conn, row["id"], pdf_url)
                     yield (i, row, pdf_url, cached_ok, prev_failed)
@@ -657,9 +663,19 @@ class Pipeline:
 
             print(f"\n  ── Stage 1/3: PDF prefetch — {n_total} papers ──", file=sys.stderr)
             n_cached = n_fetched = n_failed = n_skipped = n_nourl = 0
-            for item, fetched, error in parallel_map(_prefetch, _prefetch_items(), workers):
+            for item, fetched, error in parallel_map(_prefetch, _prefetch_items(), workers, task_timeout=120):
                 i, row, pdf_url, cached_ok, prev_failed = item
                 title = row["title"]
+                if error is not None:
+                    print(f"  [!] Error on paper {i}/{n_total}: {title[:60]} — {error}", file=sys.stderr)
+                    n_failed += 1
+                    if i % 25 == 0 or i == n_total:
+                        print(
+                            f"  [{i}/{n_total}] … {n_cached} cached · {n_fetched} downloaded "
+                            f"· {n_failed} failed · {n_skipped} skipped (prev failed) · {n_nourl} no PDF URL",
+                            file=sys.stderr,
+                        )
+                    continue
                 if not pdf_url:
                     n_nourl += 1
                 elif cached_ok:
@@ -692,28 +708,39 @@ class Pipeline:
                 file=sys.stderr,
             )
 
-            # Classify (yes/maybe/no) with bounded parallelism. Workers only
-            # call the LLM (the shared cache is lock-protected); PDF bytes are
-            # loaded from the SQLite cache on this thread at submit time.
+            # Classify (yes/maybe/no) with bounded parallelism.
+            # --classify-no-pdf: use keyword snippets from cached PDF text
+            # instead of sending full PDF bytes (56x cheaper, same accuracy
+            # for the binary wireless/not decision).
             def _classify_items():
                 for i, row in enumerate(rows, 1):
                     pdf_url = (oa_pdf_urls or {}).get(row["title"])
-                    pdf_bytes = load_cached_pdf(self.conn, row["id"], pdf_url) if pdf_url else None
-                    yield (i, row, pdf_bytes)
+                    if classify_no_pdf:
+                        # Load pre-extracted text for snippet search (cheap)
+                        pdf_text = load_cached_pdf_text(self.conn, row["id"], pdf_url) if pdf_url else None
+                        yield (i, row, None, pdf_text)
+                    else:
+                        # Legacy: send full PDF bytes to LLM
+                        pdf_bytes = load_cached_pdf(self.conn, row["id"], pdf_url) if pdf_url else None
+                        yield (i, row, pdf_bytes, None)
 
             def _classify(item):
-                _i, row, pdf_bytes = item
+                _i, row, pdf_bytes, pdf_text = item
                 force = bool(refresh_titles) and _norm_title(row["title"]) in refresh_titles
-                return classifier.classify(dict(row), pdf_bytes=pdf_bytes, refresh=force)
+                return classifier.classify(
+                    dict(row), pdf_bytes=pdf_bytes, pdf_text=pdf_text,
+                    refresh=force, classify_no_pdf=classify_no_pdf,
+                )
 
             print(
                 f"\n  ── Stage 2/3: Wireless classification — {n_total} papers ──",
                 file=sys.stderr,
             )
             wireless_ids: set[int] = set()
+            predictions_to_persist: list = []
             n_yes = n_maybe = n_no = n_err = 0
-            for item, pred, error in parallel_map(_classify, _classify_items(), workers):
-                i, row, _pdf = item
+            for item, pred, error in parallel_map(_classify, _classify_items(), workers, task_timeout=120):
+                i, row, _pdf, _txt = item
                 if isinstance(error, CreditExhaustedError):
                     if cache is not None:
                         cache.save()
@@ -725,11 +752,15 @@ class Pipeline:
                     )
                     raise error
                 if error is not None:
-                    # On LLM failure, default to "maybe" for max recall rather
-                    # than silently dropping the paper.
                     n_err += 1
-                    print(f"  [{i}/{n_total}] [!] LLM error (defaulting to maybe): {row['title'][:60]} — {error}", file=sys.stderr)
-                    wireless_ids.add(row["id"])
+                    if isinstance(error, TimeoutError):
+                        # Timeout — skip, don't default to maybe
+                        print(f"  [!] Timeout on classification for paper {i}/{n_total}: {row['title'][:60]}", file=sys.stderr)
+                    else:
+                        # LLM failure — default to "maybe" for max recall
+                        # rather than silently dropping the paper.
+                        print(f"  [{i}/{n_total}] [!] LLM error (defaulting to maybe): {row['title'][:60]} — {error}", file=sys.stderr)
+                        wireless_ids.add(row["id"])
                     continue
                 if pred.label == "yes":
                     n_yes += 1
@@ -745,6 +776,7 @@ class Pipeline:
                     print(f"  [{i}/{n_total}] [~] maybe({pred.confidence}): {row['title'][:60]}", file=sys.stderr)
                 if pred.low_pass:
                     wireless_ids.add(row["id"])
+                predictions_to_persist.append(pred)
                 # Rolling progress every 25 papers (non-verbose mode)
                 if not verbose and (i % 25 == 0 or i == n_total):
                     print(
@@ -757,6 +789,29 @@ class Pipeline:
                     cache.save()
             if cache is not None:
                 cache.save()
+
+            # Persist classification results to DB for auditing
+            with transaction(self.conn):
+                for pred in predictions_to_persist:
+                    self.conn.execute(
+                        """
+                        INSERT OR REPLACE INTO wireless_candidate_predictions
+                        (paper_id, classifier, model_version, label, confidence,
+                         evidence, high_pass, low_pass, used_abstract)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            pred.paper_id,
+                            pred.classifier,
+                            pred.model_version,
+                            pred.label,
+                            pred.confidence,
+                            pred.evidence,
+                            int(pred.high_pass),
+                            int(pred.low_pass),
+                            int(pred.used_abstract),
+                        ),
+                    )
             total_before = len(rows)
             rows = [r for r in rows if r["id"] in wireless_ids]
             print(
@@ -810,7 +865,7 @@ class Pipeline:
             f"\n  ── Stage 3/3: Dataset extraction — {n_extract} wireless papers ──",
             file=sys.stderr,
         )
-        for item, result, error in _pmap(_extract, _extract_items(), workers):
+        for item, result, error in _pmap(_extract, _extract_items(), workers, task_timeout=120):
             idx, row, pdf_url, _pdf = item
             title = row["title"]
             doi = (row["doi"] or "").strip()
@@ -821,12 +876,15 @@ class Pipeline:
                     if cache is not None:
                         cache.save()
                     print(
-                        f"\n  💳 {error}\n"
-                        f"  💾 Checkpoint saved after {idx - 1}/{n_extract} papers. "
+                        f"\n  [credit exhausted] {error}\n"
+                        f"  Checkpoint saved after {idx - 1}/{n_extract} papers. "
                         "Re-run after reloading credits to resume.",
                         file=sys.stderr,
                     )
-                raise error
+                    raise error
+                # Timeout or other error — skip this paper and continue
+                print(f"  [!] Error extracting paper {idx}/{n_extract}: {title[:60]} — {error}", file=sys.stderr)
+                continue
 
             with transaction(self.conn):
                 self.conn.execute(

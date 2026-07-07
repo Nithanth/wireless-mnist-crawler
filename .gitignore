@@ -28,6 +28,7 @@ src/evidence/
 
 # Results & batch outputs
 src/results/
+corpora/
 cov_*.json
 batch_output.log
 logs/

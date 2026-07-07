@@ -235,10 +235,11 @@ def register(app: typer.Typer) -> None:
                 if name not in seen_datasets:
                     seen_datasets[name] = d.copy()
                     seen_datasets[name]["_paper_count"] = 1
-                    seen_datasets[name]["_first_key"] = p["bibtex_key"]
+                    seen_datasets[name]["_bibtex_keys"] = [p["bibtex_key"]]
                     seen_datasets[name]["_introducing_key"] = p["bibtex_key"] if d.get("relationship_type") == "introduced" else ""
                 else:
                     seen_datasets[name]["_paper_count"] += 1
+                    seen_datasets[name]["_bibtex_keys"].append(p["bibtex_key"])
                     if d.get("relationship_type") == "introduced" and not seen_datasets[name]["_introducing_key"]:
                         seen_datasets[name]["_introducing_key"] = p["bibtex_key"]
 
@@ -253,9 +254,11 @@ def register(app: typer.Typer) -> None:
             writer.writeheader()
             for name, d in sorted(seen_datasets.items()):
                 avail = "Y" if d["availability"] else ("N" if d["availability"] is False else "")
+                # Deduplicate and sort bibtex keys
+                unique_keys = sorted(set(d["_bibtex_keys"]))
                 writer.writerow({
                     "Dataset Name": name,
-                    "Bibtex Citation Key": d.get("_introducing_key") or d.get("_first_key", ""),
+                    "Bibtex Citation Key": "; ".join(unique_keys),
                     "OSI Layer (L1-L7)": "; ".join(d["osi_layers"]),
                     "Modality(ies)": "; ".join(d["modalities"]),
                     "Availability (Open? Y/N)": avail,

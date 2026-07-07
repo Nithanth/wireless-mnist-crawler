@@ -37,12 +37,16 @@ def parallel_map(
     items: Iterable[T],
     workers: int,
     window: int | None = None,
+    task_timeout: int | None = None,
 ) -> Iterator[tuple[T, R | None, Exception | None]]:
     """Apply ``fn`` to ``items`` with ``workers`` threads, yielding in order.
 
     Yields ``(item, result, error)`` triples in input order: exactly one of
     ``result``/``error`` is non-None. With ``workers <= 1`` this degenerates
     to a plain sequential loop (no threads).
+
+    ``task_timeout`` is the maximum seconds to wait for a single task before
+    cancelling it and yielding a TimeoutError. If None, waits indefinitely.
     """
     if workers <= 1:
         for item in items:
@@ -61,7 +65,17 @@ def parallel_map(
         while in_flight:
             item, future = in_flight.popleft()
             try:
-                yield item, future.result(), None
+                if task_timeout is not None:
+                    result = future.result(timeout=task_timeout)
+                else:
+                    result = future.result()
+                yield item, result, None
+            except TimeoutError:
+                # future.cancel() only prevents pending tasks from starting;
+                # it cannot kill an already-running thread.  The abandoned
+                # thread will eventually finish (or die with the process).
+                future.cancel()
+                yield item, None, TimeoutError(f"Task timed out after {task_timeout}s")
             except Exception as exc:
                 yield item, None, exc
             for nxt in islice(iterator, 1):

@@ -1,14 +1,10 @@
-"""Unified `run` command: orchestrates the full pipeline in the correct order.
-
-Replaces run_loop.sh with a proper CLI command that enforces stage ordering,
-supports per-stage model selection, and provides cost visibility.
+"""The `add` command: fetch + extract venues/years into the active corpus.
 
 Pipeline order per venue/year:
   1. fetch-coverage   — resolve open-access PDF URLs
   2. extract-datasets — classify + extract datasets from PDFs/abstracts
 Then once at the end:
   3. merge-results    — combine per-venue CSVs into master files
-  4. report           — generate corpus summary
 """
 
 from typing import Optional
@@ -19,8 +15,8 @@ from wireless_taxonomy.commands._shared import parse_years
 
 
 def register(app: typer.Typer) -> None:
-    @app.command("run")
-    def run(
+    @app.command("add")
+    def add(
         venues: str = typer.Option(
             ..., "--venues",
             help="Comma-separated venue names (e.g. SIGCOMM,IMC,NSDI).",
@@ -52,48 +48,44 @@ def register(app: typer.Typer) -> None:
         verbose: bool = typer.Option(False, "--verbose", help="Per-paper classification output."),
         fresh: bool = typer.Option(False, "--fresh", help="Clear LLM cache and re-extract everything."),
         retry_failed: bool = typer.Option(False, "--retry-failed", help="Retry previously failed PDF downloads."),
-        out: str = typer.Option("./src/results", "--out", help="Output directory for CSV sheets."),
-        db: str = typer.Option("taxonomy.sqlite", "--db"),
-        corpus: str = typer.Option(
-            None, "--corpus",
-            help="Corpus name (corpora/<name>/). Overrides --db and --out.",
-        ),
         estimate: bool = typer.Option(
             False, "--estimate",
             help="Dry-run: show estimated paper counts and LLM calls per stage without running anything.",
         ),
         skip_coverage: bool = typer.Option(False, "--skip-coverage", help="Skip fetch-coverage (reuse existing OA data)."),
-        skip_merge: bool = typer.Option(False, "--skip-merge", help="Skip merge-results at the end."),
-        skip_report: bool = typer.Option(False, "--skip-report", help="Skip report generation at the end."),
+        classify_no_pdf: bool = typer.Option(
+            False, "--classify-no-pdf/--classify-with-pdf",
+            help="Classify using keyword snippets from PDF text instead of full PDF (56x cheaper).",
+        ),
         yes: bool = typer.Option(False, "--yes", "-y", help="Skip interactive confirmations."),
     ) -> None:
-        """Run the full pipeline: fetch-coverage, extract-datasets, merge, report.
+        """Add venues/years to the corpus: fetch PDFs, classify, extract datasets.
 
-        Orchestrates all stages in the correct dependency order for one or more
-        venue/year combinations.  Equivalent to run_loop.sh but with proper
-        prerequisite enforcement, per-stage model selection, and cost visibility.
+        Runs the full extraction pipeline for each venue/year pair, then merges
+        results into master CSVs. The corpus is incremental — re-running with the
+        same venues/years is cheap (cached papers skip instantly).
 
         \b
         Examples:
-          wt run --venues SIGCOMM,IMC --years 2022:2025 --workers 6
-          wt run --venues ICC --years 2023 --classify-model google/gemini-2.0-flash
-          wt run --venues NSDI --years 2025 --skip-coverage  # reuse existing OA data
+          wt add --venues SIGCOMM,IMC --years 2022:2025 --workers 6
+          wt add --venues ICC --years 2023 --classify-model google/gemini-2.0-flash
+          wt add --venues NSDI --years 2025 --skip-coverage --estimate
         """
-        import csv as _csv
-        import glob as _glob
-        import json
-        import os
         import time
         from pathlib import Path
 
         from wireless_taxonomy.analyze.cache import MetadataCache
         from wireless_taxonomy.commands._shared import make_pipeline, parse_model_override
         from wireless_taxonomy.config import load_dotenv
+        from wireless_taxonomy.corpus import (
+            active_corpus,
+            check_model_compatibility,
+            resolve_corpus,
+        )
 
         load_dotenv()
 
         venue_list = [v.strip() for v in venues.split(",") if v.strip()]
-        # Parse years: support comma lists and ranges
         year_list: list[int] = []
         for part in years.split(","):
             part = part.strip()
@@ -106,87 +98,73 @@ def register(app: typer.Typer) -> None:
             typer.echo("No venues or years specified.", err=True)
             raise typer.Exit(1)
 
-        # ── Corpus resolution ─────────────────────────────────────────────
-        corpus_obj = None
-        if corpus:
+        # ── Corpus resolution (mandatory — auto-creates if needed) ────
+        from wireless_taxonomy.corpus import next_auto_name
+
+        corpus_obj = active_corpus()
+        if corpus_obj is None:
+            auto_name = next_auto_name()
+            corpus_obj = resolve_corpus(auto_name, create=True)
+            typer.echo(f"Created corpus: {corpus_obj.name}")
+
+        db = str(corpus_obj.db_path)
+        out = str(corpus_obj.results_dir)
+
+        try:
             from wireless_taxonomy.config import load_settings as _load_settings
-            from wireless_taxonomy.corpus import check_model_compatibility, resolve_corpus
             from wireless_taxonomy.llm import LlmRouter as _Router
 
-            try:
-                corpus_obj = resolve_corpus(corpus, create=True)
-            except ValueError as exc:
-                typer.echo(str(exc), err=True)
-                raise typer.Exit(1)
-            db = str(corpus_obj.db_path)
-            out = str(corpus_obj.results_dir)
-
-            try:
-                _provider = _Router(_load_settings(db).llm).select_provider()
-                current_model = f"{_provider.provider}/{_provider.model}"
-            except Exception:
-                current_model = ""
-            warning = check_model_compatibility(corpus_obj, current_model)
-            if warning:
-                typer.echo(f"\nWARNING: {warning}\n", err=True)
-                if not yes and not typer.confirm("Continue with mixed-model corpus?", default=False):
-                    raise typer.Exit(1)
-
-            # Snapshot before mutating — always reversible
-            snap = corpus_obj.snapshot()
-            if snap:
-                typer.echo(f"Snapshot: {snap.stem} (rollback with: wt corpus rollback {snap.stem})")
-
-        # ── Pre-flight: verify LLM API key is configured ──────────────
-        try:
-            from wireless_taxonomy.config import load_settings as _pf_settings
-            from wireless_taxonomy.llm import LlmRouter as _pf_Router
-
-            _pf_provider = _pf_Router(_pf_settings(db).llm).select_provider()
-            if not _pf_provider.api_key_configured:
-                typer.echo(
-                    f"ERROR: No API key configured for {_pf_provider.provider}. "
-                    f"Set {_pf_provider.api_key_env} in .env",
-                    err=True,
-                )
-                raise typer.Exit(1)
+            _provider = _Router(_load_settings(db).llm).select_provider()
+            current_model = f"{_provider.provider}/{_provider.model}"
         except RuntimeError as exc:
             typer.echo(f"ERROR: {exc}", err=True)
             raise typer.Exit(1)
+        except Exception:
+            current_model = ""
+
+        if not _provider.api_key_configured:
+            typer.echo(
+                f"ERROR: No API key for {_provider.provider}. "
+                f"Set {_provider.api_key_env} in .env",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        warning = check_model_compatibility(corpus_obj, current_model)
+        if warning:
+            typer.echo(f"\nWARNING: {warning}\n", err=True)
+            if not yes and not typer.confirm("Continue with mixed-model corpus?", default=False):
+                raise typer.Exit(1)
+
+        # Snapshot before mutating — always reversible
+        snap = corpus_obj.snapshot()
+        if snap:
+            typer.echo(f"Snapshot: {snap.stem} (rollback with: wt rollback {snap.stem})")
 
         # ── Per-stage model overrides ─────────────────────────────────────
         cls_settings = parse_model_override(classify_model) if classify_model else None
         ext_settings = parse_model_override(extract_model) if extract_model else None
 
         if classify_model or extract_model:
-            typer.echo("Model configuration:")
+            typer.echo("Models:")
             if classify_model:
-                typer.echo(f"  Classification: {classify_model}")
-            else:
-                typer.echo("  Classification: (default)")
+                typer.echo(f"  classify: {classify_model}")
             if extract_model:
-                typer.echo(f"  Extraction:     {extract_model}")
-            else:
-                typer.echo("  Extraction:     (default)")
+                typer.echo(f"  extract:  {extract_model}")
             typer.echo("")
 
         # ── Plan summary ──────────────────────────────────────────────────
         pairs = [(v, y) for v in venue_list for y in year_list]
-        stages = []
-        if not skip_coverage:
-            stages.append("fetch-coverage")
+        stages = ["fetch-coverage"] if not skip_coverage else []
         stages.append("extract-datasets")
-        if not skip_merge:
-            stages.append("merge-results")
-        if not skip_report:
-            stages.append("report")
+        stages.append("merge-results")
 
+        typer.echo(f"Corpus:   {corpus_obj.name}")
         typer.echo(f"Pipeline: {' -> '.join(stages)}")
         typer.echo(f"Venues:   {', '.join(venue_list)}")
         typer.echo(f"Years:    {', '.join(str(y) for y in year_list)}")
         typer.echo(f"Total:    {len(pairs)} venue-year combinations")
         typer.echo(f"Workers:  {workers}")
-        typer.echo(f"Output:   {out}")
         typer.echo("")
 
         # ── Estimate mode ─────────────────────────────────────────────
@@ -222,74 +200,126 @@ def register(app: typer.Typer) -> None:
             typer.echo("\nRe-run without --estimate to execute.")
             raise typer.Exit()
 
+        # ── Logging setup ──────────────────────────────────────────────
+        import datetime as _dt
+        import sys
+
+        log_dir = corpus_obj.dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        _log_fh = log_file.open("w", encoding="utf-8")
+
+        def _echo(msg: str = "") -> None:
+            """Print to both console and log file."""
+            typer.echo(msg)
+            _log_fh.write(msg + "\n")
+            _log_fh.flush()
+
+        def _ts() -> str:
+            return _dt.datetime.now().strftime("%H:%M:%S")
+
+        def _fmt_dur(secs: float) -> str:
+            s = int(secs)
+            h, s = divmod(s, 3600)
+            m, s = divmod(s, 60)
+            if h > 0:
+                return f"{h}h {m}m {s}s"
+            if m > 0:
+                return f"{m}m {s}s"
+            return f"{s}s"
+
+        # ── Start ─────────────────────────────────────────────────────
+        _echo("")
+        _echo("╔══════════════════════════════════════════════════════╗")
+        _echo(f"║  wt add: {len(venue_list)} venues x {len(year_list)} years = {len(pairs)} jobs")
+        _echo(f"║  Venues: {', '.join(venue_list)}")
+        _echo(f"║  Years:  {', '.join(str(y) for y in year_list)}")
+        _echo(f"║  Corpus: {corpus_obj.name}")
+        _echo(f"║  Log:    {log_file}")
+        _echo("╚══════════════════════════════════════════════════════╝")
+        _echo("")
+
         metadata_cache = MetadataCache(".wt_cache.json")
         pipeline = make_pipeline(db)
         t0 = time.monotonic()
         all_extract_results: list[dict] = []
+        completed = 0
+        failed: list[str] = []
 
         try:
             for vi, venue in enumerate(venue_list, 1):
                 for yi, year in enumerate(year_list, 1):
-                    label = f"[{venue} {year}] ({vi * len(year_list) + yi - len(year_list)}/{len(pairs)})"
+                    idx = (vi - 1) * len(year_list) + yi
+                    _echo("")
+                    _echo(f"┌─ [{idx}/{len(pairs)}] {venue} {year}")
+                    _echo(f"│  {_ts()} Starting...")
 
-                    # ── Stage 1: fetch-coverage ───────────────────────
-                    if not skip_coverage:
-                        typer.echo(f"\n{label} Resolving open-access PDF URLs...")
-                        pipeline.text_availability_conference(
-                            venue, year,
+                    try:
+                        # ── Stage 1: fetch-coverage ───────────────────────
+                        if not skip_coverage:
+                            _echo(f"│  {_ts()} fetch-coverage...")
+                            pipeline.text_availability_conference(
+                                venue, year,
+                                source_type="dblp",
+                                resolve_dois=True,
+                                cache=metadata_cache,
+                                workers=workers,
+                                web_search=web_search,
+                            )
+                            metadata_cache.save()
+                            cov = pipeline.check_coverage_ready(venue, year)
+                            pct = f"({100*cov['papers_with_pdf']//max(cov['total_papers'],1)}%)" if cov['total_papers'] else ""
+                            _echo(
+                                f"│  {_ts()} Coverage: {cov['papers_with_pdf']}/{cov['total_papers']} PDFs {pct}"
+                            )
+
+                        # ── Stage 2: extract-datasets ─────────────────────
+                        _echo(f"│  {_ts()} extract-datasets...")
+                        result = pipeline.extract_datasets_conference(
+                            venue=venue,
+                            year=year,
                             source_type="dblp",
                             resolve_dois=True,
                             cache=metadata_cache,
+                            fresh=fresh,
+                            wireless_only=wireless_only,
                             workers=workers,
-                            web_search=web_search,
+                            verbose=verbose,
+                            retry_failed=retry_failed,
+                            classify_settings=cls_settings,
+                            extract_settings=ext_settings,
+                            classify_no_pdf=classify_no_pdf,
+                        )
+                        all_extract_results.append(result)
+                        _echo(
+                            f"│  {_ts()} Done: {result['papers_with_datasets']}/{result['total_papers']} papers "
+                            f"-> {result['total_dataset_records']} datasets"
                         )
                         metadata_cache.save()
-                        cov = pipeline.check_coverage_ready(venue, year)
-                        typer.echo(
-                            f"  Coverage: {cov['papers_with_pdf']}/{cov['total_papers']} "
-                            f"papers have PDF URLs"
-                        )
 
-                    # ── Stage 2: extract-datasets ─────────────────────
-                    typer.echo(f"\n{label} Extracting datasets...")
-                    result = pipeline.extract_datasets_conference(
-                        venue=venue,
-                        year=year,
-                        source_type="dblp",
-                        resolve_dois=True,
-                        cache=metadata_cache,
-                        fresh=fresh,
-                        wireless_only=wireless_only,
-                        workers=workers,
-                        verbose=verbose,
-                        retry_failed=retry_failed,
-                        classify_settings=cls_settings,
-                        extract_settings=ext_settings,
-                    )
-                    all_extract_results.append(result)
-                    typer.echo(
-                        f"  {result['papers_with_datasets']}/{result['total_papers']} papers "
-                        f"with datasets - {result['total_dataset_records']} records"
-                    )
-                    metadata_cache.save()
-
-                    # Record in corpus metadata
-                    if corpus_obj is not None:
-                        model_label = extract_model or classify_model or ""
-                        if not model_label:
-                            from wireless_taxonomy.config import load_settings as _ls
-                            from wireless_taxonomy.llm import LlmRouter as _R
-                            try:
-                                _p = _R(_ls(db).llm).select_provider()
-                                model_label = f"{_p.provider}/{_p.model}"
-                            except Exception:
-                                pass
+                        # Record in corpus metadata
+                        model_label = extract_model or classify_model or current_model
                         if model_label:
                             corpus_obj.record_run(
                                 model_label, f"{venue} {year}",
                                 classify_model=classify_model,
                                 extract_model=extract_model,
                             )
+                        completed += 1
+
+                    except Exception as exc:
+                        _echo(f"│  {_ts()} FAILED: {exc}")
+                        failed.append(f"{venue} {year}")
+                        continue
+
+                    # ETA
+                    elapsed_so_far = time.monotonic() - t0
+                    remaining = len(pairs) - idx
+                    if idx > 0 and remaining > 0:
+                        avg = elapsed_so_far / idx
+                        eta = _fmt_dur(avg * remaining)
+                        _echo(f"│  ETA: ~{eta} remaining ({remaining} jobs left)")
+                    _echo(f"└─ [{idx}/{len(pairs)}] {venue} {year} complete ({_fmt_dur(elapsed_so_far)} elapsed)")
 
         finally:
             pipeline.close()
@@ -299,32 +329,28 @@ def register(app: typer.Typer) -> None:
 
         # ── Stage 3: merge-results ────────────────────────────────────
         out_dir = Path(out)
-        if not skip_merge:
-            typer.echo("\nMerging results into master CSVs...")
-            # Write per-venue/year CSVs first
-            for result in all_extract_results:
-                v, y = result["venue"], result["year"]
-                _write_venue_year_csvs(out_dir, v, y, result)
-
-            # Now merge
-            from wireless_taxonomy.commands.merge import register as _unused  # noqa: F841 — just need the module
-            import wireless_taxonomy.commands.merge as _merge_mod
-            # Call merge logic directly via the CLI
-            _do_merge(out_dir)
-
-        # ── Stage 4: report ───────────────────────────────────────────
-        if not skip_report:
-            typer.echo("\nGenerating corpus report...")
-            _do_report(out_dir)
+        _echo(f"\n{_ts()} Merging results...")
+        for result in all_extract_results:
+            v, y = result["venue"], result["year"]
+            _write_venue_year_csvs(out_dir, v, y, result)
+        _do_merge(out_dir)
 
         # ── Summary ──────────────────────────────────────────────────
         total_papers = sum(r["total_papers"] for r in all_extract_results)
         total_datasets = sum(r["total_dataset_records"] for r in all_extract_results)
-        typer.echo(f"\nDone in {elapsed:.0f}s.")
-        typer.echo(f"  {len(pairs)} venue-years processed")
-        typer.echo(f"  {total_papers} wireless papers")
-        typer.echo(f"  {total_datasets} dataset records extracted")
-        typer.echo(f"  Output: {out_dir}/")
+        _echo("")
+        _echo("╔══════════════════════════════════════════════════════╗")
+        _echo(f"║  COMPLETE: {_fmt_dur(elapsed)}")
+        _echo(f"║  {completed}/{len(pairs)} venue-years processed" + (f" ({len(failed)} failed)" if failed else ""))
+        _echo(f"║  {total_papers} wireless papers")
+        _echo(f"║  {total_datasets} dataset records extracted")
+        _echo(f"║  Output: {out_dir}/")
+        _echo(f"║  Log:    {log_file}")
+        _echo("╚══════════════════════════════════════════════════════╝")
+        if failed:
+            _echo(f"\nFailed: {', '.join(failed)}")
+        _echo(f"\nNext: wt export    (reconcile + final output)")
+        _log_fh.close()
 
 
 def _write_venue_year_csvs(out_dir, venue, year, result):
@@ -386,12 +412,13 @@ def _write_venue_year_csvs(out_dir, venue, year, result):
             if name not in seen_datasets:
                 seen_datasets[name] = d.copy()
                 seen_datasets[name]["_paper_count"] = 1
-                seen_datasets[name]["_first_key"] = p["bibtex_key"]
+                seen_datasets[name]["_bibtex_keys"] = [p["bibtex_key"]]
                 seen_datasets[name]["_introducing_key"] = (
                     p["bibtex_key"] if d.get("relationship_type") == "introduced" else ""
                 )
             else:
                 seen_datasets[name]["_paper_count"] += 1
+                seen_datasets[name]["_bibtex_keys"].append(p["bibtex_key"])
                 if d.get("relationship_type") == "introduced" and not seen_datasets[name]["_introducing_key"]:
                     seen_datasets[name]["_introducing_key"] = p["bibtex_key"]
 
@@ -406,9 +433,11 @@ def _write_venue_year_csvs(out_dir, venue, year, result):
         writer.writeheader()
         for name, d in sorted(seen_datasets.items()):
             avail = "Y" if d["availability"] else ("N" if d["availability"] is False else "")
+            # Deduplicate and sort bibtex keys
+            unique_keys = sorted(set(d["_bibtex_keys"]))
             writer.writerow({
                 "Dataset Name": name,
-                "Bibtex Citation Key": d.get("_introducing_key") or d.get("_first_key", ""),
+                "Bibtex Citation Key": "; ".join(unique_keys),
                 "OSI Layer (L1-L7)": "; ".join(d["osi_layers"]),
                 "Modality(ies)": "; ".join(d["modalities"]),
                 "Availability (Open? Y/N)": avail,
@@ -514,31 +543,4 @@ def _do_merge(results_dir):
         typer.echo(f"  {p.name}: {len(merged_ds)} datasets from {len(datasets_files)} files")
 
 
-def _do_report(results_dir):
-    """Run report generation programmatically."""
-    from pathlib import Path
 
-    import typer
-
-    try:
-        from wireless_taxonomy.commands.report import (
-            _load_coverage,
-            _load_raw_runs,
-            _venue_year_stats,
-        )
-    except ImportError:
-        typer.echo("  (report module not available, skipping)", err=True)
-        return
-
-    results = Path(results_dir)
-    entries = _load_raw_runs(results)
-    if not entries:
-        typer.echo("  No raw JSON results found for report.", err=True)
-        return
-
-    coverage = _load_coverage([results])
-    stats = _venue_year_stats(entries, coverage)
-
-    total_papers = sum(s["wireless_papers"] for s in stats)
-    total_datasets = sum(s["datasets"] for s in stats)
-    typer.echo(f"  Report: {len(stats)} venue-years, {total_papers} papers, {total_datasets} datasets")
