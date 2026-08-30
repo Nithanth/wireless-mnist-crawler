@@ -1,5 +1,7 @@
 # Evaluation Results: SIGCOMM, IMC, NSDI (2022--2024)
 
+> **Historical snapshot — not the final paper results.** This document records an intermediate June 2025 evaluation using Gemini 2.5 Flash and an earlier corpus. Do not use its counts for the final paper. The final annotated catalog and validation files are available in the versioned [Wireless Dataset Reuse Taxonomy v1.0.2](https://huggingface.co/datasets/nithanthram/wireless-reuse-taxonomy/tree/v1.0.2).
+
 **Date:** 2025-06-28
 **Model:** Gemini 2.5 Flash
 **Manual curation:** 99 papers across 3 venues and 3 years
