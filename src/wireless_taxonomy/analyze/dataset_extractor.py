@@ -454,17 +454,33 @@ def has_cached_pdf(conn, paper_id: int, pdf_url: str) -> bool:
         return False
 
 
-def load_cached_pdf(conn, paper_id: int, pdf_url: str) -> bytes | None:
-    """Return raw PDF bytes from paper_text_artifacts if previously fetched."""
+def load_cached_pdf(conn, paper_id: int, pdf_url: str | None = None) -> bytes | None:
+    """Return raw PDF bytes from paper_text_artifacts if previously fetched.
+
+    If ``pdf_url`` is provided, looks up by (paper_id, source_url) first.
+    Falls back to any ok pdf_b64 artifact for the paper_id alone — this
+    covers cases where papers.pdf_url wasn't backfilled but the PDF was
+    fetched and cached under a different URL.
+    """
     if conn is None:
         return None
     try:
         import base64
-        row = conn.execute(
-            "SELECT content_text, source_type FROM paper_text_artifacts "
-            "WHERE paper_id = ? AND source_url = ? AND fetch_status = 'ok' LIMIT 1",
-            (paper_id, pdf_url),
-        ).fetchone()
+        if pdf_url:
+            row = conn.execute(
+                "SELECT content_text, source_type FROM paper_text_artifacts "
+                "WHERE paper_id = ? AND source_url = ? AND fetch_status = 'ok' LIMIT 1",
+                (paper_id, pdf_url),
+            ).fetchone()
+        else:
+            row = None
+        # Fallback: any cached PDF for this paper_id
+        if not row:
+            row = conn.execute(
+                "SELECT content_text, source_type FROM paper_text_artifacts "
+                "WHERE paper_id = ? AND fetch_status = 'ok' AND source_type = 'pdf_b64' LIMIT 1",
+                (paper_id,),
+            ).fetchone()
         if row and row["content_text"]:
             if row["source_type"] == "pdf_b64":
                 return base64.b64decode(row["content_text"])
@@ -474,21 +490,34 @@ def load_cached_pdf(conn, paper_id: int, pdf_url: str) -> bytes | None:
     return None
 
 
-def load_cached_pdf_text(conn, paper_id: int, pdf_url: str) -> str | None:
+def load_cached_pdf_text(conn, paper_id: int, pdf_url: str | None = None) -> str | None:
     """Return pre-extracted PDF text from paper_text_artifacts if cached.
 
     Cheaper than load_cached_pdf: stores plain text (~50KB) instead of
     base64-encoded PDF bytes (~10MB), and avoids a second pypdf extraction
     pass at classification/extraction time.
+
+    Falls back to any ok pdf_text artifact for the paper_id if ``pdf_url``
+    doesn't match or is None.
     """
     if conn is None:
         return None
     try:
-        row = conn.execute(
-            "SELECT content_text, source_type FROM paper_text_artifacts "
-            "WHERE paper_id = ? AND source_url = ? AND fetch_status = 'ok' LIMIT 1",
-            (paper_id, pdf_url),
-        ).fetchone()
+        if pdf_url:
+            row = conn.execute(
+                "SELECT content_text, source_type FROM paper_text_artifacts "
+                "WHERE paper_id = ? AND source_url = ? AND fetch_status = 'ok' LIMIT 1",
+                (paper_id, pdf_url),
+            ).fetchone()
+        else:
+            row = None
+        # Fallback: any cached pdf_text for this paper_id
+        if not row or row["source_type"] != "pdf_text":
+            row = conn.execute(
+                "SELECT content_text, source_type FROM paper_text_artifacts "
+                "WHERE paper_id = ? AND fetch_status = 'ok' AND source_type = 'pdf_text' LIMIT 1",
+                (paper_id,),
+            ).fetchone()
         if row and row["content_text"] and row["source_type"] == "pdf_text":
             return row["content_text"]
     except Exception:

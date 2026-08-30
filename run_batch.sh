@@ -309,7 +309,7 @@ for VENUE in "${VENUES[@]}"; do
     # improves coverage as stale negatives get retried. The JSON is rewritten
     # each run with the union of everything known.
     echo "  $(ts) Step 1/2: fetch-coverage — resolving OA PDF URLs (cached papers skip instantly)..."
-    if ! python -m wireless_taxonomy.cli fetch-coverage \
+    if ! python -m wireless_taxonomy.cli advanced fetch-coverage \
       --venue "$VENUE" --years "$YEAR" \
       --workers "$WORKERS" $WEB_SEARCH_FLAG \
       --json "$COV_JSON"; then
@@ -323,7 +323,7 @@ for VENUE in "${VENUES[@]}"; do
     echo ""
     echo "  $(ts) Step 2/2: extract-datasets — fetching PDFs, classifying, extracting..."
     echo "         (wireless-only filter → LLM classification → dataset extraction)"
-    if ! python -m wireless_taxonomy.cli extract-datasets \
+    if ! python -m wireless_taxonomy.cli advanced extract-datasets \
       --venue "$VENUE" --years "$YEAR" \
       --oa-json "$COV_JSON" \
       --workers "$WORKERS" \
@@ -360,7 +360,7 @@ done
 
 echo ""
 echo "$(ts) Merging all results into master CSVs..."
-python -m wireless_taxonomy.cli merge-results --dir "$RESULTS_DIR" --out "$RESULTS_DIR"
+python -m wireless_taxonomy.cli advanced merge-results --dir "$RESULTS_DIR" --out "$RESULTS_DIR"
 
 echo ""
 # Reconciliation is intentionally run separately for the hero run — it can be

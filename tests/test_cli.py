@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 import subprocess
 import sys
@@ -6,6 +8,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from wireless_taxonomy.cli import _parse_venue_years, app
+from wireless_taxonomy.commands.export import _write_pdf_only_datasets
 
 runner = CliRunner()
 
@@ -60,6 +63,36 @@ def test_eval_exclude_and_min_gold_pull_from_headline(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert "under-curated / excluded" in result.output
     assert "IMC 2025" in result.output
+
+
+def test_pdf_only_export_maps_raw_keys_to_disambiguated_final_keys(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "consolidated_papers.csv",
+        "Paper Title,Bibtex Citation Key\nExample Wireless Paper,smith2024examplea\n",
+    )
+    _write(
+        tmp_path / "consolidated_datasets.csv",
+        "Canonical Name,Bibtex Citation Keys\nExample Dataset,smith2024examplea\n",
+    )
+    (tmp_path / "venue_2024_raw.json").write_text(
+        json.dumps({
+            "runs": [{
+                "papers": [{
+                    "title": "Example Wireless Paper",
+                    "bibtex_key": "smith2024example",
+                    "extraction_source": "pdf",
+                    "datasets": [{"name": "Example Dataset"}],
+                }],
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    _write_pdf_only_datasets(tmp_path)
+
+    with (tmp_path / "consolidated_datasets_pdf_only.csv").open(encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert [row["Canonical Name"] for row in rows] == ["Example Dataset"]
 
 
 def test_cli_help_renders_without_typer_click_compat_error() -> None:

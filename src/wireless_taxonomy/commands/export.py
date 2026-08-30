@@ -164,6 +164,7 @@ def register(app: typer.Typer) -> None:
         if fill:
             typer.echo("Filling unknown dataset availability...")
             from wireless_taxonomy.analyze.cache import MetadataCache
+            from wireless_taxonomy.analyze.dataset_extractor import _check_url_live
             from wireless_taxonomy.db import connect
             from wireless_taxonomy.llm import LlmRequest, LlmRouter
 
@@ -217,13 +218,17 @@ def register(app: typer.Typer) -> None:
 
                     avail = result_json.get("available")
                     url = result_json.get("url") or ""
-                    if avail is not None:
-                        status = "open" if avail else "closed"
-                        conn.execute(
-                            "UPDATE datasets SET availability_status = ?, availability_url = COALESCE(?, availability_url) WHERE id = ?",
-                            (status, url or None, row["dataset_id"]),
-                        )
-                        filled += 1
+                    if avail is True and url and _check_url_live(url):
+                        status = "open"
+                    elif avail is False:
+                        status = "closed"
+                    else:
+                        continue
+                    conn.execute(
+                        "UPDATE datasets SET availability_status = ?, availability_url = COALESCE(?, availability_url) WHERE id = ?",
+                        (status, url or None, row["dataset_id"]),
+                    )
+                    filled += 1
 
                 conn.commit()
                 cache.save()
@@ -254,6 +259,16 @@ def register(app: typer.Typer) -> None:
                     typer.echo("  No raw JSON results found for report.")
             except Exception as exc:
                 typer.echo(f"  Report generation failed: {exc}", err=True)
+
+        # ── Step 4: Consolidated papers & bibtex CSVs ─────────────────────
+        typer.echo("Writing consolidated papers & bibtex...")
+        _write_consolidated_papers_bibtex(corpus_obj, results_dir)
+        typer.echo(f"  Wrote: consolidated_papers.csv, consolidated_bibtex.csv")
+
+        # ── Step 5: PDF-only variant ─────────────────────────────────────
+        typer.echo("Writing PDF-only datasets variant...")
+        _write_pdf_only_datasets(results_dir)
+        typer.echo(f"  Wrote: consolidated_datasets_pdf_only.csv")
 
         typer.echo("\nExport complete.")
         typer.echo(f"  {consolidated_path}")
@@ -287,3 +302,136 @@ def _write_consolidated_csv(canonical, path):
                 ds.availability_url,
                 ds.merge_reason,
             ])
+
+
+def _write_consolidated_papers_bibtex(corpus_obj, results_dir):
+    """Write consolidated_papers.csv and consolidated_bibtex.csv.
+
+    Filters master CSVs to only include papers classified as wireless.
+    """
+    import csv as _csv
+    import sqlite3
+    from pathlib import Path
+
+    from wireless_taxonomy.db import connect
+
+    conn = connect(str(corpus_obj.db_path))
+    conn.row_factory = sqlite3.Row
+
+    # Get wireless paper IDs
+    wireless_ids = set(
+        row["paper_id"]
+        for row in conn.execute(
+            "SELECT paper_id FROM wireless_candidate_predictions WHERE label IN ('yes', 'maybe')"
+        ).fetchall()
+    )
+
+    # Map bibtex_key -> paper_id
+    key_to_pid = {
+        row["citation_key"]: row["paper_id"]
+        for row in conn.execute("SELECT paper_id, citation_key FROM bibtex_entries").fetchall()
+    }
+    conn.close()
+
+    # Filter master_papers.csv
+    master_papers_path = results_dir / "master_papers.csv"
+    if master_papers_path.exists():
+        with master_papers_path.open(encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            rows = list(reader)
+
+        wireless_papers = [
+            r for r in rows
+            if key_to_pid.get(r.get("Bibtex Citation Key", "")) in wireless_ids
+        ]
+
+        out = results_dir / "consolidated_papers.csv"
+        with out.open("w", newline="", encoding="utf-8") as f:
+            writer = _csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(wireless_papers)
+
+    # Filter master_bibtex.csv
+    master_bibtex_path = results_dir / "master_bibtex.csv"
+    if master_bibtex_path.exists():
+        with master_bibtex_path.open(encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            rows = list(reader)
+
+        wireless_bibtex = [
+            r for r in rows
+            if key_to_pid.get(r.get("Bibtex Citation Key", "")) in wireless_ids
+        ]
+
+        out = results_dir / "consolidated_bibtex.csv"
+        with out.open("w", newline="", encoding="utf-8") as f:
+            writer = _csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(wireless_bibtex)
+
+
+def _write_pdf_only_datasets(results_dir):
+    """Write consolidated_datasets_pdf_only.csv excluding abstract-only entries."""
+    import csv as _csv
+    import json
+    from pathlib import Path
+
+    results_dir = Path(results_dir)
+
+    # Build bibtex_key -> extraction_source mapping
+    def normalize_title(value: str) -> str:
+        return " ".join(value.lower().split())
+
+    title_to_final_key: dict[str, str] = {}
+    papers_path = results_dir / "consolidated_papers.csv"
+    if papers_path.exists():
+        with papers_path.open(encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                title = normalize_title(row.get("Paper Title", ""))
+                key = row.get("Bibtex Citation Key", "").strip()
+                if title and key:
+                    title_to_final_key[title] = key
+
+    key_to_source: dict[str, str] = {}
+    for f in sorted(results_dir.glob("*_raw.json")):
+        if f.name.startswith(("master_", "consolidated_")):
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            for run in data.get("runs") or ([data] if "papers" in data else []):
+                for paper in run.get("papers") or []:
+                    key = paper.get("bibtex_key", "")
+                    src = paper.get("extraction_source", "unknown")
+                    if key:
+                        key_to_source[key] = src
+                    final_key = title_to_final_key.get(normalize_title(paper.get("title", "")))
+                    if final_key:
+                        key_to_source[final_key] = src
+        except Exception:
+            continue
+
+    # Read consolidated and filter
+    consolidated_path = results_dir / "consolidated_datasets.csv"
+    if not consolidated_path.exists():
+        return
+
+    with consolidated_path.open(encoding="utf-8") as f:
+        reader = _csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        rows = list(reader)
+
+    pdf_sources = {"pdf", "pdf_text", "pdf_text_fallback"}
+    pdf_only = []
+    for r in rows:
+        keys = [k.strip() for k in r["Bibtex Citation Keys"].split(",") if k.strip()]
+        sources = set(key_to_source.get(k, "unknown") for k in keys)
+        if sources & pdf_sources:
+            pdf_only.append(r)
+
+    out = results_dir / "consolidated_datasets_pdf_only.csv"
+    with out.open("w", newline="", encoding="utf-8") as f:
+        writer = _csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(pdf_only)

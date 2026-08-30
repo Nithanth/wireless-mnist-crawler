@@ -717,11 +717,12 @@ class Pipeline:
                     pdf_url = (oa_pdf_urls or {}).get(row["title"])
                     if classify_no_pdf:
                         # Load pre-extracted text for snippet search (cheap)
-                        pdf_text = load_cached_pdf_text(self.conn, row["id"], pdf_url) if pdf_url else None
+                        # Falls back to paper_id if pdf_url is None
+                        pdf_text = load_cached_pdf_text(self.conn, row["id"], pdf_url)
                         yield (i, row, None, pdf_text)
                     else:
                         # Legacy: send full PDF bytes to LLM
-                        pdf_bytes = load_cached_pdf(self.conn, row["id"], pdf_url) if pdf_url else None
+                        pdf_bytes = load_cached_pdf(self.conn, row["id"], pdf_url)
                         yield (i, row, pdf_bytes, None)
 
             def _classify(item):
@@ -842,7 +843,9 @@ class Pipeline:
         def _extract_items():
             for idx, row in enumerate(rows, 1):
                 pdf_url = (oa_pdf_urls or {}).get(row["title"])
-                pdf_bytes = _load_pdf(self.conn, row["id"], pdf_url) if pdf_url else None
+                # Always attempt to load cached PDF — even without a pdf_url,
+                # the artifact may exist from a prior coverage run.
+                pdf_bytes = _load_pdf(self.conn, row["id"], pdf_url)
                 yield (idx, row, pdf_url, pdf_bytes)
 
         def _extract(item):

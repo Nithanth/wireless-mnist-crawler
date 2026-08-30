@@ -1,35 +1,37 @@
 # wireless-taxonomy
 
 Working repo for the **wireless-mnist** research project (CMU × NIST) on the
-*openness of wireless datasets used to reproduce ML research*.
+*openness and reuse of datasets in wireless research*.
 
-This is a focused **coverage-evaluation tool**: a Python CLI
-(`wireless_taxonomy`) that, per conference/year, pulls the accepted-paper list,
-backfills titles/abstracts from open metadata APIs, classifies which papers are
-wireless (keyword or LLM, from title + abstract), and **scores that automated
-set against a hand-curated gold list** (Jaccard / IoU, precision / recall / F1)
-so we can quantify how well the automated path reproduces the manual curation.
+The Python CLI (`wireless_taxonomy`) retrieves venue proceedings, enriches
+paper metadata, classifies papers for wireless relevance, obtains legally
+accessible full text, extracts structured dataset records, resolves repeated
+dataset identities across papers, verifies availability evidence, and exports
+a consolidated dataset taxonomy. It also evaluates the automated paper and
+dataset results against a hand-curated validation set using precision, recall,
+and Jaccard similarity.
 
-Because ACM/IEEE block automated full-text fetching, the workflow is
-deliberately metadata-only: it works from **DBLP** (authoritative paper list:
-title/authors/DOI) plus **OpenAlex/Crossref/Semantic Scholar/arXiv** (abstracts,
-with a USENIX page-scrape fallback and an opt-in ACM scrape), and compares on
-title + abstract. Resolved abstracts/DOIs are cached to disk so re-runs are
-fast and deterministic, and DBLP poster/demo/workshop records are dropped at
-ingest so they don't pollute the proceedings set. Data is persisted in SQLite.
+Paper lists come primarily from **DBLP**, with metadata backfilled through
+**OpenAlex, Crossref, Semantic Scholar, and arXiv**. Classification uses the
+paper title and abstract and can use the full PDF when available. Dataset
+extraction prefers full-paper text; strict abstract-only extractions are kept
+separate from the PDF-backed catalog used for dataset-level analysis. Results,
+PDF fetch state, and provenance are persisted in a corpus-specific SQLite
+database, while resolved metadata and LLM responses are cached for repeatable
+reruns.
 
 ---
 
 ## CLI usage
 
-The CLI is **three commands**: `classify` (the whole per-conference loop, with a
-pretty yes/maybe/no breakdown), `eval` (DB-free snapshot scoring against a gold
-sheet), and `llm-config` (which LLM providers are configured).
+The primary workflow is `init` → `add` → `export`. Commands for individual
+pipeline stages, validation, cache management, and debugging are available
+under `wt advanced`. The complete LLM prompt inventory is documented in
+[`PROMPTS.md`](PROMPTS.md).
 
 ### Setup
 
-Requires Python ≥ 3.11. The tool is intentionally light — its only runtime
-dependencies are `typer`/`click`.
+Requires Python ≥ 3.11. Runtime dependencies are `typer`, `click`, and `pypdf`.
 
 ```bash
 pip install -e .
@@ -45,7 +47,7 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli --help
 # The legacy name `wireless-taxonomy` is also installed as an alias.
 ```
 
-### 1. `classify` — loop a conference and label every paper
+### Advanced: `classify` — loop a conference and label every paper
 
 Pulls the accepted-paper list from DBLP (dropping poster/demo/workshop/keynote
 records so only main-track papers remain), backfills missing DOIs + abstracts,
@@ -63,7 +65,7 @@ an opt-in last resort for IMC/SIGCOMM/MobiCom — it's off by default because AC
 is Cloudflare-protected (see *Abstract caching & providers* below).
 
 ```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli classify \
+wt advanced classify \
   --venue NSDI --years 2023:2025 --llm \
   --csv nsdi.csv --json nsdi.json
 ```
@@ -96,7 +98,7 @@ NSDI 2024 — 112 papers (abstracts: 112/112, 100%)
   abstract, or model changed**. Pass `--refresh-llm` to ignore cached labels and
   re-call the model (a fresh classification).
 
-### 2. `eval` — DB-free snapshot scoring vs a gold sheet
+### Advanced: `eval` — DB-free snapshot scoring vs a gold sheet
 
 Scoring is a pure, point-in-time computation, so it runs with **no DB and no
 network** — straight from files. Give it the full labelled CSV from `classify
@@ -104,7 +106,7 @@ network** — straight from files. Give it the full labelled CSV from `classify
 (venue, year) and reports `jaccard / precision / recall / f1`.
 
 ```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli eval \
+wt advanced eval \
   --classified nsdi.csv --gold "List of Papers.csv" \
   --pass high --drop-workshops \
   --out report.json --md report.md
@@ -152,10 +154,10 @@ PYTHONPATH=src python3 -m wireless_taxonomy.cli eval \
 The same logic is importable:
 `from wireless_taxonomy.eval.standalone import eval_files`.
 
-### 3. `llm-config` — show configured LLM providers
+### Advanced: `llm-config` — show configured LLM providers
 
 ```bash
-PYTHONPATH=src python3 -m wireless_taxonomy.cli llm-config
+wt advanced llm-config
 ```
 
 ### Experiment harness (`scripts/evaluate_coverage.py`)
@@ -187,51 +189,42 @@ The pipeline finds all papers from a conference year, classifies which are
 wireless, fetches their PDFs, extracts structured dataset records via LLM, and
 outputs CSV spreadsheets. Here's how to use it from scratch.
 
-### Quick start (single venue/year)
+### Quick start
 
 ```bash
-# 0. Install
 pip install -e .
-
-# 1. Set up your .env (copy from .env.example, fill in API keys)
 cp .env.example .env
-# Required: at least one of OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY
-# Recommended: SEMANTIC_SCHOLAR_API_KEY for better abstract/DOI resolution
+# Add at least one supported LLM API key to .env.
 
-# 2. Run for one conference + year
-export PYTHONPATH=src
-
-# Step 1: Find which papers have open-access PDFs
-python -m wireless_taxonomy.cli fetch-coverage \
-  --venue NSDI --years 2024 \
-  --json cov_NSDI_2024.json
-
-# Step 2: Classify + extract datasets (uses PDF URLs from step 1)
-python -m wireless_taxonomy.cli extract-datasets \
-  --venue NSDI --years 2024 \
-  --oa-json cov_NSDI_2024.json \
-  --out ./src/results
-
-# Output: src/results/nsdi_2024_papers.csv
-#         src/results/nsdi_2024_datasets.csv
-#         src/results/nsdi_2024_bibtex.csv
-#         src/results/nsdi_2024_raw.json
+wt init wireless_v1
+wt add --venues SIGCOMM,IMC,NSDI,ICC,TWC --years 2022:2025
+wt export
+wt status
 ```
+
+Use `wt add --estimate` before a run to inspect expected paper and LLM-call
+counts. Rerunning the same venue-years reuses cached metadata, PDFs, and LLM
+responses unless `--fresh` is supplied.
 
 ### What happens under the hood
 
 ```text
-fetch-coverage                    extract-datasets
-┌─────────────┐                  ┌────────────────────────────────────────────┐
-│ DBLP ingest │─── paper list ──▶│ 1. Fetch PDFs (cached in SQLite)          │
-│ (title/DOI) │                  │ 2. Classify wireless? (LLM, yes/maybe/no) │
-└─────────────┘                  │ 3. Filter to wireless (yes + maybe)       │
-       │                         │ 4. Extract datasets from each paper (LLM) │
-       ▼                         │ 5. Verify availability URLs (live check)  │
-  cov_*.json                     └──────────────┬─────────────────────────────┘
-  (PDF URLs)                                    │
-                                                ▼
-                                     3 CSVs + raw JSON
+DBLP proceedings and metadata APIs
+                │
+                ▼
+Paper relevance classification (yes / maybe / no)
+                │
+                ▼
+Open-access PDF discovery and full-text extraction
+                │
+                ▼
+Structured dataset extraction from retained papers
+                │
+                ▼
+Exact-name and URL matching → similarity candidates → LLM confirmation
+                │
+                ▼
+Availability verification and consolidated CSV export
 ```
 
 ### Batch run (multiple venues × years)
@@ -284,7 +277,7 @@ After all runs, merge per-venue/year CSVs into master files:
 
 ```bash
 # Automatically runs at the end of run_batch.sh, or run manually:
-python -m wireless_taxonomy.cli merge-results --dir ./src/results --out ./src/results
+wt advanced merge-results --dir ./src/results --out ./src/results
 ```
 
 Produces:
@@ -298,7 +291,7 @@ Produces:
 
 | Layer | File | What it stores | How to clear |
 |-------|------|---------------|--------------|
-| **LLM cache** | `.wt_cache.json` | Classification labels, dataset extractions, abstracts, DOIs | `python -m wireless_taxonomy.cli cache clear-section llm` |
+| **LLM cache** | `.wt_cache.json` | Classification labels, dataset extractions, abstracts, DOIs | Rerun `wt add` with `--fresh` |
 | **PDF cache** | `taxonomy.sqlite` | Raw PDF bytes (expensive to re-download) | Almost never — prompt-independent |
 | **Results** | `src/results/*.csv` | Output spreadsheets | `./run_batch.sh --fresh-results` (archives, doesn't delete) |
 
@@ -306,25 +299,23 @@ LLM classifications are **keyed by prompt + model hash**, so changing the
 classification prompt automatically invalidates old cached results. You don't
 need to manually clear the cache after editing the prompt.
 
-Inspect cache status anytime:
-
-```bash
-python -m wireless_taxonomy.cli cache status
-```
+Use `wt status` to inspect the active corpus and `wt advanced --help` for targeted cache-maintenance commands.
 
 ### Command reference
 
 | Command | Purpose |
 | --- | --- |
-| `classify` | Loop a venue over a year range: DBLP ingest → DOI/abstract backfill → classify; prints yes/maybe/no breakdown. |
-| `eval` | DB-free snapshot eval: score a classified CSV vs a gold sheet (DOI→title→fuzzy). No DB/network. |
-| `fetch-coverage` | Report which papers have legally fetchable open-access full text. Outputs `cov_*.json`. |
-| `extract-datasets` | Full extraction: classify wireless → fetch PDF → LLM extract → output 3 CSVs. |
-| `merge-results` | Combine all per-venue/year CSVs into master files. |
-| `cache` | Inspect or clear `.wt_cache.json` sections (`status`, `clear`, `clear-section llm`). |
-| `corpus-status` | Show what's in the DB: venues, years, paper counts, extraction status. |
-| `prune` | Prune extraction/classification results by venue/year or run ID. |
-| `llm-config` | Show which LLM providers are configured and their models. |
+| `wt init` | Create or adopt a corpus workspace. |
+| `wt add` | Retrieve papers, discover PDFs, classify wireless relevance, extract datasets, and merge venue-year results. |
+| `wt export` | Reconcile dataset identities, fill unknown availability, and produce consolidated outputs. |
+| `wt status` | Show corpus venues, years, paper counts, and extraction status. |
+| `wt rollback` | Restore the snapshot preceding the most recent corpus run. |
+| `wt advanced classify` | Run paper classification for a venue and year range. |
+| `wt advanced eval` | Score classified papers against a curated validation file. |
+| `wt advanced fetch-coverage` | Report legally fetchable open-access full text. |
+| `wt advanced extract-datasets` | Run classification and structured dataset extraction as an individual stage. |
+| `wt advanced merge-results` | Combine per-venue/year outputs into master files. |
+| `wt advanced llm-config` | Show configured LLM providers and models. |
 
 Run any command with `--help` for its full flags.
 
