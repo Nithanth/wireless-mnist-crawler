@@ -20,7 +20,6 @@ from typer.core import TyperArgument, TyperOption
 # argument. Patch all affected classes once at import time.
 
 _OPTION_MAKE_METAVAR = TyperOption.make_metavar
-_ARGUMENT_MAKE_METAVAR = TyperArgument.make_metavar
 _CLICK_PARAMETER_MAKE_METAVAR = click.core.Parameter.make_metavar
 _CLICK_OPTION_MAKE_METAVAR = click.core.Option.make_metavar
 _CLICK_ARGUMENT_MAKE_METAVAR = click.core.Argument.make_metavar
