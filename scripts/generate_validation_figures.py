@@ -120,11 +120,6 @@ def load_db_availability():
 
 
 # ── matching ─────────────────────────────────────────────────────────────
-def match_papers(manual_titles: set[str], ai_titles: set[str]):
-    inter = manual_titles & ai_titles
-    return inter
-
-
 def match_datasets(manual_ds: list[dict], ai_ds: list[dict], sim_threshold=0.75):
     """Greedy 1:1 matching between manual and AI dataset lists.
 
