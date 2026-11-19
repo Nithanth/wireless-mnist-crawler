@@ -415,13 +415,6 @@ def _label(value: Any) -> Label:
     return "maybe"
 
 
-def _float(value: Any, default: float) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _confidence(value: Any) -> str:
     """Parse confidence — accepts categorical or legacy numeric values."""
     if isinstance(value, str):
